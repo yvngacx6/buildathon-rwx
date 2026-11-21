@@ -2,6 +2,7 @@
 """A/B one switch (default BR_RUNVERIFY) in the built image, under the scorer's docker flags.
 
 usage: python3 eval/rv_ab.py IMAGE OUTDIR SETDIR [SETDIR ...] [--reps 3] [--env NAME]
+                             [--fixed K=V ...] [--only-on]
 
 For each set and each value of the switch (0 = off, 1 = on), runs the image `reps` times
 (the Makefile's RUN_FLAGS, data mounted read-only) and records stdout, stderr and the
@@ -74,15 +75,25 @@ def main() -> None:
         i = args.index("--env")
         switch = args[i + 1]
         del args[i:i + 2]
+    fixed = {}
+    while "--fixed" in args:
+        i = args.index("--fixed")
+        k, v = args[i + 1].split("=", 1)
+        fixed[k] = v
+        del args[i:i + 2]
+    vals = ("0", "1")
+    if "--only-on" in args:
+        args.remove("--only-on")
+        vals = ("1",)
     image, outdir, sets = args[0], Path(args[1]), [Path(a) for a in args[2:]]
     outdir.mkdir(parents=True, exist_ok=True)
     for data in sets:
         res = {}
-        for val in ("0", "1"):
+        for val in vals:
             cpus, sims, miss = [], [], []
             for r in range(reps):
                 base = outdir / f"{data.name}.{val}.{r}"
-                cpu = run(image, data, {switch: val}, base)
+                cpu = run(image, data, {**fixed, switch: val}, base)
                 sim, m, n = score(data, base.with_suffix(".out").read_text())
                 cpus.append(cpu)
                 sims.append(sim)
@@ -93,6 +104,8 @@ def main() -> None:
             print(f"{data.name:14s} {switch}={val}: sim {res[val][0]:8.1f}s  cpu(med) "
                   f"{res[val][1]:6.2f}s  cpus {[round(c, 2) for c in cpus]}  sims "
                   f"{[round(s, 1) for s in sims]}  misses {max(miss)}/{n}", flush=True)
+        if "0" not in res:
+            continue
         dsim = res["1"][0] - res["0"][0]
         dcpu = res["1"][1] - res["0"][1]
         n = res["1"][3]
