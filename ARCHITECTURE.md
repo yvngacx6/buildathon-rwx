@@ -3,7 +3,8 @@
 ## Current best: v1 (branch `v1`)
 
 ```
-patch ──► diff.parse/apply ──► per file ──► rule (select.py) ──► ∪ ──► +untraced ──► pack (LPT, k=1..8) ──► JSON
+patch ──► diff.parse/apply ──► per file ──► rule (select.py) ──► ∪ ──► +untraced ──► S
+S ──► [verify.py, optional: cheap S → run it on the patched tree → keep only failures; anomaly → S] ──► pack (LPT, k=1..8) ──► JSON
                                   │
                                   ├─ .py: classify.regions → function / class / module regions
                                   │        function → lines map over the function span
@@ -32,6 +33,8 @@ Every rule is about code structure; no rule names an edit kind as harmless or ma
 | `selector/nameindex.py` | Build-time step (`python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl`, in the Dockerfile) that stores the `names.py` scan as tables; run time loads it lazily (only class/module edits) and checks a source fingerprint, else builds in memory. For local eval run the same command with your `BR_SQLGLOT` and `index/names.pkl` (gitignored). |
 | `selector/maps.py` | Lazy gz map loading (maps/SCHEMA.md), id → number via the run's tests.json. |
 | `selector/pack.py` | Choose worker count and split tests (scorer cost model). |
+| `selector/verify.py` | Optional pass 2 (switch `ENABLED`, env `BR_VERIFY=0` turns it off): when a static selection is cheap to run, run it against the patched tree (symlink overlay in /tmp, fork server with pytest pre-imported, never sqlglot) and output only the tests that failed. Labelers' outcome rules; any anomaly → the static selection. Tests ≥ 5 s and files that start process pools / import duckdb+pandas are never run, only kept. Cost policy, guards and fidelity notes are in its docstring. |
+| `eval/verify_audit.py`, `eval/verify_policy.py` | Fidelity check of verify.py against the labels (audit mode runs every runnable commit) and the fit / replay that set its cost constants. |
 | `mapbuild/import_time.py` | Build `maps/import_time.json.gz`: per line, the modules whose import runs it (fresh interpreter per module, sys.monitoring). |
 | `eval/adversarial.py` | Write the adversarial private patch set (import-time code, removed names, hunkless diffs, …). Patches and labels stay out of git. |
 | `mapbuild/convert_prototype.py` | INTERIM: convert the laptop prototype maps (research reports 02 and 05) into the SCHEMA format. |
@@ -60,3 +63,4 @@ without ---/+++ (pure renames, empty files added / deleted) are kept as hunkless
 | r1-attrnarrow | 2026-11-20 | I08: name-reader narrowing of class / module assignments; lambda call lines | 185.0 |
 | r1-robust | 2026-11-20 | Import-time map; removed/renamed/derived module names; hunkless diff entries (adversarial round 1) | 198.8 |
 | r2-slowtests | 2026-11-20 | Slow tests (≥ 5 s) in function bodies need a touched statement (private264: 3453.9 → 3269.2) | 185.0 |
+| r3-verify | 2026-11-21 | Run-time verification of cheap selections (selector/verify.py); sample 183.9 + 1.0 CPU → 174.9 + 3.2 CPU | 174.9 |

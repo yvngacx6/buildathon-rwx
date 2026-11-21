@@ -9,6 +9,14 @@ data=urllib.request.urlopen('https://github.com/tobymao/sqlglot/archive/${SQLGLO
 tarfile.open(fileobj=io.BytesIO(data)).extractall('/opt', filter='data')" \
  && mv /opt/sqlglot-${SQLGLOT_SHA} /opt/sqlglot
 
+# The labelers' environment, for selector/verify.py (runs cheap selections against the patch).
+COPY requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir -r /app/requirements.lock
+# Bytecode for the pinned tree, so each verification imports sqlglot/tests from .pyc: plain
+# compileall, plus pytest's assertion-rewritten test modules (a collect-only pass writes them).
+RUN cd /opt/sqlglot && python -m compileall -q sqlglot tests \
+ && SKIP_INTEGRATION=0 python -m pytest --collect-only -q -p no:cacheprovider tests > /dev/null
+
 COPY selector /app/selector
 COPY maps /app/maps
 
