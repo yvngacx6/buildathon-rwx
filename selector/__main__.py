@@ -170,8 +170,12 @@ def _run(out: Output, t0: float) -> None:
     all_cost = pack.cost_ms(all_workers, ms_of)
 
     try:
+        from . import diffexec
         from .select import ALL_FRACTION, Selector
 
+        # Verification children are capped by their own CPU; their wall timeouts only guard a
+        # block, and never outlast the ALL_PHASE deadline (moon-17).
+        diffexec.WALL_END = budget.t0 + ALL_PHASE * budget.limit
         selector = Selector(tests, sqlglot, maps)
     except Exception as exc:  # noqa: BLE001  (R4: maps / indexes unreadable → ALL)
         _log(f"selector unavailable ({type(exc).__name__}: {exc}): ALL for every commit")
