@@ -220,8 +220,13 @@ def test_module_constant_follows_import_alias(selector):
 
 
 def test_non_assignment_in_class_body_falls_back(selector):
-    got = run(selector, D, "    WEEK = -1\n", "    WEEK = -1\n    print(WEEK)\n")
-    assert got == CONSERVATIVE_TSQL
+    # A call in the body may mutate objects other modules own: with no import-state diff
+    # (this fake repo has no snapshot) nothing rules that out → ALL.
+    edit = ("    WEEK = -1\n", "    WEEK = -1\n    print(WEEK)\n")
+    assert run(selector, D, *edit) == EVERYONE
+    # Once the global-effect check passes, the class's conservative set.
+    selector._foreign_state = lambda path: None
+    assert run(selector, D, *edit) == CONSERVATIVE_TSQL
 
 
 def test_decorated_class_with_side_effects_falls_back(selector):
