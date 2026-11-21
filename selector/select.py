@@ -74,6 +74,10 @@ map shows it ran a line of a touched statement: the whole statement for simple s
 the header lines for an if / for / while whose header alone changed. The statement view
 exists only for clean in-place edits (classify.touched_statements); otherwise, or when no
 test at all ran the touched statements, slow tests stay at the whole-function rule.
+
+test_generator_memory (6.7 s), selected through any route but ALL: its exact body runs on
+the patched package in a fresh interpreter for the dialects the patch can reach; it is
+dropped only if that passes with margin (selector/genmem.py).
 """
 
 from __future__ import annotations
