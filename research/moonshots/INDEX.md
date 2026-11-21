@@ -19,8 +19,9 @@ new moonshot angle is started in its slot.
 | 11 | Assertion-level slicing: verify only the affected assertions of cheap tests | moon-11 | running | |
 | 12 | Compact tree-table input encoding so diffexec can record tpcds/max_nodes callees | moon-12 | running | |
 | 13 | Cut container CPU 4.9 s → <1 s (native/cached hot paths, cheaper state diff) | moon-13 | running | |
-| 14 | Fixture-edit precision: per-pair/per-line fixture reads and pair semantics (fixture readers ≈11% of A/B cost) | moon-14 | running | |
+| 14 | Fixture-edit precision | moon-14 | done | ✓ Loader-output diff per reader: private −84.5 s, adversarial −19.6 s, P −10.5/40, 0 misses on 73 fixture commits → porting as R27 (r27-fixtures). |
 | 15 | Per-fixture-case slicing for code edits (generalise r17 to test_annotate_funcs, test_qualify_columns, check_file loops) | moon-15 | running | |
 | 16 | Practice-like code commits: per-mechanism over-selection breakdown + targeted fixes | moon-16 | running | |
 | 17 | Determinism audit: identical input → identical output across runs/load (diffexec/subtest budgets, hash seeds, fork timing) | moon-17 | running | |
 | 18 | Red-team soundness review of all run-time pruners (diffexec, subtest, slowverify, genmem, r19 import-fn, statement rule) | moon-18 | running | |
+| 19 | 'Conservative def-time' + 'state diff' buckets on practice_like (~87 s): sound narrowing | moon-19 | running | |
