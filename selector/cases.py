@@ -40,7 +40,7 @@ PREFIX = TFILE + "::TestOptimizer::"
 SCORER_SLOWDOWN = 2.0
 BUDGET_S = float(os.environ.get("BR_CASES_S", "6"))
 SHARE = 0.6
-OVERHEAD_S = float(os.environ.get("BR_CASES_OVERHEAD", "0.15"))  # fork + swap (laptop CPU s)
+OVERHEAD_S = float(os.environ.get("BR_CASES_OVERHEAD", "0.25"))  # fork + swap (laptop CPU s)
 HELPERS = ("parse_and_optimize", "qualify_then_canonicalize", "qualify_columns",
            "pushdown_projections", "normalize", "simplify", "pushdown_ctes", "annotate_functions")
 BANNED_FILES = ("sqlglot/serde.py",)  # kwargs were pickled at build with the pinned dump()
@@ -333,6 +333,7 @@ class Cases:
         self.sel = selector
         self.store = store
         self._meta = None
+        self._idx: dict = {}
         self.numbers = {t["number"]: t["id"][len(PREFIX):] for t in selector.tests
                         if t["id"].startswith(PREFIX)}
         self.spent = 0.0
@@ -346,11 +347,7 @@ class Cases:
         if not store.is_file():
             return None
         self = cls(selector, store)
-        meta = self.meta()
-        if not meta:
-            return None
-        self.numbers = {n: name for n, name in self.numbers.items() if name in meta["tests"]}
-        return self if self.numbers else None
+        return self if self.numbers else None  # the store loads on first use
 
     def meta(self):
         if self._meta is None:
@@ -360,17 +357,19 @@ class Cases:
         return self._meta
 
     def _hit_cases(self, spans: dict) -> set[int]:
+        import bisect
         meta = self.meta()
         out: set[int] = set()
         for path, ss in spans.items():
-            lines = meta["inv"].get(path)
-            if not lines:
-                continue
-            for ln, sid in lines.items():
-                for first, last in ss:
-                    if first <= ln <= last:
-                        out.update(meta["sets"][sid])
-                        break
+            idx = self._idx.get(path)
+            if idx is None:
+                d = meta["inv"].get(path, {})
+                lines = sorted(d)
+                idx = self._idx[path] = (lines, [d[ln] for ln in lines])
+            lines, sids = idx
+            for first, last in ss:
+                for j in range(bisect.bisect_left(lines, first), bisect.bisect_right(lines, last)):
+                    out.update(meta["sets"][sids[j]])
         return out
 
     def plan(self, spans: dict, numbers: set[int]):
@@ -382,9 +381,9 @@ class Cases:
         hit = self._hit_cases(spans)
         out = {}
         for n in numbers:
-            t = meta["tests"][self.numbers[n]]
-            if _hit(t["noncase"], spans):
-                continue  # the test's own code runs a touched statement: keep
+            t = meta["tests"].get(self.numbers[n])
+            if t is None or _hit(t["noncase"], spans):
+                continue  # unknown test / its own code runs a touched statement: keep
             todo = [i for i in t["cases"] if i in hit]
             if any(not meta["cases"][i]["ok"] for i in todo):
                 continue
@@ -403,31 +402,35 @@ class Cases:
             return set(), "cases: keep (set-up / non-case code touched)"
         meta = self.meta()
         cpu = lambda i: meta["cases"][i]["cpu"]  # noqa: E731
-        chosen, todo, est = set(), [], 0.0
+        chosen, est = [], 0.0
         for n in sorted(per, key=lambda n: sum(cpu(i) for i in per[n])):
-            qs = [i for i in per[n] if i not in todo]
-            c = sum(cpu(i) for i in qs) + (OVERHEAD_S if qs and not todo else 0.0)
-            trial = chosen | {n}
+            c = sum(cpu(i) for i in per[n]) + (OVERHEAD_S if per[n] and not est else 0.0)
+            if per[n]:
+                c += 0.01  # grandchild fork
+            trial = set(chosen) | {n}
             spend = SCORER_SLOWDOWN * (est + c)
             gain = benefit_of(trial)
             if gain > 0 and spend <= min(BUDGET_S, SHARE * gain / 1000):
-                chosen, est = trial, est + c
-                todo.extend(qs)
+                chosen.append(n)
+                est += c
         if not chosen:
             return set(), f"cases: keep (est {sum(cpu(i) for v in per.values() for i in v):.1f}s)"
-        if not todo:
-            return chosen, f"cases: {len(chosen)} tests dropped (no case runs a touched statement)"
-        # cheapest cases first: a failing case ends the child early
-        todo.sort(key=cpu)
+        free = {n for n in chosen if not per[n]}
+        work = [(n, sorted(per[n], key=cpu)) for n in chosen if per[n]]
+        if not work:
+            return free, f"cases: {len(free)} tests dropped (no case runs a touched statement)"
         try:
-            ok = self.verify(jobs, todo, min(BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0))
+            passed = self.verify(jobs, work, min(BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0))
         except Exception as e:  # noqa: BLE001
-            return set(), f"cases: keep ({type(e).__name__})"
-        if not ok:
-            return set(), f"cases: keep ({len(todo)} cases, a case failed, {self.last_child:.2f}s)"
-        return chosen, f"cases: {len(chosen)} tests dropped ({len(todo)} cases re-run, {self.last_child:.2f}s)"
+            passed = set()
+        ncases = sum(len(v) for _, v in work)
+        dropped = free | passed
+        note = (f"cases: {len(dropped)} of {len(chosen)} tests dropped ({ncases} cases, "
+                f"{len(work) - len(passed)} tests failed verification, {self.last_child:.2f}s)")
+        return dropped, note
 
-    def verify(self, jobs, todo: list, budget: float) -> bool:
+    def verify(self, jobs, work: list, budget: float) -> set[int]:
+        """→ the tests whose cases all reproduce (each test verified in its own grandchild)."""
         meta = self.meta()
         root = str(self.sel.sqlglot)
         _warm(root)
@@ -438,9 +441,9 @@ class Cases:
             code = 1
             try:
                 os.close(rfd)
-                ok = _child(root, jobs, todo, meta, budget)
+                passed = _child(root, jobs, work, meta, budget)
                 with os.fdopen(wfd, "wb") as fh:
-                    fh.write(b"OK" if ok else b"NO")
+                    fh.write(pickle.dumps(sorted(passed)))
                 code = 0
             except BaseException:  # noqa: BLE001
                 if os.environ.get("CASES_DEBUG"):
@@ -472,10 +475,15 @@ class Cases:
         self.last_child = round((t1.children_user - t0.children_user)
                                 + (t1.children_system - t0.children_system), 3)
         self.spent += self.last_child
-        return not timed_out and status == 0 and b"".join(chunks) == b"OK"
+        if timed_out or status != 0:
+            return set()
+        try:
+            return set(pickle.loads(b"".join(chunks)))
+        except Exception:  # noqa: BLE001
+            return set()
 
 
-def _child(root, jobs, todo, meta, budget) -> bool:
+def _child(root, jobs, work, meta, budget) -> set[int]:
     import signal
     sys.setrecursionlimit(1000)  # the pool worker's default
     signal.signal(signal.SIGPROF, signal.SIG_DFL)
@@ -484,8 +492,29 @@ def _child(root, jobs, todo, meta, budget) -> bool:
     if why:
         if os.environ.get("CASES_DEBUG"):
             print("cases bail:", why, file=sys.stderr)
-        return False
+        return set()
     ns = helper_namespace(root)
+    passed = set()
+    for n, todo in work:
+        # one grandchild per test: a failing / state-changing case cannot leak into another test
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                code = 0 if _run_test_cases(todo, meta, ns) else 1
+            except BaseException:  # noqa: BLE001
+                code = 1
+            finally:
+                os._exit(code)
+        _, status = os.waitpid(pid, 0)
+        if status == 0:
+            passed.add(n)
+    return passed
+
+
+def _run_test_cases(todo, meta, ns) -> bool:
+    import signal
+    signal.signal(signal.SIGPROF, signal.SIG_DFL)
     for i in todo:
         c = meta["cases"][i]
         signal.setitimer(signal.ITIMER_PROF, 3 * c["cpu"] + 0.5)
@@ -498,6 +527,7 @@ def _child(root, jobs, todo, meta, budget) -> bool:
             if os.environ.get("CASES_DEBUG"):
                 print("cases diff:", c["test"], i, file=sys.stderr)
             return False
+    signal.setitimer(signal.ITIMER_PROF, 0)
     return True
 
 
