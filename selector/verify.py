@@ -74,9 +74,11 @@ POOL_MARKERS = ("ProcessPoolExecutor", "multiprocessing", "import duckdb", "impo
 # CPU of 114 audit runs with R under 3 recorded seconds (EC2 c7i, the scorer's docker flags;
 # eval/verify_policy.py). P_FAIL / MARGIN: best realized net when the policy is replayed on the
 # audit runs of all four labeled sets (experiments/LOG.md E009).
-OVERHEAD = float(os.environ.get("BR_VERIFY_OVERHEAD", "0.12"))  # fork + import sqlglot + pytest
+# Re-measured on the r5 image (E012, 4-vCPU EC2): single-test runs cost 0.20-0.28 s, larger runs
+# less than the c7i fit, so OVERHEAD 0.12 -> 0.22 and PER_SECOND 1.4 -> 1.0.
+OVERHEAD = float(os.environ.get("BR_VERIFY_OVERHEAD", "0.22"))  # fork + import sqlglot + pytest
 PER_FILE = float(os.environ.get("BR_VERIFY_PER_FILE", "0.025"))  # import + collect a test module
-PER_SECOND = float(os.environ.get("BR_VERIFY_PER_SECOND", "1.4"))  # CPU per recorded test second
+PER_SECOND = float(os.environ.get("BR_VERIFY_PER_SECOND", "1.0"))  # CPU per recorded test second
 SERVER_START = 0.25  # python + pytest import, paid once per batch if anything is verified
 # The batch runs only if its expected gain clears the server start by this much: the model is
 # rough (r5-verify, E012: single-test runs cost 0.20-0.27 s, not 0.15), so a batch of one or two
