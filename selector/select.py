@@ -85,12 +85,14 @@ DOC_SUFFIXES = (".md", ".rst", ".txt", ".html", ".png", ".svg", ".jpg")
 DOC_FILES = {"LICENSE", "Makefile", "CHANGELOG", ".gitignore", ".pre-commit-config.yaml"}
 CONFIG_FILES = {"pyproject.toml", "setup.cfg"}
 ALWAYS_ALL = {"pytest.ini", "tox.ini", "conftest.py", "setup.py"}
-ALL_FRACTION = 0.85  # selection cost ≥ this × ALL cost → just run ALL
+# Selection cost ≥ this × ALL cost → just run ALL. r5-tune: 0.85 fired on 32.8 s selections
+# (0.89 × ALL, 4 s dearer, never needed on any set); 0.95 keeps the free hedge near equal cost.
+ALL_FRACTION = 0.95
 SLOW_SECONDS = 5.0  # tests at least this slow get the statement-level rule in function bodies
-# An import-state diff cost ~1.2 s of container CPU when this gate was set (now ~0.8 s on a
-# loaded EC2 box, r3-cpu). Run it only when the wide set costs at least this much more than
-# the cheapest selection it could give.
-STATE_MIN_GAIN = 2.0
+# An import-state diff costs ~0.8 s of container CPU (r3-cpu). Run it only when the wide set
+# costs at least this much more than the cheapest selection it could give. r5-tune: 1.2 adds
+# diffs that save ~1.8 s each; ≤1.0 adds diffs that save ~0.5 s (< their CPU).
+STATE_MIN_GAIN = 1.2
 # Class hierarchies the classes map records (maps/MANIFEST.json notes): a test that made an
 # instance of one of these classes (or used it as a dialect) is credited to it and its bases.
 TRACKED_ROOTS = {
