@@ -39,6 +39,14 @@ BATCH_BUDGET_S = float(os.environ.get("BR_DIFFEXEC_BATCH_S", "100"))
 BENEFIT_SHARE = float(os.environ.get("BR_DIFFEXEC_SHARE", "0.85"))
 
 
+def wall_guard(budget: float) -> float:
+    """Wall-clock limit for a verification child whose CPU is capped by `budget` (moon-17).
+
+    Only a guard against a child that blocks: the child's own CPU caps decide overruns, so a
+    busy or throttled host (CPU-starved child) must not change the answer."""
+    return 4 * budget + 30
+
+
 class DiffExec:
     def __init__(self, selector, store: Path) -> None:
         self.sel = selector
@@ -77,6 +85,7 @@ class DiffExec:
         # Generous on purpose: the scorer CPU is ~2x slower than our dev boxes, and a budget
         # that runs out keeps every test (board S07–S09 lost most diffexec gains that way).
         budget = min(COMMIT_BUDGET_S, BENEFIT_SHARE * benefit_ms / 1000, BATCH_BUDGET_S - self.spent)
+        self.last_budget = budget
         if budget < 0.05:
             return None
         req = {"root": str(self.sel.sqlglot), "store": str(self.store), "deadline_s": budget,
@@ -92,7 +101,7 @@ class DiffExec:
         try:
             proc = subprocess.run([sys.executable, "-m", "diffexec.replay"], cwd=REPO, env=env,
                                   input=json.dumps(req), capture_output=True, text=True,
-                                  timeout=budget + 5)
+                                  timeout=wall_guard(budget))
         except subprocess.TimeoutExpired:
             return None
         finally:
@@ -130,6 +139,9 @@ class DiffExec:
             code = 1
             try:
                 os.close(rfd)
+                import resource  # total CPU cap (SIGXCPU ends the child → keep)
+                cap = int(2 * budget + 3)
+                resource.setrlimit(resource.RLIMIT_CPU, (cap, cap + 1))
                 data = json.dumps(replay.run_request(req)).encode()
                 with os.fdopen(wfd, "wb") as fh:
                     fh.write(data)
@@ -142,7 +154,7 @@ class DiffExec:
                 os._exit(code)
         os.close(wfd)
         chunks = []
-        deadline = time.monotonic() + budget + 5
+        deadline = time.monotonic() + wall_guard(budget)
         import select as _select
         status = None
         with os.fdopen(rfd, "rb") as fh:
@@ -163,6 +175,7 @@ class DiffExec:
         _, status = os.waitpid(pid, 0)
         if timed_out:
             status = -1
+        self.last_status = status
         t1 = os.times()
         self.last_child = round((t1.children_user - t0.children_user)
                                 + (t1.children_system - t0.children_system), 2)
@@ -272,9 +285,10 @@ class DiffExec:
                 benefit_ms = benefit_of(possible) if possible else 0
                 if benefit_ms <= 0:
                     return {}, "diffexec: skipped (no candidate worth dropping has complete recordings)"
+        self.last_status = None
         got = self._replay(jobs, benefit_ms)
         if got is None:
-            return {}, "diffexec: no answer (error / timeout / budget)"
+            return {}, f"diffexec: no answer (error / timeout / budget; status {self.last_status})"
         if got.get("bail"):
             return {}, f"diffexec: bail ({got['bail']})"
         codes = got.get("codes", {})
@@ -323,7 +337,7 @@ class DiffExec:
             n += len(out)
         stats = got.get("stats", {})
         return dropped, (f"diffexec: dropped {n} "
-                         f"(blobs {stats.get('ok')}/{stats.get('blobs')}, child cpu {stats.get('cpu_s')}s, rusage {self.last_child}s, "
+                         f"(blobs {stats.get('ok')}/{stats.get('blobs')}, late {stats.get('late')}, bytes {stats.get('bytes')}, budget {self.last_budget:.2f}s, child cpu {stats.get('cpu_s')}s, rusage {self.last_child}s, "
                          f"parent {time.process_time() - t0:.2f}s)")
 
     def _is_resource(self, tid: str) -> bool:
