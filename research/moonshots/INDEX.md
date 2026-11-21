@@ -16,12 +16,14 @@ new moonshot angle is started in its slot.
 | 08 | Practice-board experiment design | moon-08 | done | Slot plan adopted in part (ablations; always pick final explicitly after diagnostics). Score-encoded 'telemetry word' REJECTED: it circumvents 'you never see what your program printed' — not used. |
 | 09 | Final-round strategy | moon-09 | done | Deterministic under ±2x CPU. Must-fix: global wall deadline, Dockerfile download retry, Selector-construction guard, config/no-reader files → R25. Gap is practice-like code commits → moon-16. |
 | 10 | Wildcard ideas | moon-10 | done | 17 angles; V1 = run leftover cheap tests via plain unittest (agrees with labels 418/418), gated ≤0.6 s → −3…−9 s/40 → R24. Fixture-case slicing → moon-15. |
-| 11 | Assertion-level slicing: verify only the affected assertions of cheap tests | moon-11 | running | |
+| 11 | Assertion-level slicing | moon-11 | done | ✗ Sound (0 false drops/2811) but ~0 s/40 net. Found possible import_time.py one-liner hole → moon-18. |
 | 12 | Compact tree-table input encoding so diffexec can record tpcds/max_nodes callees | moon-12 | running | |
-| 13 | Cut container CPU 4.9 s → <1 s (native/cached hot paths, cheaper state diff) | moon-13 | running | |
+| 13 | Container CPU | moon-13 | done | ✓ Merged (28767ce): −14% CPU, byte-identical output (≈ −0.7 s/40). |
 | 14 | Fixture-edit precision | moon-14 | done | ✓ Loader-output diff per reader: private −84.5 s, adversarial −19.6 s, P −10.5/40, 0 misses on 73 fixture commits → porting as R27 (r27-fixtures). |
 | 15 | Per-fixture-case slicing for code edits (generalise r17 to test_annotate_funcs, test_qualify_columns, check_file loops) | moon-15 | running | |
-| 16 | Practice-like code commits: per-mechanism over-selection breakdown + targeted fixes | moon-16 | running | |
+| 16 | Code-commit over-selection | moon-16 | done | ✓ R-DEF (literal-default edits → callers that use the default): −13…−17 s/40, 0 misses → R28. Next: tokenizer-settings read sites (moon-20), key-level state diff (moon-21). |
 | 17 | Determinism audit: identical input → identical output across runs/load (diffexec/subtest budgets, hash seeds, fork timing) | moon-17 | running | |
 | 18 | Red-team soundness review of all run-time pruners (diffexec, subtest, slowverify, genmem, r19 import-fn, statement rule) | moon-18 | running | |
 | 19 | 'Conservative def-time' + 'state diff' buckets on practice_like (~87 s): sound narrowing | moon-19 | running | |
+| 20 | Tokenizer settings → TokenizerCore(...) read sites ∩ dialect users | moon-20 | running | |
+| 21 | Key-level state diff for class-creation hooks & import-run builders | moon-21 | running | |
