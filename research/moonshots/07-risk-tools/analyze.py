@@ -41,7 +41,8 @@ from reasons import bucket
 def allkind(r):
     b = bucket(r["why"])
     w = r["why"]
-    if "rror" in w[:200] or "collect" in w[:200] or "compile" in w[:200] or "syntax" in w[:200]:
+    import re
+    if re.search(r"SyntaxError|IndentationError|ImportError|Error|deleted|unknown file kind|configuration", w[:200]):
         return "ALL:error/collection"
     return b[:45]
 def mech(r):

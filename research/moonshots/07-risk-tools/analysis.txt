@@ -9,14 +9,15 @@ failing slow tests NOT selected (pre-existing misses): 0
   tpch                                     n=  97 fail=  17 rate=0.18
   max_nodes                                n=  63 fail=   9 rate=0.14
  by mechanism
-  ALL:error/collection                     n= 210 fail=  68 rate=0.32
   func                                     n=  96 fail=  23 rate=0.24
   other                                    n=  86 fail=  17 rate=0.20
-  ALL: base-file class / module / def-time body n=  40 fail=   0 rate=0.00
+  ALL: binding removed                     n=  80 fail=  26 rate=0.33
+  ALL:error/collection                     n=  65 fail=  20 rate=0.31
+  ALL: base-file class / module / def-time body n=  60 fail=   5 rate=0.08
+  ALL: lines run during `import sqlglot`   n=  50 fail=  10 rate=0.20
+  ALL: other                               n=  25 fail=   9 rate=0.36
+  ALL: selection ~ALL cost (function run by ~ev n=  25 fail=   5 rate=0.20
   fixture                                  n=  22 fail=   6 rate=0.27
-  ALL: other                               n=  20 fail=   0 rate=0.00
-  ALL: selection ~ALL cost (function run by ~ev n=  20 fail=   5 rate=0.25
-  ALL: binding removed                     n=  15 fail=   2 rate=0.13
  by diffexec
   dx_none                                  n= 430 fail=  95 rate=0.22
   dx_keepall                               n=  37 fail=  18 rate=0.49
@@ -39,51 +40,45 @@ failing slow tests NOT selected (pre-existing misses): 0
   practice_like                            n=  24 fail=   1 rate=0.04
   sample                                   n=   3 fail=   3 rate=1.00
  by mech x line_hits
-  ('ALL:error/collection', 0)              n= 206 fail=  66 rate=0.32
+  ('ALL: binding removed', 0)              n=  80 fail=  26 rate=0.33
   ('other', 0)                             n=  77 fail=  16 rate=0.21
+  ('ALL:error/collection', 0)              n=  64 fail=  19 rate=0.30
+  ('ALL: base-file class / module / def-time body', 0) n=  60 fail=   5 rate=0.08
   ('func', 0)                              n=  54 fail=   3 rate=0.06
+  ('ALL: lines run during `import sqlglot`', 0) n=  47 fail=   9 rate=0.19
   ('func', 1)                              n=  42 fail=  20 rate=0.48
-  ('ALL: base-file class / module / def-time body', 0) n=  40 fail=   0 rate=0.00
+  ('ALL: other', 0)                        n=  25 fail=   9 rate=0.36
+  ('ALL: selection ~ALL cost (function run by ~ev', 0) n=  21 fail=   1 rate=0.05
   ('fixture', 0)                           n=  20 fail=   5 rate=0.25
-  ('ALL: other', 0)                        n=  20 fail=   0 rate=0.00
-  ('ALL: selection ~ALL cost (function run by ~ev', 0) n=  16 fail=   1 rate=0.06
-  ('ALL: binding removed', 0)              n=  15 fail=   2 rate=0.13
   ('other', 1)                             n=   9 fail=   1 rate=0.11
   ('ALL: selection ~ALL cost (function run by ~ev', 1) n=   4 fail=   4 rate=1.00
-  ('ALL:error/collection', 1)              n=   4 fail=   2 rate=0.50
+  ('ALL: lines run during `import sqlglot`', 1) n=   3 fail=   1 rate=0.33
   ('fixture', 1)                           n=   2 fail=   1 rate=0.50
+  ('ALL:error/collection', 1)              n=   1 fail=   1 rate=1.00
 
-lam=0.3: CV brier 0.1823 logloss 0.5627 (base rate 0.238, brier0 0.1812)
+lam=0.3: CV brier 0.1919 logloss 0.5807 (base rate 0.238, brier0 0.1812)
 
-lam=1.0: CV brier 0.1791 logloss 0.5424 (base rate 0.238, brier0 0.1812)
+lam=1.0: CV brier 0.1876 logloss 0.5638 (base rate 0.238, brier0 0.1812)
 
-lam=3.0: CV brier 0.1757 logloss 0.5285 (base rate 0.238, brier0 0.1812)
+lam=3.0: CV brier 0.1829 logloss 0.5505 (base rate 0.238, brier0 0.1812)
 
 reliability (CV, lam=1), bins by predicted p:
-  [0.01,0.03) n=   2 mean_pred=0.026 observed=1.000 fails=2
-  [0.03,0.07) n=  66 mean_pred=0.060 observed=0.076 fails=5
-  [0.07,0.15) n= 117 mean_pred=0.112 observed=0.103 fails=12
-  [0.15,0.30) n= 184 mean_pred=0.235 observed=0.277 fails=51
-  [0.30,0.60) n= 130 mean_pred=0.429 observed=0.377 fails=49
-  [0.60,1.01) n=  10 mean_pred=0.701 observed=0.200 fails=2
+  [0.03,0.07) n=  18 mean_pred=0.058 observed=0.111 fails=2
+  [0.07,0.15) n=  91 mean_pred=0.118 observed=0.209 fails=19
+  [0.15,0.30) n= 289 mean_pred=0.217 observed=0.242 fails=70
+  [0.30,0.60) n= 102 mean_pred=0.406 observed=0.275 fails=28
+  [0.60,1.01) n=   9 mean_pred=0.672 observed=0.222 fails=2
 lowest-p positives (CV):
-  p=0.0252 private/tiyl max_nodes ALL: selection ~ALL cost (function run by ~ev lh=1 dx_skipped ALL (selection ~ALL cost) sqlglot/parser.py: def Parser._match, (runs at import: +15) [1532]; diffexec: skipped (a .py e
-  p=0.0274 private/tiyl tpch ALL: selection ~ALL cost (function run by ~ev lh=1 dx_skipped ALL (selection ~ALL cost) sqlglot/parser.py: def Parser._match, (runs at import: +15) [1532]; diffexec: skipped (a .py e
-  p=0.0301 private/tiyl opt_tpch ALL: selection ~ALL cost (function run by ~ev lh=1 dx_skipped ALL (selection ~ALL cost) sqlglot/parser.py: def Parser._match, (runs at import: +15) [1532]; diffexec: skipped (a .py e
-  p=0.0359 private/tiyl genmem ALL: selection ~ALL cost (function run by ~ev lh=0 dx_skipped ALL (selection ~ALL cost) sqlglot/parser.py: def Parser._match, (runs at import: +15) [1532]; diffexec: skipped (a .py e
-  p=0.0536 private/tiyl tpcds ALL: selection ~ALL cost (function run by ~ev lh=1 dx_skipped ALL (selection ~ALL cost) sqlglot/parser.py: def Parser._match, (runs at import: +15) [1532]; diffexec: skipped (a .py e
-  p=0.0607 adversarial/fix_delete_empty_init max_nodes ALL:error/collection lh=0 dx_none ALL (tests/__init__.py deleted; tests/__init__.py is loaded at collection)
-  p=0.0697 adversarial/fix_delete_empty_init tpch ALL:error/collection lh=0 dx_none ALL (tests/__init__.py deleted; tests/__init__.py is loaded at collection)
-  p=0.0787 adversarial/fix_delete_empty_init opt_tpch ALL:error/collection lh=0 dx_none ALL (tests/__init__.py deleted; tests/__init__.py is loaded at collection)
-  p=0.0950 private/pqfr genmem func lh=0 dx_none sqlglot/dialects/solr.py: sqlglot/dialects/solr.py: binding removed (SolrGenerator): a module-level statement other than
-  p=0.0955 private/17ns tpch fixture lh=0 dx_none tests/fixtures/optimizer/tpc-h/tpc-h.sql: fixture → readers [61]
-  p=0.1026 private/qp5p opt_tpch fixture lh=0 dx_none tests/fixtures/optimizer/tpc-h/tpc-h.sql: fixture → readers [61]
-coef [-1.48, 0.78, 0.91, 0.11, 0.22, -0.7, 1.61, 0.0, -0.84, -0.69, 0.48, 0.0, 0.61, -0.25, 0.61, 0.0, 0.99, 0.03, 0.0, 0.0, -0.54]
+  p=0.0582 adversarial/fix_delete_empty_init max_nodes ALL:error/collection lh=0 dx_none ALL (tests/__init__.py deleted; tests/__init__.py is loaded at collection)
+  p=0.0662 adversarial/fix_delete_empty_init tpch ALL:error/collection lh=0 dx_none ALL (tests/__init__.py deleted; tests/__init__.py is loaded at collection)
+  p=0.0740 adversarial/fix_delete_empty_init opt_tpch ALL:error/collection lh=0 dx_none ALL (tests/__init__.py deleted; tests/__init__.py is loaded at collection)
+  p=0.1063 private/17ns tpch fixture lh=0 dx_none tests/fixtures/optimizer/tpc-h/tpc-h.sql: fixture → readers [61]
+coef [-1.48, 0.74, 0.87, 0.1, 0.2, 0.36, 0.39, 0.0, -0.77, -0.59, 0.41, 0.12, 0.53, -0.25, 0.6, 0.0, 0.92, -0.36, 0.0, 0.0, -0.25]
 
 == decision sim (CV probabilities). mult=1 is EV-neutral; mult>1 more conservative
-  mult= 0.5 sets=all                    saved=    80.7s misses=1 net=  -219.3 dropped=6 [('private', 'tiyl')]
+  mult= 0.5 sets=all                    saved=    24.2s misses=0 net=    24.2 dropped=1 []
   mult= 0.5 sets=practice_like,sample   saved=     0.0s misses=0 net=     0.0 dropped=0 []
-  mult= 0.5 sets=private                saved=    40.5s misses=1 net=  -259.5 dropped=3 [('private', 'tiyl')]
+  mult= 0.5 sets=private                saved=    24.2s misses=0 net=    24.2 dropped=1 []
   mult=   1 sets=all                    saved=     0.0s misses=0 net=     0.0 dropped=0 []
   mult=   1 sets=practice_like,sample   saved=     0.0s misses=0 net=     0.0 dropped=0 []
   mult=   1 sets=private                saved=     0.0s misses=0 net=     0.0 dropped=0 []
@@ -103,52 +98,52 @@ coef [-1.48, 0.78, 0.91, 0.11, 0.22, -0.7, 1.61, 0.0, -0.84, -0.69, 0.48, 0.0, 0
 slow-test spend over all labeled commits: 2557.738 s on 470 commits
 commits needing a slow test: 61
 
-shift test: n_test=27 fails=4 brier model=0.1285 intercept-only=0.1351
-  sample/2jrq tpcds     y=1 p_shift=0.521 p_cv=0.455 func lh=1 dx_keepall save=18.0
-  sample/3utz tpcds     y=1 p_shift=0.551 p_cv=0.532 func lh=1 dx_keepall save=14.9
-  sample/3utz tpch      y=1 p_shift=0.373 p_cv=0.351 func lh=1 dx_keepall save=0.0
-  practice_like/06t7 tpcds     y=0 p_shift=0.330 p_cv=0.339 func lh=1 dx_skipped save=9.3
-  practice_like/06t7 genmem    y=0 p_shift=0.188 p_cv=0.176 func lh=0 dx_skipped save=1.1
-  practice_like/06t7 tpch      y=0 p_shift=0.193 p_cv=0.207 func lh=1 dx_skipped save=1.1
-  practice_like/06t7 opt_tpch  y=0 p_shift=0.224 p_cv=0.222 func lh=1 dx_skipped save=1.1
-  practice_like/0rza opt_tpch  y=0 p_shift=0.191 p_cv=0.151 func lh=0 dx_keepall save=1.2
-  practice_like/1k2u tpcds     y=0 p_shift=0.544 p_cv=0.463 func lh=1 dx_keepall save=16.1
-  practice_like/4gr2 tpcds     y=0 p_shift=0.184 p_cv=0.131 func lh=0 dx_skipped save=8.9
-  practice_like/4gr2 genmem    y=0 p_shift=0.205 p_cv=0.148 func lh=0 dx_skipped save=1.0
-  practice_like/4gr2 tpch      y=0 p_shift=0.099 p_cv=0.071 func lh=0 dx_skipped save=0.1
-  practice_like/4gr2 opt_tpch  y=0 p_shift=0.117 p_cv=0.079 func lh=0 dx_skipped save=0.0
-  practice_like/7zco max_nodes y=0 p_shift=0.245 p_cv=0.229 ALL:error/collection lh=0 dx_none save=7.4
-  practice_like/7zco tpcds     y=0 p_shift=0.419 p_cv=0.389 ALL:error/collection lh=0 dx_none save=2.0
-  practice_like/7zco genmem    y=0 p_shift=0.449 p_cv=0.442 ALL:error/collection lh=0 dx_none save=0.0
-  practice_like/7zco tpch      y=0 p_shift=0.259 p_cv=0.232 ALL:error/collection lh=0 dx_none save=0.0
-  practice_like/7zco opt_tpch  y=0 p_shift=0.297 p_cv=0.259 ALL:error/collection lh=0 dx_none save=0.0
-  practice_like/ehpl tpcds     y=0 p_shift=0.167 p_cv=0.115 func lh=0 dx_skipped save=8.9
-  practice_like/ehpl genmem    y=0 p_shift=0.187 p_cv=0.130 func lh=0 dx_skipped save=1.0
-  practice_like/ehpl tpch      y=0 p_shift=0.089 p_cv=0.062 func lh=0 dx_skipped save=0.0
-  practice_like/ehpl opt_tpch  y=0 p_shift=0.105 p_cv=0.070 func lh=0 dx_skipped save=0.0
-  practice_like/fq85 tpcds     y=0 p_shift=0.498 p_cv=0.524 func lh=1 dx_keepall save=16.1
-  practice_like/ptlz tpcds     y=1 p_shift=0.390 p_cv=0.380 func lh=1 dx_differs save=21.5
-  practice_like/tggb tpcds     y=0 p_shift=0.281 p_cv=0.272 func lh=0 dx_keepall save=18.4
-  practice_like/z8gc tpcds     y=0 p_shift=0.613 p_cv=0.669 func lh=1 dx_keepall save=12.6
-  practice_like/z8gc opt_tpch  y=0 p_shift=0.482 p_cv=0.538 func lh=1 dx_keepall save=0.0
+shift test: n_test=27 fails=4 brier model=0.1126 intercept-only=0.1351
+  sample/2jrq tpcds     y=1 p_shift=0.512 p_cv=0.451 func lh=1 dx_keepall save=18.0
+  sample/3utz tpcds     y=1 p_shift=0.546 p_cv=0.533 func lh=1 dx_keepall save=14.9
+  sample/3utz tpch      y=1 p_shift=0.379 p_cv=0.359 func lh=1 dx_keepall save=0.0
+  practice_like/06t7 tpcds     y=0 p_shift=0.289 p_cv=0.315 func lh=1 dx_skipped save=9.3
+  practice_like/06t7 genmem    y=0 p_shift=0.173 p_cv=0.173 func lh=0 dx_skipped save=1.1
+  practice_like/06t7 tpch      y=0 p_shift=0.171 p_cv=0.195 func lh=1 dx_skipped save=1.1
+  practice_like/06t7 opt_tpch  y=0 p_shift=0.196 p_cv=0.208 func lh=1 dx_skipped save=1.1
+  practice_like/0rza opt_tpch  y=0 p_shift=0.214 p_cv=0.172 func lh=0 dx_keepall save=1.2
+  practice_like/1k2u tpcds     y=0 p_shift=0.542 p_cv=0.460 func lh=1 dx_keepall save=16.1
+  practice_like/4gr2 tpcds     y=0 p_shift=0.139 p_cv=0.102 func lh=0 dx_skipped save=8.9
+  practice_like/4gr2 genmem    y=0 p_shift=0.150 p_cv=0.113 func lh=0 dx_skipped save=1.0
+  practice_like/4gr2 tpch      y=0 p_shift=0.076 p_cv=0.056 func lh=0 dx_skipped save=0.1
+  practice_like/4gr2 opt_tpch  y=0 p_shift=0.089 p_cv=0.062 func lh=0 dx_skipped save=0.0
+  practice_like/7zco max_nodes y=0 p_shift=0.167 p_cv=0.162 ALL: lines run during `import sqlglot` lh=0 dx_none save=7.4
+  practice_like/7zco tpcds     y=0 p_shift=0.297 p_cv=0.284 ALL: lines run during `import sqlglot` lh=0 dx_none save=2.0
+  practice_like/7zco genmem    y=0 p_shift=0.323 p_cv=0.330 ALL: lines run during `import sqlglot` lh=0 dx_none save=0.0
+  practice_like/7zco tpch      y=0 p_shift=0.176 p_cv=0.163 ALL: lines run during `import sqlglot` lh=0 dx_none save=0.0
+  practice_like/7zco opt_tpch  y=0 p_shift=0.203 p_cv=0.183 ALL: lines run during `import sqlglot` lh=0 dx_none save=0.0
+  practice_like/ehpl tpcds     y=0 p_shift=0.129 p_cv=0.088 func lh=0 dx_skipped save=8.9
+  practice_like/ehpl genmem    y=0 p_shift=0.138 p_cv=0.100 func lh=0 dx_skipped save=1.0
+  practice_like/ehpl tpch      y=0 p_shift=0.070 p_cv=0.048 func lh=0 dx_skipped save=0.0
+  practice_like/ehpl opt_tpch  y=0 p_shift=0.082 p_cv=0.053 func lh=0 dx_skipped save=0.0
+  practice_like/fq85 tpcds     y=0 p_shift=0.500 p_cv=0.526 func lh=1 dx_keepall save=16.1
+  practice_like/ptlz tpcds     y=1 p_shift=0.378 p_cv=0.367 func lh=1 dx_differs save=21.5
+  practice_like/tggb tpcds     y=0 p_shift=0.305 p_cv=0.295 func lh=0 dx_keepall save=18.4
+  practice_like/z8gc tpcds     y=0 p_shift=0.592 p_cv=0.650 func lh=1 dx_keepall save=12.6
+  practice_like/z8gc opt_tpch  y=0 p_shift=0.464 p_cv=0.520 func lh=1 dx_keepall save=0.0
 
 == structural rules over selected slow rows: n, fails, upper95, single-drop savings
   R0 any selected slow                          n= 509 fail=121 rate=0.238 up95=0.277  practice-ish n=262 fail=67 save1=1848s
   R1 ran 0 touched lines                        n= 448 fail= 93 rate=0.208 up95=0.248  practice-ish n=217 fail=42 save1=1267s
   R2 ran 0 touched lines, not ALL               n= 151 fail= 24 rate=0.159 up95=0.226  practice-ish n=68 fail=15 save1=714s
-  R3 ALL (conservative, not error)              n=  95 fail=  7 rate=0.074 up95=0.144  practice-ish n=60 fail=5 save1=178s
-  R4 ALL conservative & ran 0 touched lines     n=  91 fail=  3 rate=0.033 up95=0.092  practice-ish n=56 fail=1 save1=169s
+  R3 ALL (conservative, not error)              n= 240 fail= 55 rate=0.229 up95=0.286  practice-ish n=110 fail=22 save1=449s
+  R4 ALL conservative & ran 0 touched lines     n= 233 fail= 50 rate=0.215 up95=0.272  practice-ish n=105 fail=18 save1=434s
   R5 0 touched lines & 0 fn lines               n= 414 fail= 87 rate=0.210 up95=0.252  practice-ish n=193 fail=40 save1=1145s
   R6 dx incomplete                              n=   1 fail=  0 rate=0.000 up95=0.793  practice-ish n=0 fail=0 save1=21s
   R7 ran touched line (lh>=1)                   n=  61 fail= 28 rate=0.459 up95=0.583  practice-ish n=45 fail=25 save1=581s
   R8 lh>=1 & dx_none                            n=  16 fail=  4 rate=0.250 up95=0.495  practice-ish n=5 fail=2 save1=72s
   R9 state mechanism                            n=   0 fail=  0 rate=0.000 up95=1.000  practice-ish n=0 fail=0 save1=0s
   joint drop by R1 ran 0 touched lines: saved=1909.5s misses=42 [('private', '17ns'), ('private', '40ek'), ('private', '55em'), ('private', 'blag'), ('private', 'db6n'), ('private', 'fae8')] dropped=448
-     {'sample', 'practice_like'}: saved=63.4s misses=0 []
+     {'practice_like', 'sample'}: saved=63.4s misses=0 []
      {'private'}: saved=894.8s misses=21 [('private', '17ns'), ('private', '40ek'), ('private', '55em'), ('private', 'blag'), ('private', 'db6n'), ('private', 'fae8')]
-  joint drop by R4 ALL conservative & ran 0 touched lines: saved=344.6s misses=2 [('private', 'tiyl'), ('adversarial', 'del_transforms_func')] dropped=91
-     {'sample', 'practice_like'}: saved=0.0s misses=0 []
-     {'private'}: saved=210.6s misses=1 [('private', 'tiyl')]
+  joint drop by R4 ALL conservative & ran 0 touched lines: saved=870.4s misses=17 [('private', '40ek'), ('private', 'lrwu'), ('private', 'luvk'), ('private', 'ofqm'), ('private', 'pjl9'), ('private', 'tiyl')] dropped=233
+     {'practice_like', 'sample'}: saved=19.1s misses=0 []
+     {'private'}: saved=373.1s misses=6 [('private', '40ek'), ('private', 'lrwu'), ('private', 'luvk'), ('private', 'ofqm'), ('private', 'pjl9'), ('private', 'tiyl')]
   joint drop by R5 0 touched lines & 0 fn lines: saved=1723.3s misses=40 [('private', '17ns'), ('private', '40ek'), ('private', 'blag'), ('private', 'db6n'), ('private', 'fae8'), ('private', 'g1sp')] dropped=414
-     {'sample', 'practice_like'}: saved=22.2s misses=0 []
+     {'practice_like', 'sample'}: saved=22.2s misses=0 []
      {'private'}: saved=811.8s misses=19 [('private', '17ns'), ('private', '40ek'), ('private', 'blag'), ('private', 'db6n'), ('private', 'fae8'), ('private', 'g1sp')]

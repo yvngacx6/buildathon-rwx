@@ -1,159 +1,136 @@
 # Moonshot 07: calibrated expected-value risk on slow tests
 
-## Verdict: NO-GO as a probabilistic dropper. P(it helps on the final) ≈ 5 %. Expected gain ≈ 0 s.
+## Verdict: NO-GO for expected score. On P(first) it is a ~3–5 % corner gamble. P(this helps) ≈ 5 %; expected gain ≈ 0 s.
 
-- **The structural evidence can't separate failing slow tests from passing ones well enough.**
-  - Data: 470 labeled commits, 509 (commit, selected slow test) rows, 121 of which fail.
-  - Grouped 10-fold CV logistic: AUC **0.64**, Brier **0.179** vs **0.181** for intercept-only.
-  - Leave-sets-out (train on private + adversarial, score on sample + practice_like): Brier 0.129 vs 0.135.
-- **At the EV break-even the model drops nothing.** Break-even is p < saving/300, which is about 3–7 % for tpcds and about 10 % for max_nodes.
+- **Structural evidence can't predict which selected slow tests fail.**
+  - Data: 470 labeled commits, 509 (commit, selected slow test) rows, 121 of which fail (24 %).
+  - Grouped 10-fold CV logistic: AUC **0.56**, Brier **0.188**. Intercept-only is 0.181, so the model is *worse* than the base rate.
+  - Leave-sets-out (train on private + adversarial, score on sample + practice_like): 0.113 vs 0.135. That is n = 27 rows with 4 failures, too few to rely on.
+- **At the EV break-even the model drops nothing.**
+  - Break-even is p < saving/300: about 3–7 % for tpcds, about 10 % for max_nodes.
   - At mult = 1 (the EV-neutral threshold), CV drops **0 tests**.
-  - At mult = 0.5 (twice as aggressive), it saves 81 s across all 470 commits and pays **1 miss (300 s)**.
-- **The lever alone cannot take first place.** On practice we are 194.0 and the leader is 126.1, a 68 s gap. Our *entire* slow-test spend is about 61 s.
-  - Dropping every slow test still leaves us behind, and gives 1.5 expected misses over 60 final commits, so P(0 misses) ≈ 0.22.
-- **Spin-off 1, worth doing soundly rather than probabilistically.** Stratum: a slow test added *only* because the edited function "runs at import", and the test ran 0 touched lines.
-  - Record: **0 failures in 36 rows / 12 commits**, about 103 s of single-drop savings, and it is the stratum behind practice_like 4gr2 and ehpl (tpcds, about 9 s each).
-  - 12 commits is too few to certify statistically (rule of three gives up to about 25 % per commit). Use it as a target for a sound mechanism, the import-state diff of the import-time call (§5).
-- **Spin-off 2.** The "diffexec: not recorded (budget)" stratum fails **13 of 26** times, so it must stay. It is also the largest remaining tpcds spend: 359 s across 23 pool commits, and 1k2u, fq85, tggb and z8gc in practice_like.
-  - The lever there is a store with a bigger budget for executor/optimizer functions, not risk.
+  - The lowest-p true failures sit at p ≈ 0.06 (adversarial/fix_delete_empty_init) and 0.11 (private/17ns).
+- **The lever alone cannot reach first place.** On practice we are 194.0 and the leader is 126.1, a 68 s gap. Our whole slow-test spend is about 61 s.
+- **Answer to (3).** The two objectives disagree:
+  - Expected score / rank: best threshold = drop nothing.
+  - P(first): best threshold = **drop every slow test**, a corner solution, worth only P(first) ≈ 0.03–0.05 today. Any interior threshold is worse than both corners (§3–4).
+- **Spin-off (sound, not probabilistic).** Stratum: a slow test added only because the edited function "runs at import", having run 0 touched lines.
+  - Record: 0 failures in 36 rows / 12 commits, 103 s of single-drop savings. It includes practice_like 4gr2 and ehpl (tpcds, about 9 s each).
+  - Target it with the import-state-diff gate (§5), not a probability. The saving is unverified.
 
-## 1. Data and features (scripts in `07-risk-tools/`, raw output in `analysis.txt`)
+## 1. Data and features (`07-risk-tools/`: harness.py, analyze.py, win.py, analysis.txt)
 
 **Data.**
-- `harness.py` runs today's selector (main 4826380 + the pinned-image store) over sample, practice_like, private, private41, adversarial and adversarial2.
-- It covers 470 commits. 61 of them need a slow test, and the selector already keeps all of those (0 pre-existing slow misses).
+- `harness.py` runs today's selector (main 4826380 + the pinned-image store) on sample, practice_like, private, private41, adversarial and adversarial2.
+- That is 470 labeled commits. candB (481) and all120 have no labels.
+- 61 of the 470 need a slow test, and the selector keeps every one of them (0 slow misses today).
 - Slow tests are max_nodes 28.8 s, tpcds 21.5 s, genmem 6.7 s, tpch 3.9 s and opt_tpch 3.5 s.
 
-**Features per (commit, slow test).** None of them is an edit kind:
-- the mechanism bucket (`eval/reasons.py` buckets, with error/collection ALL split from conservative ALL);
-- the number of touched old lines the test ran (lines map);
-- the number of enclosing-function lines it ran;
-- the popularity of the touched lines;
-- diffexec status (none / keep-all / skipped / differs / incomplete);
-- whether the change is on an exception path;
-- multi-file;
-- the marginal packed-cost saving.
+**Features.** None of them is an edit kind:
+- the mechanism (`eval/reasons.py` buckets, with real error/deleted/config ALL split out);
+- touched old lines the test ran;
+- enclosing-function lines it ran;
+- popularity of the touched lines;
+- diffexec outcome;
+- exception path (never fired on these one-token mutants);
+- multi-file.
 
-The ~600 patches in the brief turned out to be 470 with labels; candB (481) and all120 are unlabeled.
+| Stratum (selected slow rows) | n | fail | rate |
+|---|---|---|---|
+| all | 509 | 121 | 0.24 |
+| test ran a touched line | 61 | 28 | 0.46 |
+| ran 0 touched lines | 448 | 93 | 0.21 |
+| function map, 0 touched lines | 54 | 3 | 0.056 (Wilson 95 % upper bound ≈ 0.15) |
+| **import-time addition, 0 touched lines** | 36 | 0 | 0 (≈ 0.25 per commit by the rule of three) |
+| ALL: base-file class/module body | 60 | 5 | 0.08 |
+| ALL: `import sqlglot` lines | 50 | 10 | 0.20 |
+| ALL: binding removed | 80 | 26 | 0.33 |
+| ALL: real error / deleted / config | 65 | 20 | 0.31 |
+| ALL: ~ALL cost | 25 | 5 | 0.20 |
+| fixture → readers | 22 | 6 | 0.27 |
+| diffexec "not recorded (budget)" | 26 | 13 | 0.50 |
+| diffexec replayed and differs | 6 | 3 | 0.50 |
 
-### Strata (selected slow rows → failure rate)
+**Running a touched line is the only signal, and it points the wrong way for us.** The cheap-to-drop rows (0 touched lines) still fail at 21 %.
 
-| Stratum | n | fail | rate | Wilson 95 % upper bound |
+**Conservative ALL is not safe.**
+- Joint-dropping every conservative-ALL slow test that ran 0 touched lines saves 870 s across the pool and costs 17 misses.
+- An earlier mislabeled split had shown this stratum at 3/91. That was wrong (fixed and re-run).
+
+**Pareto.** CV p, one drop per commit, ranked by p/saving, all 470 commits:
+
+| Drops | Saved s | Real misses | Σp | Π(1−p) |
 |---|---|---|---|---|
-| all selected slow | 509 | 121 | 0.24 | 0.28 |
-| ALL from error / collection | 210 | 68 | 0.32 | – (keep: a broken import fails everything) |
-| ALL conservative (base body, other, binding removed, ~ALL), 0 touched lines | 91 | 3 | 0.033 | 0.092 |
-| function map, test ran a touched line | 42 | 20 | 0.48 | – |
-| function map, 0 touched lines | 54 | 3 | 0.056 | ≈0.15 |
-| import-time addition, 0 touched lines | 36 | 0 | 0 | ≈0.10 per row, ≈0.25 per commit |
-| diffexec not recorded (budget) | 26 | 13 | 0.50 | – |
-| diffexec replayed and differs | 6 | 3 | 0.50 | – |
+| 5 | 90 | 0 | 0.60 | 0.53 |
+| 10 | 145 | 1 | 1.13 | 0.30 |
+| 20 | 293 | 5 | 2.77 | 0.05 |
+| 40 | 555 | 13 | 6.6 | 0.001 |
 
-What this shows:
-- Running a touched line is the only strong signal (0.46 vs 0.21).
-- The exception-path flag never fired on these one-token mutants.
-- Call counts per test are not separable from "ran a touched line" with this store.
+The best case buys about 90–145 s per miss on the pool, and each miss costs 300 s.
 
-**The ALL-conservative stratum.** Its point rate (3.3 %) is below break-even, but the 95 % upper bound is 9 %. Joint dropping there saves 345 s across all 470 commits and pays **2 misses** (private/tiyl `Parser._match` "~ALL cost" and adversarial/del_transforms_func), so net −255 s. It saves 0 s on sample + practice_like, because practice commits do not land in it.
+**Distribution shift.** 13 % of pool commits need a slow test, vs 1/40 = 2.5 % on practice (S11). Pool-calibrated p's are therefore about 5x pessimistic for practice-like commits, so the Pareto above is pool-only. The final projections below anchor on S11 instead.
 
-**Lowest-p true failures under CV:**
-- tiyl (p ≈ 0.03–0.05, all five slow tests fail);
-- fix_delete_empty_init (0.06);
-- pqfr (0.095);
-- 17ns and qp5p (0.10).
-
-So the bottom 2 % of the probability scale is not clean.
-
-### Pareto (CV p, one drop per commit, ranked by p/saving, all 470 commits)
-
-| Drops | Saved s | Realized misses | Σp | P(0 misses) = Π(1−p) |
-|---|---|---|---|---|
-| 1 | 7 | 1 | 0.03 | 0.975 |
-| 5 | 72 | 1 | 0.38 | 0.67 |
-| 10 | 127 | 1 | 0.76 | 0.45 |
-| 20 | 208 | 3 | 1.41 | 0.23 |
-| 40 | 464 | 6 | 4.15 | 0.01 |
-
-The very first drop (tiyl) is already a miss. At best this buys about 70–130 s per miss, and a miss costs 300 s.
-
-## 2. Legality: "no table from a patch, or from a kind of edit, to the tests it breaks"
+## 2. Legality: "no table from a patch, or kind of edit, to the tests it breaks"
 
 **What we must not ship.**
-- Learned coefficients fitted on labels that map patch evidence to P(this test fails). They are a soft patch→failures function.
-- Per-test intercepts (tpcds 0.33, max_nodes 0.14) are worse: they are a literal test→failure-rate table learned from patches.
+- Fitted coefficients mapping patch evidence to P(this test fails). That is a soft patch→failures function learned from labels.
+- Per-test intercepts (tpcds 0.33, max_nodes 0.14) are worse: a literal test→failure-rate table learned from patches.
 
-**The defensible form.** A hand-written *structural* rule whose premise is execution semantics, and whose only label-fitted part is a scalar threshold.
+**The defensible form.**
+- A hand-written *structural* rule whose premise is execution semantics, with a single scalar threshold that labels only validate.
+- This is the same status as `SLOW_SECONDS`, `ALL_FRACTION` and `STATE_MIN_GAIN`, which E006 and E013 tuned on labeled sets.
+- No kind, file or test identity in the rule. Labels count misses; they never fit shipped weights.
 
-- This is the same status as `SLOW_SECONDS`, `ALL_FRACTION` and `STATE_MIN_GAIN`, which E006 and E013 already tuned on labeled sets.
-- Example: "a slow test that ran no touched statement and reaches the edit only through an import-time call is dropped when the import-state diff of that call is empty."
-- Labels are used to *validate* (count misses), never to fit shipped weights.
-- The rule has no kind, file or test identity in it, so it says nothing about which tests a given patch breaks.
+**Consequence.** A defensible rule must be *sound*, and a sound rule needs no probability. The legal version of this moonshot is ordinary selector work (§5).
 
-**Conclusion.** The defensible form is exactly a *sound* mechanism. Once it is sound, it needs no probability. The legal version of this moonshot therefore collapses into ordinary selector work (§5).
+## 3. Expected score vs variance (final ≈ 60 commits)
 
-## 3. Expected score vs variance on the final (~60 commits)
+**Reruns don't resample misses.**
+- Simulated cost is deterministic, so a miss happens in all 5 reruns or in none.
+- Variance comes from which commits the final draws (shared by every team) plus about ±0.5 s of CPU.
 
-**Misses don't add variance across reruns.**
-- The simulated cost is deterministic. A miss happens in all 5 reruns or in none.
-- Variance comes only from which unseen commits the final draws, plus about ±0.5 s of CPU noise.
-- Whether a team wins by 1 s comes down to commit-set luck and CPU, not to rerun noise.
+**Projections, anchored on practice × 1.5:**
+- Ours: 194.0 → **≈ 291 s**. Leader: 126.1 → **≈ 189 s**.
+- Dropping all slow tests saves about 92 s, with 1.5 expected misses (S11: 1/40). Expected score rises to about 650 s; P(0 misses) ≈ e^(−1.5) ≈ 0.22.
 
-**Our final at today's selector.**
-- Practice 194.0 (189.1 sim + 4.9 CPU) × 1.5 ≈ **291 s**.
-- Leader 126.1 × 1.5 ≈ **189 s**.
-- Spending the whole slow budget saves about 92 s and expects 1.5 misses (S11: dropping every test ≥ 3 s gave 1 miss in 40). Expected score 291 → about 650 s.
-
-**Monte Carlo.**
-- `win.py`, 20k draws. Commit-set shock N(0, 8) shared by every team, then N(0, 6) per team. 5 leaders at 1.5 × {126.1, 130.3, 134.3, 135.3, 139.9}, each with probability q of at least one miss on the final's new kinds.
+**Monte Carlo (`win.py`, 20k draws).**
+- Commit-set shock N(0, 8) shared by all teams, plus N(0, 6) per team (assumed, not measured).
+- The top 5 practice scores × 1.5, each with probability q of at least one miss on the final's new kinds.
 - f = fraction of slow spend dropped.
-- Model A: misses ~ Poisson(1.5 f), i.e. no better than random, which is what AUC 0.64 delivers.
-- Model B: an oracle-like rule that keeps the one needing commit 90 % of the time.
+- Model A: misses ~ Poisson(1.5 f), i.e. no better than random, which matches AUC 0.56.
+- Model B: an oracle-like rule that keeps the needing commit 90 % of the time. It is optimistic.
 
-| Our practice-equivalent base (with slow) | q | f=0 | f=0.5 A / B | f=1 A / B |
-|---|---|---|---|---|
-| 194 (today) | 0.2 | 0.000 | 0.000 / 0.000 | 0.03 / 0.10 |
-| 194 | 0.4 | 0.010 | 0.005 / 0.010 | 0.05 / 0.19 |
-| 170 (non-slow cut to ~109) | 0.2 | 0.000 | 0.006 / 0.012 | 0.23 / 0.90 |
-| 155 | 0.2 | 0.000 | 0.29 / 0.60 | 0.22 / 0.91 |
-| 145 | 0.2 | 0.001 | 0.46 / 0.94 | 0.22 / 0.90 |
-
-How to read the table:
-- P(first) is a step function of cost, capped by P(0 misses). Model A at f = 1 can never exceed e^(−1.5) ≈ 0.22.
-- Risk only pays when the rest of the selector is already within about 15–45 s of the leader. In that case the right move is the *smallest* drop set that clears the leader projection, not the EV threshold.
-- At today's base, no threshold gives a meaningful P(first): f = 1 under the unrealistic model B gets 0.10–0.19, and under realistic model A 0.03–0.05.
+| Base (practice, with slow) | q | f=0 | f=0.25 A/B | f=0.5 A/B | f=1 A/B |
+|---|---|---|---|---|---|
+| 194 (today) | 0.2 | 0.000 | 0.000/0.000 | 0.000/0.000 | **0.026**/0.104 |
+| 194 | 0.4 | 0.010 | 0.006/0.009 | 0.005/0.010 | **0.046**/0.186 |
+| 170 (non-slow ≈ 109) | 0.2 | 0.000 | 0.001/0.000 | 0.006/0.012 | 0.226/0.900 |
+| 155 | 0.2 | 0.000 | 0.007/0.011 | 0.294/0.596 | 0.222/0.905 |
+| 145 | 0.2 | 0.001 | 0.185/0.261 | 0.460/0.935 | 0.223/0.900 |
 
 ## 4. Threshold that maximizes P(first)
 
-Order candidates by p/saving and drop the shortest prefix whose cumulative saving S satisfies:
+**P(first) is a step function of cost, capped by P(0 misses).** The optimal rule is therefore: drop the shortest prefix, ordered by p/saving, whose saving clears the leader projection plus a margin of about 3–5 s. If no prefix clears it, take the corner that comes closest.
 
-    our_projection − S < leader_projection − margin
+**Today.**
+- No prefix clears the 68 s gap: the whole slow spend is only 61 s.
+- **The P(first)-max choice is f = 1 (drop all slow): 0.026–0.046 under model A, vs 0.000–0.010 at f = 0.** Intermediate f is worse than both corners, because it pays miss risk without getting under the leader.
+- f = 1 costs about +360 s of expected score, and with it almost surely the top-5 re-run. Which objective governs is the team's call.
+- Our recommendation is to keep f = 0. The 0-miss record across 111 adversarial patches is our real edge if leaders miss new kinds (q), and a 3–5 % lottery does not justify giving it up.
 
-then stop. Using today's numbers:
+**If other work brings non-slow cost to about 110 s/40** (base about 155–170 with slow): an interior f ≈ 0.5–1 maximizes P(first), at about 0.3 (model A).
+- Ship it then as one global threshold on a structural rule, last submission only.
+- Margin: ties within 1 s go to the earlier submission, and the commit-set shock is mostly common to all teams, so 3–5 s covers the per-team σ.
 
-- **Today.** The gap is 68 s (practice) and the full slow spend is 61 s, so the inequality has no solution. **The P(first)-optimal threshold is "drop nothing."** We keep the 0-miss record, which is worth the most if leaders miss new kinds; q is unknown and our 111-patch adversarial record is the edge.
-- **If other moonshots bring the non-slow cost to ≤ about 110 s/40**, a gap of ≤ 15–30 s remains. The prefix is then about 5 drops on the Pareto (P(0 misses) ≈ 0.67). In model-A terms that is P(first) ≈ 0.3–0.45, vs ≈ 0 without risk, so taking the gamble becomes correct.
-- That decision belongs to the last submission. Even then it should be expressed as one global threshold on a structural rule (§2), never as fitted weights.
+## 5. Do instead (sound, rule-compliant)
 
-**Margin.** Ties within 1 s go to the earlier submission, and the commit-set shock is mostly common to all teams. A 3–5 s margin covers the per-team noise (σ ≈ 6 s for 60 commits is our assumption, not a measurement).
-
-## 5. What to do instead (sound, rule-compliant)
-
-1. **Import-time addition → state-diff gate** (stratum 0/36).
-   - When a function-map selection adds tests because the function "runs at import (+N)", run the existing import-state diff (state.py) on the patched import.
-   - An **empty** diff means the import-time call produced identical state. Then only run-time readers (line map) are needed, so slow tests that ran no touched line drop.
-   - This generalizes I25 (already sound for sqlglot-only roots).
-   - practice_like: 4gr2 and ehpl tpcds, about 9 s each over 24 commits, so maybe 10–20 s per 40 practice commits.
-   - CPU: about 1.2 s per diff on EC2 (about 2.4 s on the scorer), so gate it on saving ≥ 4 s.
-   - Smallest test: run the gate on practice_like + private and confirm 0 new misses on all six sets.
-2. **diffexec budget for executor/optimizer functions** (13/26 fail, so only replay can separate them).
-   - These are 1k2u, fq85, tggb and z8gc in practice_like, worth 12–18 s each.
-   - Raising per-function caps for the functions tpcds calls, and lazy-loading those blobs, is the sound path. Store size is not the constraint: the image has no size limit, but the repo ≤ 20 MB applies unless the build fetches the store.
-3. **Don't ship the logistic.** It is near-useless (AUC 0.64), legally exposed, and its EV-neutral threshold drops nothing.
-
-## Numbers in one place
-
-- 470 labeled commits; 509 selected slow rows; 121 fail; 61 commits need a slow test.
-- Pool slow spend: 2558 s.
-- CV AUC 0.64; Brier 0.179 vs 0.181.
-- EV-neutral rule: 0 drops. 2× aggressive: +81 s, 1 miss.
-- Today: no threshold gives P(first) > about 0.05 under realistic model A. The gamble only becomes rational if the non-slow cost reaches about 110 s/40.
+1. **Import-time addition → import-state-diff gate** (stratum 0/36).
+   - When a function selection adds "runs at import (+N)" users and the import-state diff of the patched import is empty, keep only run-time readers. Slow tests that ran no touched line then drop.
+   - I25 already does this for sqlglot-only roots. First check why it did not fire on 4gr2 and ehpl: test-module roots, or the marginal-cost gate.
+   - Possible gain: practice_like 4gr2 and ehpl ≈ 18 s per 24 commits, unverified.
+   - CPU: about 2.4 s on the scorer per diff, so gate on saving ≥ 4 s.
+   - Validate with 0 new misses on all six sets.
+2. **diffexec recording budget for the functions tpcds calls** ("not recorded (budget)" fails 50 %, so only replay can separate those rows).
+   - Affects practice_like 1k2u, fq85, tggb and z8gc, 12–18 s each.
+   - The repo ≤ 20 MB cap is the constraint, not the image.
+3. **Don't ship the logistic.** AUC 0.56, legally exposed, and it drops nothing at break-even.
