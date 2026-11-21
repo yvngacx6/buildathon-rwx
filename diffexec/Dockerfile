@@ -30,7 +30,8 @@ RUN if [ "$RECORD" = "1" ]; then \
 
 ARG STORE=diffexec/empty_store
 COPY ${STORE} /app/diffexec_store
-RUN chmod -R a+rX /app /opt/sqlglot
+RUN cd /app && python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl \
+ && chmod -R a+rX /app /opt/sqlglot
 
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
