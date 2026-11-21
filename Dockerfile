@@ -11,6 +11,8 @@ tarfile.open(fileobj=io.BytesIO(data)).extractall('/opt', filter='data')" \
 
 COPY selector /app/selector
 COPY maps /app/maps
+# Differential-execution replay (I12); its store is maps/diffexec.zip.
+COPY diffexec /app/diffexec
 
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1

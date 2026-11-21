@@ -69,6 +69,35 @@ without ---/+++ (pure renames, empty files added / deleted) are kept as hunkless
 tests that no map knows join every non-empty selection. Without the imports map, every
 "import bound" above is ALL.
 
+## Differential execution (I12): `maps/diffexec.zip`
+
+For a commit whose `.py` edits are all inside function bodies, the tests the lines map selects
+for those functions are checked by replaying, old code against new code, every call input
+that the pinned commit's own test run passed to the changed functions. A test is dropped only
+if every recorded call reachable from it (its own phases, its class's setUpClass, and all calls
+made outside tests) gives an identical effect: same result or exception, same argument state
+after the call (including aliasing), same log records, warnings and stdout, no large slowdown.
+Anything unknown (function not recorded or over a cap, unpicklable input, generator, test that
+failed while recorded, test measuring time/memory/gc, replay error or CPU budget) keeps the
+tests. Without the store the selector behaves exactly as without diffexec.
+
+**Note for judges.** `maps/diffexec.zip` is built only from sqlglot at the pinned commit running
+its own test suite in the pinned image (`mapbuild/diffexec_build.sh`): for every function under
+`sqlglot/`, the deduplicated inputs it was called with while each test ran (capped per function,
+caps applied after merging, so independent of parallelism) and a digest of each call's effect.
+It contains no labels, no patches and no mutants, and nothing in it names an edit kind; the
+decision is made at run time by executing the patched function. Provenance, caps, sizes and
+sha256 are in `maps/MANIFEST.json` → `"diffexec"`.
+
+| Module | Job |
+|---|---|
+| `diffexec/record.py` | pytest plugin used by the store build: records inputs and effect digests per (function, test phase). |
+| `diffexec/serial.py` | Picklers: rebuildable inputs (full `Expr` slot state incl. parents, closures), identity-aware effect digests. |
+| `diffexec/build.py` | Merges per-file recordings, applies caps, writes the deterministic zip. |
+| `diffexec/replay.py` | Run time, in a forked child: swaps in the patched code objects and replays. |
+| `selector/diffexec.py` | Gates (eligibility, benefit, index precheck), CPU budget, fork, drop rule. |
+| `mapbuild/diffexec_build.sh`, `mapbuild/diffexec_run.py` | Rebuild the store in the pinned image. |
+
 ## History
 
 | Version | Date | Change | Sample s |
