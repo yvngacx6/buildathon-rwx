@@ -19,6 +19,7 @@ import sys
 import zlib
 from pathlib import Path
 
+from . import state
 from .names import HARMLESS_BASES, Fallback, Index, Site
 
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "index" / "names.pkl"
@@ -127,6 +128,23 @@ class NameIndex:
                 out.append(site)
         return out
 
+    def mentions(self, name: str) -> list[Site]:
+        """Every place that names `name` (attribute, bare name, string, or an import alias of
+        it), whatever it binds to."""
+        out = [site for *_, site in self._occurrences(name)]
+        for path, alias in self.data["imports"].get(name, ()):
+            if alias != name:
+                out += [site for p, *_, site in self._occurrences(alias) if p == path]
+        return out
+
+    def holders(self, name: str) -> list[tuple[str, tuple[str, ...]]]:
+        """Classes whose body binds class `name` (`class MySQL(Dialect): Parser = MySQLParser`),
+        as (path, chain)."""
+        out = []
+        for holder in self.data["class_refs"].get(name, ()):
+            out += [(p, tuple(ch)) for p, ch, *_ in self.data["classes"].get(holder, ())]
+        return out
+
     def check_class(self, path: str, chain: tuple[str, ...]) -> list[tuple[str, tuple[str, ...]]]:
         """Raise Fallback when class machinery outside our view may consume its attributes
         (an ancestor outside the repo, a decorator that is not the identity).
@@ -224,6 +242,12 @@ def main(argv: list[str]) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(pickle.dumps(data, pickle.HIGHEST_PROTOCOL))
     print(f"name index: {len(data['occ'])} names, {out.stat().st_size // 1024} KiB -> {out}")
+    # The old-source import-state snapshot (selector/state.py) lives next to it.
+    snap = out.with_name("state.pkl")
+    if state.build(sqlglot.resolve(), snap.resolve()):
+        print(f"state snapshot: {snap.stat().st_size // 1024} KiB -> {snap}")
+    else:
+        print("state snapshot: FAILED (state narrowing disabled)", file=sys.stderr)
 
 
 if __name__ == "__main__":
