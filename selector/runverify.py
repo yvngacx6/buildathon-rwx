@@ -47,7 +47,10 @@ DEFAULT_MAP = REPO / "maps" / "runverify.json.gz"
 DEPS = os.environ.get("BR_RUNVERIFY_DEPS", "/app/deps")
 GATE_S = float(os.environ.get("BR_RUNVERIFY_GATE", "0.6"))  # predicted scorer CPU per commit
 SCORER_SLOWDOWN = float(os.environ.get("BR_RUNVERIFY_SLOWDOWN", "2.0"))  # scorer vs map host
-CAP_FACTOR, CAP_EXTRA = 3.0, 0.3  # child CPU cap: 3x the map estimate + 0.3 s (map-host s)
+CAP_FACTOR, CAP_EXTRA = 4.0, 0.3  # child CPU cap: 4x the map estimate + 0.3 s (2x on scorer)
+# Also verify when the predicted scorer CPU is at most this share of what dropping the whole
+# selection would save (its scorer cost: busiest worker + 2 s per worker).
+SHARE = float(os.environ.get("BR_RUNVERIFY_SHARE", "0"))
 BATCH_S = float(os.environ.get("BR_RUNVERIFY_BATCH_S", "20"))  # total child CPU per run
 SPAWN_MODULES = {"multiprocessing", "concurrent", "subprocess", "threading", "_thread",
                  "socket", "asyncio", "pty"}
@@ -677,7 +680,12 @@ class RunVerify:
             return numbers, f"runverify: skip ({got})"
         order, est = got
         scorer = SCORER_SLOWDOWN * est
-        if scorer > GATE_S:
+        gate = GATE_S
+        if SHARE > 0:
+            from . import pack
+            ms_of = {n: pack.duration_ms(self.sel._secs[n]) for n in numbers}
+            gate = max(gate, SHARE * pack.cost_ms(pack.pack(numbers, ms_of), ms_of) / 1000)
+        if scorer > gate:
             return numbers, f"runverify: skip (est {scorer:.2f}s scorer CPU)"
         if self.spent + scorer > BATCH_S:
             return numbers, "runverify: skip (batch budget)"
