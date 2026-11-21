@@ -12,6 +12,8 @@ here knows which tests any particular edit breaks.
   sqlglot/ function body                 tests that ran any line of the function (lines map)
     … slow tests (≥ SLOW_SECONDS)        only if they ran a touched statement (see below)
     … signature / decorator              + users of the enclosing classes (classes map)
+    … writes a class-level table at run  + tests that ran a line naming that table (the
+      time (`self.TABLE[k] = …`, `.pop`)   change can outlive the call: `_class_state_writes`)
     … run while modules are imported     + ALL (`import sqlglot`) / the modules' dependents,
                                          unless the import-state diff shows the patched
                                          sqlglot/ imports build the same state: then nothing
@@ -22,6 +24,8 @@ here knows which tests any particular edit breaks.
       creation / import (metaclass,      module values (selector/state.py); per changed value:
       __init_subclass__, import calls)   tests that ran a run-time reader, among the tests that
                                          can hold the owner class (`_by_state`)
+    … body mutates objects / now        import-state diff first: a change outside the patched
+      aliases one (`X = Base.X`)         modules → ALL (`_foreign_state`)
   sqlglot/ class body (otherwise)        users of the class chain ∪ tests that ran the file
   sqlglot/ module level (otherwise)      users of the module's classes ∪ tests that ran the file
                                          (ALL if the changed names are used in other modules)
@@ -123,6 +127,12 @@ class AllTests(Exception):
     """Raised by a rule that cannot narrow the selection; the message is the reason."""
 
 
+class GlobalEffect(AllTests):
+    """The edit changes import-time state owned by modules it does not touch (a class body
+    that aliases another class's dict and mutates it): every test that runs after the module
+    is imported, in the same process, can see it. ALL, never the import bound."""
+
+
 class Selector:
     def __init__(self, tests: list[dict], sqlglot: Path, maps: Path) -> None:
         self.tests = tests
@@ -147,6 +157,7 @@ class Selector:
         self._name_index: nameindex.NameIndex | None = None
         self._files: list[diff.FilePatch] = []  # the current commit's files
         self._state: dict | None | bool = False  # its import-state diff (False: not yet run)
+        self._state_error: str | None = None  # file that failed the patched import, if known
         self._direct: dict[str, bool] | None = None  # names `_by_names` saw edited
         self.notes: list[str] = []  # why a definition-time region was (not) narrowed
         self._dependents: dict[str, set[int]] = {}
@@ -173,7 +184,7 @@ class Selector:
         files = diff.parse(patch_text)
         if not files:
             return self.all_numbers(), "ALL (no files parsed)"
-        self._files, self._state = files, False
+        self._files, self._state, self._state_error = files, False, None
         chosen: set[int] = set()
         reasons = []
         self._jobs = []  # diffexec: (path, new text, prunable tests) per file
@@ -250,7 +261,7 @@ class Selector:
         try:
             return self._python(fp)
         except AllTests as exc:
-            if str(exc).startswith(f"{path}: hunk"):
+            if isinstance(exc, GlobalEffect) or str(exc).startswith(f"{path}: hunk"):
                 raise
             # Every narrower rule gave up: fall back to the import bound of this one module.
             return self._import_bound(path, str(exc))
@@ -526,6 +537,22 @@ class Selector:
                 if r.signature:
                     got |= self._class_users(module, r.classes)
                     fixed |= got
+                defs = _edited_defs(old_tree, new_tree, r)
+                shared = _class_state_writes(defs)
+                if got and any(classify._writes_shared_state(f) for f in defs):
+                    # state that outlives the call (module / class tables, caches): replaying
+                    # the recorded calls (diffexec) compares only arguments and results
+                    fixed |= got
+                    self._mixed_py = True
+                if shared and got:
+                    # The def mutates a class-level table at run time
+                    # (`self.NO_PAREN_FUNCTION_PARSERS["PRIOR"] = …` … `.pop("PRIOR")`): an edit
+                    # can leave it changed for every later test in the process, which replaying
+                    # one call (diffexec) cannot see either.
+                    got |= self._mention_runners(shared)
+                    fixed |= got
+                    self._mixed_py = True
+                    kinds.append(f"(writes class state {', '.join(sorted(shared))})")
                 # Called while some module is imported (trie builders, decorator factories,
                 # `X = build()` tables, module __getattr__): every importer depends on it,
                 # which no per-test coverage can show.
@@ -594,6 +621,8 @@ class Selector:
         base = path in BASE_FILES
         if base and (r.kind not in ("class", "module") or r.via_def):
             raise AllTests(f"{path}: base class / module body")
+        if r.kind in ("class", "module") and _may_share(old_tree, new_tree, r):
+            self._foreign_state(path)
         try:
             wide: set[int] | None = (self.all_numbers() if base else
                                      self._conservative(path, module, old_tree, new_tree, r))
@@ -642,10 +671,29 @@ class Selector:
         if not users:
             if r.kind == "module" or not r.classes:
                 got |= self._importer_users(path, old_tree, new_tree)
+            else:
+                # A class the classes map does not record (enums, namespaces): other modules
+                # read it through the class object (`ErrorLevel.RAISE`, `DType.BPCHAR.value`)
+                # without running a line of this file or making one.
+                got |= self._mention_runners({name for chain in r.classes for name in chain})
             users = self.maps.module_users(module, classify.top_level_classes(old_tree))
         got |= users
         if not got:
             raise AllTests(f"{path}: definition-time change with no known users")
+        return got
+
+    def _mention_runners(self, names: set[str]) -> set[int]:
+        """Tests that ran a line naming one of these classes (attribute, bare name, string or
+        import alias), plus every test of a test file that names one at import."""
+        index = self._index()
+        got: set[int] = set()
+        for name in names:
+            for site in index.mentions(name):
+                if site.when == "run":
+                    got |= self.maps.span(site.path, *site.lines)
+                elif site.path.startswith("tests/"):
+                    got |= self._by_file.get(site.path, set()) | set(
+                        self.maps.test_imports.get(site.path))
         return got
 
     def _by_names(self, path: str, old_tree: ast.Module, new_tree: ast.Module,
@@ -728,6 +776,42 @@ class Selector:
 
     # ── import-time state (selector/state.py) ──────────────────────────────────
 
+    def _foreign_state(self, path: str) -> None:
+        """Every bound below (users of the class, tests that ran or load the module) assumes
+        the edit changes only state the patched modules own. A body that mutates objects, or
+        that now aliases one, can break that: `SINGLE_TOKENS = Tokenizer.SINGLE_TOKENS` followed
+        by `SINGLE_TOKENS.pop("%")` removes % from every tokenizer once the dialect is imported,
+        lazily, by some earlier test in the same worker. Check it on the import-state diff:
+        an entry that changed outside the patched modules, not a subclass of one of their
+        classes and not a copy of one of their changed values (equal to it both before and
+        after the edit: a re-export, `X = other.X.copy()`) → GlobalEffect (ALL). The patched
+        package does not import: ALL if the failing file is not a patched one (the edit broke
+        another module), else the module's own bound still holds."""
+        found = self._state_diff()
+        if found is None:
+            broken = self._state_error
+            if broken and broken not in {fp.path for fp in self._files}:
+                # the edit makes another module fail to import (it copied a key we removed)
+                raise GlobalEffect(f"{path}: breaks the import of {broken}")
+            return
+        if "digests" not in found:
+            return
+        mods = {_module_of(fp.path) for fp in self._files
+                if fp.path.startswith("sqlglot/") and fp.path.endswith(".py")}
+        digests, info = found["digests"], found["info"]
+        ours = {tuple(digests[k]) for k in found["changed"]
+                if k in digests and _in_modules(k.split(" ", 2)[1], mods)}
+        for key in found["changed"]:
+            kind, owner, attr = key.split(" ", 2)
+            pair = tuple(digests.get(key) or (None, None))
+            if _in_modules(owner, mods) or (None not in pair and pair in ours):
+                continue
+            if kind == "C" and any(m and _in_modules(m, mods)
+                                   for m in (info.get(owner) or {}).get("mro", [])):
+                continue  # a subclass of a patched class: its users are the class's users
+            raise GlobalEffect(f"{path}: changes import-time state outside the patched modules "
+                               f"({owner.rsplit(':', 1)[-1]}.{attr})")
+
     def _state_diff(self) -> dict | None:
         """What the commit changes in the state sqlglot builds at import (once per commit)."""
         if self._state is False:
@@ -742,7 +826,10 @@ class Selector:
             from . import state  # imported on first use: few commits need it
 
             snapshot = Path(os.environ.get("BR_STATE", state.DEFAULT_PATH))
-            self._state = state.diff(self.sqlglot, snapshot, patched)
+            found = state.diff(self.sqlglot, snapshot, patched)
+            if found is not None and "import_error" in found:
+                self._state_error, found = found["import_error"], None
+            self._state = found
         return self._state  # type: ignore[return-value]
 
     def _by_state(self, path: str, r: classify.Region,
@@ -1359,6 +1446,124 @@ def _leading_futures(body: list[ast.stmt]) -> int:
 
 def _module_of(path: str) -> str:
     return path[:-3].replace("/", ".").removesuffix(".__init__")
+
+
+def _in_modules(owner: str, modules: set[str]) -> bool:
+    """Is a state-diff owner (`module`, `module:Qual`, or an anonymous class key
+    `<anon>.module.Qual…`) defined in one of `modules`?"""
+    owner = owner.removeprefix("<anon>.").split(":", 1)[0].rstrip("#")
+    return any(owner == m or owner.startswith(m + ".") for m in modules)
+
+
+_MUTATORS = {"pop", "popitem", "update", "append", "add", "extend", "setdefault", "clear",
+             "remove", "discard", "insert"}
+
+
+def _edited_defs(old_tree: ast.Module, new_tree: ast.Module, r: classify.Region) -> list:
+    """The def a function region edits, in the old and the new tree (a lambda: none)."""
+    if not r.chain or r.is_lambda:
+        return []
+    name = r.chain[-1]
+    out = []
+    for tree in (old_tree, new_tree):
+        scopes: list[ast.AST] = [tree]
+        for part in r.chain:  # follow the chain through class / def bodies (no full walk)
+            scopes = [c for s in scopes for c in getattr(s, "body", ())
+                      if isinstance(c, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                      and c.name == part]
+        if not scopes:  # defined under if / try: search the whole tree
+            scopes = [f for f in ast.walk(tree) if isinstance(
+                f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name == name]
+        out += [f for f in scopes if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    return out
+
+
+def _class_state_writes(defs: list) -> set[str]:
+    """Class-level tables (UPPER_CASE attributes reached through `self` / `cls` /
+    `type(self)`) that the edited def, in either version, mutates in place: item stores and
+    deletes, augmented assignments, mutating method calls."""
+    out: set[str] = set()
+
+    def table(node: ast.AST) -> str | None:
+        if (isinstance(node, ast.Attribute) and node.attr.lstrip("_").isupper()
+                and (isinstance(node.value, ast.Name) and node.value.id in ("self", "cls")
+                     or isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+                     and node.value.func.id == "type")):
+            return node.attr
+        return None
+
+    for fn in defs:
+        for node in ast.walk(fn):
+            hit = None
+            if isinstance(node, ast.Subscript) and not isinstance(node.ctx, ast.Load):
+                hit = table(node.value)
+            elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Attribute):
+                hit = table(node.target)
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                  and node.func.attr in _MUTATORS):
+                hit = table(node.func.value)
+            if hit:
+                out.add(hit)
+    return out
+
+
+_INERT_STMTS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom,
+                ast.Pass, ast.Global, ast.Nonlocal)
+
+
+def _side_effects(body: list[ast.stmt]) -> bool:
+    """Does a class / module body run statements beyond binding names: item / attribute
+    stores, augmented assignments, calls as statements (`KEYWORDS.pop(...)`), loops?"""
+    for stmt in body:
+        if isinstance(stmt, _INERT_STMTS) or (isinstance(stmt, ast.Expr)
+                                              and isinstance(stmt.value, ast.Constant)):
+            continue
+        if isinstance(stmt, ast.Assign):
+            if all(isinstance(n, (ast.Name, ast.Tuple, ast.List, ast.Starred, ast.Load, ast.Store))
+                   for t in stmt.targets for n in ast.walk(t)):
+                continue
+            return True
+        if isinstance(stmt, ast.AnnAssign):
+            if isinstance(stmt.target, ast.Name):
+                continue
+            return True
+        if isinstance(stmt, ast.If):
+            if "TYPE_CHECKING" in ast.dump(stmt.test):
+                continue
+            if _side_effects(stmt.body) or _side_effects(stmt.orelse):
+                return True
+            continue
+        if isinstance(stmt, ast.Try):
+            if any(_side_effects(b) for b in (stmt.body, stmt.orelse, stmt.finalbody,
+                                               *[h.body for h in stmt.handlers])):
+                return True
+            continue
+        return True
+    return False
+
+
+def _may_share(old_tree: ast.Module, new_tree: ast.Module, r: classify.Region) -> bool:
+    """Can a class / module body edit change objects other modules own? Only if a version of
+    the body mutates objects (`_side_effects`) or a changed assignment now binds an existing
+    object by reference (`X = Base.X`: an alias, where the old value was a copy)."""
+    bodies = []
+    for tree in (old_tree, new_tree):
+        if r.kind == "class":
+            node = names._find_class(tree, r.chain)
+            if node is None:
+                return False  # class added / removed: handled as a removed binding / new name
+            bodies.append(node.body)
+        else:
+            bodies.append(tree.body)
+    if _side_effects(bodies[0]) or _side_effects(bodies[1]):
+        return True
+    aliases = [s for s in bodies[1] if isinstance(s, (ast.Assign, ast.AnnAssign))
+               and isinstance(s.value, (ast.Name, ast.Attribute))]
+    if not aliases:
+        return False
+    old = {ast.dump(s) for s in bodies[0] if isinstance(s, (ast.Assign, ast.AnnAssign))
+           and isinstance(s.value, (ast.Name, ast.Attribute))}
+    return any(ast.dump(s) not in old for s in aliases)
 
 
 def name_of(path: str) -> str:

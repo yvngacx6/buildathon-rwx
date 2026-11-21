@@ -339,6 +339,18 @@ def regions(old_tree: ast.Module, new_tree: ast.Module, removed: list[int], adde
     found: dict[Region, None] = {}
     for line in removed:
         found.setdefault(_region_for_old_line(old, line))
+        s = old.innermost(line)
+        if s is not None and s.kind == "lambda" and line == s.node.lineno:
+            # The `lambda` line also belongs to the enclosing scope (the lambda is created
+            # there, next to e.g. the dict key that holds it): deleting a table entry
+            # `KEY: lambda self: …` changes the table, not just the lambda.
+            p = _named_parent(old, s)
+            if p is None:
+                found.setdefault(Region("module", ()))
+            elif p.kind == "class":
+                found.setdefault(Region("class", p.chain, classes=p.classes + (p.chain,)))
+            else:
+                found.setdefault(_function_region(p, line))
     for line in added:
         found.setdefault(_region_for_new_line(old, new, line))
     return [replace(r, statements=touched_statements(r, old, new, same))
@@ -459,7 +471,9 @@ def _writes_shared_state(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     True for `global` / `nonlocal`, and for an item or attribute store / delete whose root
     object is not a local of the def (a module-level name, a call result) or is the `cls`
     of a classmethod. Stores rooted at other parameters (`self.x = ...`, `node.args[k] = ...`)
-    count as per-call state: the object comes from the caller.
+    count as per-call state: the object comes from the caller. Mutating method calls count
+    like stores when rooted at a non-local name (`_REGISTRY.append(x)`) or at a class-level
+    table reached through the instance (`self.NO_PAREN_FUNCTION_PARSERS.pop(k)`).
     """
     params = {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}
     params |= {a.arg for a in (fn.args.vararg, fn.args.kwarg) if a}
@@ -468,16 +482,55 @@ def _writes_shared_state(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
         params -= {a.arg for a in first}
     local = params | {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)
                       and isinstance(n.ctx, ast.Store)}
+
+    def shared_ref(value: ast.AST) -> bool:
+        """A reference (not a copy) to a module-level object or a class-level table."""
+        if isinstance(value, ast.Name):
+            return value.id not in local
+        if isinstance(value, ast.Attribute):
+            root = value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and root.id in ("self", "cls"):
+                return value.attr.lstrip("_").isupper()
+            return isinstance(root, ast.Name) and root.id not in local
+        return False
+
+    # locals bound to shared objects (`table = _TABLES`, `kw = self.KEYWORDS`): mutating them
+    # mutates the shared object
+    aliases = {st.targets[0].id for st in ast.walk(fn)
+               if isinstance(st, ast.Assign) and len(st.targets) == 1
+               and isinstance(st.targets[0], ast.Name) and shared_ref(st.value)}
     for node in ast.walk(fn):
         if isinstance(node, (ast.Global, ast.Nonlocal)):
             return True
+        target = None
         if isinstance(node, (ast.Attribute, ast.Subscript)) and not isinstance(node.ctx, ast.Load):
-            root = node.value
+            target = node.value
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr in _MUTATORS):
+            # `_REGISTRY.append(x)`, `self.TABLE.pop(k)`: an in-place change, like a store
+            target = node.func.value
+            if (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+                    and target.value.id in ("self", "cls")
+                    and target.attr.lstrip("_").isupper()):
+                return True  # a class-level table reached through the instance
+            while isinstance(target, (ast.Attribute, ast.Subscript)):
+                target = target.value
+            if not isinstance(target, ast.Name):
+                continue  # rooted at a call result: per call, as far as we can tell
+        if target is not None:
+            root = target
             while isinstance(root, (ast.Attribute, ast.Subscript)):
                 root = root.value
-            if not (isinstance(root, ast.Name) and root.id in local):
+            if not (isinstance(root, ast.Name) and root.id in local) or (
+                    isinstance(root, ast.Name) and root.id in aliases):
                 return True
     return False
+
+
+_MUTATORS = {"pop", "popitem", "update", "append", "add", "extend", "setdefault", "clear",
+             "remove", "discard", "insert"}
 
 
 def _yields(node: ast.AST) -> bool:
