@@ -24,6 +24,7 @@ class _Meta(type):
     def __new__(cls, name, bases, attrs):
         klass = super().__new__(cls, name, bases, attrs)
         klass.TRIE = {k: len(k) for k in klass.KEYWORDS}  # derived at class creation
+        klass.MARK = "A" in klass.KEYWORDS  # overwrites whatever the body set
         return klass
 
 
@@ -32,6 +33,7 @@ class Dialect(metaclass=_Meta):
     PARTS = (1, 2)
     ESC = "x"
     CACHED = 1
+    OPTS = {"x": 1}
 
     def trie(self):
         return self.TRIE  # @trie
@@ -47,6 +49,16 @@ class Dialect(metaclass=_Meta):
     def core(self):
         return Core(esc=self.ESC)  # @core
 
+    def has_x(self):
+        return "x" in self.OPTS  # @opts_keys
+
+    def any_opts(self):
+        if self.OPTS:  # @opts_truth
+            return 1
+
+    def opt_x(self):
+        return self.OPTS["x"]  # @opts_full
+
     def cached(self):
         if type(self) not in _CACHE:
             _CACHE[type(self)] = build(type(self))
@@ -58,6 +70,8 @@ class TSQL(Dialect):
     PARTS = (3, 4)
     ESC = "y"
     CACHED = 2
+    OPTS = {"x": 2}
+    MARK = 5
 
 
 class Core:
@@ -72,10 +86,10 @@ def build(cls):
     return cls.CACHED  # @build
 '''
 FILES = {"sqlglot/__init__.py": "", "sqlglot/dialect.py": DIALECT}
-T = [f"tests/test_a.py::TestA::test_{i}" for i in range(8)]
-TRIE, TRIE_OTHER, PARTS, PARTS_USE, CORE, ESC, KW, BUILD = range(8)
+T = [f"tests/test_a.py::TestA::test_{i}" for i in range(11)]
+TRIE, TRIE_OTHER, PARTS, PARTS_USE, CORE, ESC, KW, BUILD, OPT_KEYS, OPT_TRUTH, OPT_FULL = range(11)
 D = "sqlglot/dialect.py"
-TSQL_USERS = [TRIE, PARTS, PARTS_USE, CORE, ESC, KW, BUILD]
+TSQL_USERS = [TRIE, PARTS, PARTS_USE, CORE, ESC, KW, BUILD, OPT_KEYS, OPT_TRUTH, OPT_FULL]
 
 
 def line_of(marker: str) -> int:
@@ -98,9 +112,12 @@ def repo(tmp_path_factory) -> tuple[Path, Path]:
         f"{D}:{line_of('@core')}": [CORE, ESC],
         f"{D}:{line_of('@esc')}": [ESC],
         f"{D}:{line_of('@build')}": [BUILD],
+        f"{D}:{line_of('@opts_keys')}": [OPT_KEYS],
+        f"{D}:{line_of('@opts_truth')}": [OPT_TRUTH],
+        f"{D}:{line_of('@opts_full')}": [OPT_FULL],
     }
     classes = {"sqlglot.dialect.TSQL": TSQL_USERS,
-               "sqlglot.dialect.Dialect": list(range(8))}
+               "sqlglot.dialect.Dialect": list(range(len(T)))}
     maps.mkdir()
     for name, mapping in {"lines": lines, "classes": classes, "reads": {},
                           "test_imports": {}}.items():
@@ -170,8 +187,25 @@ def test_snapshot_of_other_source_is_not_used(repo, tmp_path, monkeypatch):
     (other / D).write_text(DIALECT + "\n# changed size\n")
     (other / "sqlglot/__init__.py").write_text("")
     assert state.diff(other, snapshot, {}) is None
-    assert state.diff(root, snapshot, {}) == {"changed": [], "info": {}, "instances": [],
-                                              "holders": {}}
+    assert state.diff(root, snapshot, {}) == {"changed": [], "same": {}, "info": {},
+                                              "instances": [], "holders": {}}
+
+
+@pytest.mark.parametrize("after, expected", [
+    ('OPTS = dict(x=3)', {OPT_FULL}),  # same keys, same truth (a call: state diff)
+    ('OPTS = dict(y=2)', {OPT_FULL, OPT_KEYS}),  # same truth only
+    ("OPTS = dict()", {OPT_FULL, OPT_KEYS, OPT_TRUTH}),
+])
+def test_reads_of_truth_or_keys_only_see_what_changed(selector, after, expected):
+    got, why = run(selector, 'OPTS = {"x": 2}', after)
+    assert got == expected, why
+
+
+def test_edit_overwritten_at_class_creation_selects_nothing(selector):
+    # the metaclass overwrites MARK: the patched import builds the same state
+    got, why = run(selector, "MARK = 5", "MARK = 6")
+    assert got == set(), why
+    assert "identical state" in why
 
 
 def test_diff_reports_derived_values(repo):

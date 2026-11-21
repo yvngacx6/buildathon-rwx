@@ -250,3 +250,54 @@ def test_prebuilt_index_is_used_only_for_the_source_it_describes(tmp_path):
     assert {"sqlglot/dialect.py", "tests/test_tsql.py"} <= paths
     (repo / "sqlglot/user.py").write_text(USER + "# edited\n")
     assert nameindex.load(out, repo) is None
+
+
+SERDE = '''\
+from sqlglot import expressions as exp
+
+
+def load(name, path):
+    module: object
+    if path:
+        module = __import__(path, fromlist=[name])
+    else:
+        module = exp
+    return getattr(module, name)  # @module_lookup
+
+
+def maybe(name, obj):
+    module = exp
+    module = obj  # rebound to any object
+    return getattr(module, name)  # @any_lookup
+'''
+
+
+def test_computed_lookup_on_a_module_cannot_read_a_class_attribute():
+    from selector.names import Index
+    index = Index({"sqlglot/serde.py": SERDE, "sqlglot/expressions.py": "",
+                   "sqlglot/__init__.py": ""})
+    found = {site.lines[0]: on_module for _, _, site, _, _, on_module in index._dynamic_sites()}
+    rows = SERDE.splitlines()
+    line = next(i for i, row in enumerate(rows, 1) if "@module_lookup" in row)
+    other = next(i for i, row in enumerate(rows, 1) if "@any_lookup" in row)
+    assert found[line] is not None  # module globals only: never a class attribute
+    assert found[other] is None
+
+
+@pytest.mark.parametrize("code, use", [
+    ("if x.A: pass", "truth"),
+    ("y = 1 if not x.A else 2", "truth"),
+    ("if a and x.A: pass", "truth"),
+    ("y = a and x.A", ""),  # returns x.A itself
+    ("y = bool(x.A or b)", "truth"),
+    ("y = 'k' in x.A", "keys"),
+    ("y = x.A in z", ""),
+    ("y = x.A.get('k')", ""),
+])
+def test_how_a_read_uses_the_value(code, use):
+    import ast
+    from selector.names import _use
+    tree = ast.parse(code)
+    parents = {id(c): p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+    node = next(n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "A")
+    assert _use(node, parents) == use

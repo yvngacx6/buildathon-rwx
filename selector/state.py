@@ -56,6 +56,7 @@ SKIP_GLOBALS = {"__builtins__", "__loader__", "__spec__", "__file__", "__cached_
                 "__name__", "__package__", "__path__", "__annotations__", "__annotate__",
                 "__conditional_annotations__"}
 _SCALARS = {type(None), bool, int, float, complex}
+_PLAIN = _SCALARS | {str, bytes, dict, list, tuple, set, frozenset}
 _ADDRESS = re.compile(r" at 0x[0-9a-fA-F]+")
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "index" / "state.pkl"
 
@@ -237,6 +238,17 @@ class Snapshot:
         return _h("code", c.co_code, consts, c.co_names, c.co_varnames, c.co_freevars,
                   c.co_argcount, c.co_kwonlyargcount, c.co_flags)
 
+    def proj(self, v: object) -> tuple[bool | None, str | None]:
+        """What a read that only tests truth (`if X:`) or membership (`k in X`) can see of
+        `v`: (bool(v), digest of the set of keys / elements); None where not computed
+        (only exact builtin containers and scalars, whose `bool` / `in` run no repo code)."""
+        t = type(v)
+        truth = bool(v) if t in _PLAIN else None
+        keys = None
+        if t in (dict, set, frozenset, list, tuple):
+            keys = _h(sorted({self.fp(k) for k in v}))
+        return truth, keys
+
     def value(self, key: str) -> object:
         """The value behind an entry key of `take`."""
         kind, owner, name = key.split(" ")
@@ -380,13 +392,25 @@ def unordered(snap: Snapshot, keys) -> dict[str, str | None]:
     return out
 
 
+def projections(snap: Snapshot, keys) -> dict[str, tuple[bool | None, str | None]]:
+    """`Snapshot.proj` of some entries (missing / pseudo entries left out)."""
+    out = {}
+    for k in keys:
+        try:
+            value = snap.value(k)
+        except (KeyError, ValueError):
+            continue
+        out[k] = snap.proj(value)
+    return out
+
+
 def _main(argv: list[str]) -> None:
     cmd, root = argv[0], argv[1]
     if cmd == "snap":  # snap <root> <out>
         snap = take(root, {}, track=True)
         Path(argv[2]).write_bytes(pickle.dumps(
             {"entries": snap.entries, "info": snap.info(), "instances": snap.instance_mro(),
-             "holders": snap.holders(),
+             "holders": snap.holders(), "proj": projections(snap, snap.entries),
              "unordered": unordered(snap, snap.entries)}, pickle.HIGHEST_PROTOCOL))
         return
     if cmd == "diff":  # diff <root> <old>; stdin: {"path": patched source}
@@ -423,7 +447,18 @@ def compare(snap: Snapshot, old: dict, patched: dict[str, str]) -> dict:
     info = {k: info.get(k) or old["info"].get(k) for k in keys}
     held = old.get("holders")
     wanted = keys | {m for k in keys for m in (info.get(k) or {}).get("mro", []) if m}
+    # per changed entry, what reads that only test its truth / membership still see the same
+    before_proj = old.get("proj") or {}
+    now_proj = projections(snap, [k for k in changed if k in new and k in before_proj])
+    same = {}
+    for k, (truth, keys) in now_proj.items():
+        was_truth, was_keys = before_proj[k]
+        kept = (["truth"] if truth is not None and truth == was_truth else []) + (
+            ["keys"] if keys is not None and keys == was_keys else [])
+        if kept:
+            same[k] = kept
     return {"changed": sorted(changed),
+            "same": same,
             "info": info,
             "instances": sorted(set(snap.instance_mro()) | set(old["instances"])),
             "holders": None if held is None else {k: held[k] for k in wanted if k in held}}
