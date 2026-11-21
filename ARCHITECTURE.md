@@ -34,22 +34,35 @@ Every rule is about code structure; no rule names an edit kind as harmless or ma
 | `selector/pack.py` | Choose worker count and split tests (scorer cost model). |
 | `mapbuild/import_time.py` | Build `maps/import_time.json.gz`: per line, the modules whose import runs it (fresh interpreter per module, sys.monitoring). |
 | `eval/adversarial.py` | Write the adversarial private patch set (import-time code, removed names, hunkless diffs, …). Patches and labels stay out of git. |
+| `mapbuild/import_map.py` | Builds `maps/imports.json.gz`: runs every test alone in a fresh pytest process with `mapbuild/importtrace/sitecustomize.py` on PYTHONPATH (audit "import" hook, also in subprocesses / spawned pool workers) and records each module it loads. Selector use: the import bound (below). |
 | `mapbuild/convert_prototype.py` | INTERIM: convert the laptop prototype maps (research reports 02 and 05) into the SCHEMA format. |
 | `maps/` | `lines`, `classes`, `reads`, `test_imports`, `import_time` (.json.gz) + `MANIFEST.json`. |
 | `eval/evaluate.py` | Score the selector on `sample/` and the private set, without Docker. |
 | `tests/test_select.py` | One unit test per rule, on a tiny fake repo (`python -m pytest tests/`). |
 | `tests/test_names.py` | The I08 narrowing and each of its fallbacks. |
 
-Safety nets: hunk does not apply / does not parse → ALL; definition-time change with no known
-users → ALL; module-level non-assignment change → ALL; base-class bodies (`BASE_FILES`) → ALL;
+Import bound (r2-importclosure): an edit confined to one module can only reach tests that load
+that module (imports map) or read it as a file (reads map); if the module stops importing,
+exactly those tests error. Used for: new text that does not parse, deleted / renamed .py
+files (old path; a rename onto conftest, __init__ or a non-module stays ALL), removed
+bindings, and every rule below that would otherwise answer ALL – but only for modules loaded
+lazily at run time (dialects by name, imports inside functions). A module loaded while
+pytest collects the test files (160 of them, incl. the `import sqlglot` set, everything
+tests/dialects/test_dialect.py and test files import) → ALL: a collection error may
+interrupt the whole session (pytest default). Deleting a test file nothing imports → its tests.
+
+Safety nets: hunk does not apply → ALL; does not parse → import bound; definition-time change
+with no known users → import bound; module-level non-assignment change → import bound;
+base-class bodies (`BASE_FILES`) → import bound (≈ ALL: 1617 tests load them);
 a function no test ran is treated as definition-time code (it may run only at import);
-tests that no map knows join every non-empty selection.
 Import-time: a function whose body runs while modules are imported (trie builders, decorator
 factories, `X = build()` tables, module `__getattr__`) is a change to every importer: ALL if
 `import sqlglot` runs it, else the dependents of each module whose import runs it. Module-level
 name changes follow derived names (`B = f(A)`) and same-module functions that read them;
 deleted / renamed top-level defs and classes join the importer search. `diff --git` entries
 without ---/+++ (pure renames, empty files added / deleted) are kept as hunkless file patches.
+tests that no map knows join every non-empty selection. Without the imports map, every
+"import bound" above is ALL.
 
 ## History
 
@@ -60,3 +73,4 @@ without ---/+++ (pure renames, empty files added / deleted) are kept as hunkless
 | r1-attrnarrow | 2026-11-20 | I08: name-reader narrowing of class / module assignments; lambda call lines | 185.0 |
 | r1-robust | 2026-11-20 | Import-time map; removed/renamed/derived module names; hunkless diff entries (adversarial round 1) | 198.8 |
 | r2-slowtests | 2026-11-20 | Slow tests (≥ 5 s) in function bodies need a touched statement (private264: 3453.9 → 3269.2) | 185.0 |
+| r2-importclosure | 2026-11-20 | I22: import bound (traced per-test import closure) instead of ALL, run-time-only modules | 183.9 (private264 3263.9 → 2923.7) |

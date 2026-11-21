@@ -351,6 +351,94 @@ def test_bindings_detects_removed_names():
     assert _bindings(old) - _bindings(new) == {"record", "A.f"}
 
 
+# ── import bound (imports map) ───────────────────────────────────────────────
+
+IMPORTS = {"sqlglot/other.py": [A], "sqlglot/lib.py": [A, C, D], "sqlglot/parser.py": [A, B, C, D],
+           "sqlglot/fourth.py": [B], "tests/test_lib.py": [A, B], "<isolation-failure>": []}
+
+
+COLLECTED = ["sqlglot/parser.py", "tests/helpers.py", "tests/test_lib.py"]
+COLLECTED_BY_IMPORT = ["sqlglot/parser.py", "tests/helpers.py"]  # test_lib.py: pytest only
+
+
+def _with_imports(selector: Selector, tmp_path: Path, mapping: dict, **extra) -> Selector:
+    body = {"tests": T[:4], "map": mapping,  # U is untraced: always added
+            "collection": COLLECTED, "collection_imported": COLLECTED_BY_IMPORT, **extra}
+    body = {k: v for k, v in body.items() if v is not None}
+    (tmp_path / "maps" / "imports.json.gz").write_bytes(gzip.compress(json.dumps(body).encode()))
+    return Selector(selector.tests, selector.sqlglot, tmp_path / "maps")
+
+
+@pytest.fixture
+def bounded(selector: Selector, tmp_path: Path) -> Selector:
+    return _with_imports(selector, tmp_path, IMPORTS)
+
+
+def test_syntax_error_selects_tests_that_load_the_module(bounded):
+    assert run(bounded, edit("sqlglot/lib.py", "return sql\n", "return sql +\n")) == {A, C, D, U}
+
+
+def test_deleted_module_selects_tests_that_load_it(bounded):
+    assert run(bounded, patch("sqlglot/other.py", OTHER, None)) == {A, U}
+
+
+def test_renamed_module_selects_tests_that_load_the_old_path(bounded):
+    text = ("--- a/sqlglot/other.py\n+++ b/sqlglot/moved.py\n@@ -1 +1 @@\n"
+            "-from sqlglot.lib import Dialect\n+from sqlglot.lib import Dialect\n")
+    assert run(bounded, text) == {A, U}
+
+
+def test_rule_that_gives_up_falls_back_to_import_bound(bounded):
+    # module-level import change and base-class body were ALL
+    assert run(bounded, edit("sqlglot/other.py", "from sqlglot.lib import Dialect",
+                             "from sqlglot.lib import Dialect, LIMIT")) == {A, U}
+    assert run(bounded, edit("sqlglot/parser.py", "STRICT = False", "STRICT = True")) == ALL
+
+
+def test_hunk_that_does_not_apply_still_selects_all(bounded):
+    assert run(bounded, patch("sqlglot/lib.py", "nothing like the file\n", "x\n")) == ALL
+
+
+def test_removed_binding_selects_tests_that_load_the_module(bounded):
+    # Dialect is imported by other.py → the removal is visible → import bound of lib.py
+    assert run(bounded, edit("sqlglot/lib.py", "class Dialect:", "class Dialect2:")) == {A, C, D, U}
+
+
+def test_rename_onto_conftest_or_init_selects_all(bounded):
+    for target in ("tests/conftest.py", "sqlglot/__init__.py", "setup.py", "sqlglot/x.txt"):
+        text = (f"--- a/sqlglot/other.py\n+++ b/{target}\n@@ -1 +1 @@\n"
+                "-from sqlglot.lib import Dialect\n+from sqlglot.lib import Dialect\n")
+        assert run(bounded, text) == ALL, target
+
+
+def test_module_nothing_loads_selects_only_unknown_tests(bounded):
+    # only the untraced test U, which the map cannot vouch for
+    assert run(bounded, patch("sqlglot/third.py", FILES["sqlglot/third.py"], None)) == {U}
+
+
+def test_isolation_failures_join_the_bound(selector, tmp_path):
+    sel = _with_imports(selector, tmp_path, {**IMPORTS, "<isolation-failure>": [D]})
+    assert run(sel, patch("sqlglot/other.py", OTHER, None)) == {A, D, U}
+
+
+def test_syntax_error_in_collected_file_selects_all(bounded):
+    # a collection error: pytest's default interrupts the whole session
+    assert run(bounded, edit("tests/test_lib.py", "assert True", "assert True +")) == ALL
+    assert run(bounded, edit("tests/helpers.py", "return 1", "return 1 +")) == ALL
+
+
+def test_deleted_test_file_nothing_imports_selects_its_tests(bounded):
+    assert run(bounded, patch("tests/test_lib.py", TEST, None)) == {A, B, U}
+
+
+def test_deleted_module_imported_at_collection_selects_all(bounded):
+    assert run(bounded, patch("tests/helpers.py", HELPERS, None)) == ALL
+
+
+def test_map_without_collection_lists_selects_all(selector, tmp_path):
+    sel = _with_imports(selector, tmp_path, IMPORTS, collection=None, collection_imported=None)
+    assert run(sel, patch("sqlglot/other.py", OTHER, None)) == ALL
+
 # ── import-time code, removed names, derived names, hunkless entries ─────────
 
 def test_function_run_by_import_sqlglot_selects_all(selector):

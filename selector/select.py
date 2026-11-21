@@ -8,7 +8,7 @@ here knows which tests any particular edit breaks.
   file                                   selection
   ─────────────────────────────────────  ───────────────────────────────────────────────
   .py, same syntax tree (or docstrings)  nothing
-  .py that does not parse after patch    ALL
+  .py that does not parse after patch    import bound: tests that load the module ∪ read it
   sqlglot/ function body                 tests that ran any line of the function (lines map)
     … slow tests (≥ SLOW_SECONDS)        only if they ran a touched statement (see below)
     … signature / decorator              + users of the enclosing classes (classes map)
@@ -24,10 +24,24 @@ here knows which tests any particular edit breaks.
   tests/ helper module                   importers (test_imports map)
   tests/fixtures/**                      tests that read the file (reads map); never AST-filtered
   new .py file (not conftest)            nothing: nothing at the pinned commit imports it
-  deleted / renamed .py file             ALL
+  deleted / renamed .py file             import bound of the old path
+  any rule above that gives up (removed  import bound of the module (instead of ALL)
+    binding, changed import, no known
+    users, base-class body, …)
   docs, *.md, benchmarks/, posts/        nothing
   pyproject.toml / setup.cfg             nothing, unless a pytest section changes → ALL
   anything else, or a hunk that fails    ALL
+
+Import bound (imports map, mapbuild/import_map.py): each test was run alone in a fresh
+process and every module it loaded was recorded (collection-time closure of its file, eager
+`import sqlglot` set, lazy dialect loads, function-level imports, subprocesses). An edit
+confined to one module can only reach tests that load it or read it as a file; a module
+that fails to import breaks exactly those. Tests that fail when run alone, or that the trace
+does not know, are always added. Without the map, or for a hunk that does not apply: ALL.
+Only for modules loaded lazily at run time: a module loaded while pytest collects the test
+files (`pytest --collect-only tests`, traced at map build) would fail at collection, and
+pytest's default interrupts the whole session → ALL. A deleted / renamed test file that no
+other module imports is not a collection error (its tests just vanish) → import bound.
 
 Then: tests no map knows about join every non-empty selection, and a selection that would
 cost nearly as much as ALL becomes ALL (same price, no risk).
@@ -132,7 +146,13 @@ class Selector:
                 readers |= self.maps.reads.get(p)
             return readers, "fixture → readers"
         if fp.old_path and fp.new_path and fp.old_path != fp.new_path:
-            raise AllTests(f"{path} renamed")
+            # The old module is gone; nothing at the pinned commit imports the new path –
+            # unless the new path is one pytest or Python picks up by itself.
+            new = fp.new_path
+            if not (new.endswith(".py") and new.startswith(("sqlglot/", "tests/"))
+                    and name_of(new) not in ALWAYS_ALL and name_of(new) != "__init__.py"):
+                raise AllTests(f"{fp.old_path} renamed to {new}")
+            return self._import_bound(fp.old_path, f"{fp.old_path} renamed", removed=True)
         if name in ALWAYS_ALL:
             raise AllTests(f"{path} is test configuration")
         if path.startswith(DOC_DIRS) or path.endswith(DOC_SUFFIXES) or name in DOC_FILES:
@@ -149,8 +169,31 @@ class Selector:
                 return set(), "new module, nothing imports it"
             raise AllTests(f"{path}: new file outside sqlglot/ and tests/")
         if fp.new_path is None:
-            raise AllTests(f"{path} deleted")
-        return self._python(fp)
+            return self._import_bound(path, f"{path} deleted", removed=True)
+        try:
+            return self._python(fp)
+        except AllTests as exc:
+            if str(exc).startswith(f"{path}: hunk"):
+                raise
+            # Every narrower rule gave up: fall back to the import bound of this one module.
+            return self._import_bound(path, str(exc))
+
+    def _import_bound(self, path: str, why: str, removed: bool = False) -> tuple[set[int], str]:
+        """Every test an edit confined to module `path` can reach: the tests that load it
+        (imports map: its import closure, traced per test in a fresh process, lazy loads
+        included) ∪ the tests that read it as a file. If it stops importing, these break.
+
+        Only for modules loaded lazily, after collection: if the module is loaded while
+        pytest collects the test files, a failure there is a collection error, and pytest's
+        default interrupts the whole session → ALL. A removed (deleted / renamed) test file
+        that no other module imports is not a collection error: its tests just vanish."""
+        loaders = self.maps.loaders(path)
+        if (loaders is None or not path.endswith(".py") or name_of(path) in ALWAYS_ALL
+                or not path.startswith(("sqlglot/", "tests/"))):
+            raise AllTests(why)
+        if self.maps.collected(path, by_import=removed):
+            raise AllTests(f"{why}; {path} is loaded at collection")
+        return loaders | self.maps.reads.get(path), f"{why} → tests that load it (run time)"
 
     def _config(self, fp: diff.FilePatch) -> tuple[set[int], str]:
         """pyproject.toml / setup.cfg: only pytest sections can change a test run."""
@@ -174,10 +217,13 @@ class Selector:
         try:
             old_text = old_bytes.decode("utf-8")
             new_text = diff.apply(old_text, fp)
+        except (diff.PatchError, UnicodeDecodeError) as exc:
+            raise AllTests(f"{path}: hunk does not apply ({type(exc).__name__})") from None
+        try:
             old_tree = ast.parse(old_bytes)
             new_tree = ast.parse(new_text.encode("utf-8"))
             compile(new_tree, path, "exec")
-        except (diff.PatchError, SyntaxError, ValueError, UnicodeDecodeError) as exc:
+        except (SyntaxError, ValueError) as exc:  # the module no longer imports
             raise AllTests(f"{path}: {type(exc).__name__}") from None
         classify.strip_docstrings(old_tree)
         classify.strip_docstrings(new_tree)

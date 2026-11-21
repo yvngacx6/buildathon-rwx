@@ -38,5 +38,11 @@
   "reads.json.gz": "ec9bac97b1345881da4247eecf485f6bbe6b312d5b8996d62e9d4c1e5b90e262",
   "test_imports.json.gz": "60c49d6b4c070cda176471547825565befb8d1970e0db0125da2a81a0c5515a2",
   "import_time.json.gz": "4c208c9b19b0b50ea325b31036563652cd471bfcd44969ee7091d849cd9e1ed0"
+ },
+ "imports": {
+  "build_command": "SKIP_INTEGRATION=0 python mapbuild/import_map.py sample/tests.json <scratch copy of pinned sqlglot> maps -j4 (--recollect redoes only the collection lists)",
+  "built": "2026-11-21; full map on laptop (python 3.13.12, same pinned source, same requirements versions). Checked in the pinned image (agent-adv = python:3.13-slim@sha256:e48f59... + requirements.lock, EC2): every 8th test (203) re-traced there gives identical module sets, and identical collection lists. Full image run not done: the shared 4-core box was ~100 min busy.",
+  "facts": "1620 tests each run alone, 244 modules, 0 isolation failures; collection: 160 modules (101 by import). No labeled patch used.",
+  "environment_note": "The only except ImportError around a repo import is sqlglot/_version (generated, not in the repo), so optional dependencies cannot change the module closures."
  }
 }
