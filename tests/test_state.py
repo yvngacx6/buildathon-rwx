@@ -115,7 +115,7 @@ def repo(tmp_path_factory) -> tuple[Path, Path]:
 def selector(repo, monkeypatch) -> Selector:
     root, snapshot = repo
     monkeypatch.setenv("BR_STATE", str(snapshot))
-    monkeypatch.setattr(select, "STATE_MIN_COST", 0.0)
+    monkeypatch.setattr(select, "STATE_MIN_GAIN", -10.0)
     # the fake's hierarchy stands in for one the classes map records
     monkeypatch.setattr(select, "TRACKED_ROOTS", {"sqlglot.dialect:Dialect"})
     tests = [{"number": i, "id": t, "file": t.split("::")[0], "seconds": 1.0}

@@ -72,9 +72,9 @@ CONFIG_FILES = {"pyproject.toml", "setup.cfg"}
 ALWAYS_ALL = {"pytest.ini", "tox.ini", "conftest.py", "setup.py"}
 ALL_FRACTION = 0.85  # selection cost ≥ this × ALL cost → just run ALL
 SLOW_SECONDS = 5.0  # tests at least this slow get the statement-level rule in function bodies
-# An import-state diff costs ~0.4 s of CPU; any non-empty selection costs ≥ 2 s. Below this
-# cost the wide set leaves too little to win.
-STATE_MIN_COST = 3.5
+# An import-state diff costs ~1.2 s of container CPU (EC2, pinned image). Run it only when the
+# wide set costs at least this much more than the cheapest selection it could give.
+STATE_MIN_GAIN = 2.0
 # Class hierarchies the classes map records (maps/MANIFEST.json notes): a test that made an
 # instance of one of these classes (or used it as a dialect) is credited to it and its bases.
 TRACKED_ROOTS = {
@@ -324,12 +324,14 @@ class Selector:
             except names.Fallback as exc:
                 self.notes.append(f"{'.'.join(r.chain) or module}: no narrowing ({exc})")
                 try:
-                    if wide is not None and self._cost(wide) < STATE_MIN_COST:
-                        raise names.Fallback("too cheap to pay for an import-state diff")
                     direct, self._direct = self._direct, None
-                    if wide is not None and direct and self._seconds(
-                            self._state_floor(path, r, direct, wide)) >= self._seconds(wide):
-                        raise names.Fallback("the edited names' own readers cost as much")
+                    if wide is not None:
+                        # A selection is never cheaper than this floor (2 s if unknown).
+                        floor = (self._cost(self._state_floor(path, r, direct, wide))
+                                 if direct else 0.0)
+                        if self._cost(wide) - max(floor, 2.0) < STATE_MIN_GAIN:
+                            raise names.Fallback(f"at most {self._cost(wide) - max(floor, 2.0):.1f}"
+                                                 " s to win: not worth an import-state diff")
                     got, why = self._by_state(path, r, wide)
                     if wide is not None and self._seconds(got) >= self._seconds(wide):
                         raise names.Fallback(f"{why}, but no cheaper")
