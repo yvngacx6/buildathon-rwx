@@ -1,26 +1,48 @@
 {
-  "status": "INTERIM prototype maps, laptop-built (not the pinned image). Replace with the definitive maps from branch `maps` when they land.",
-  "sqlglot_sha": "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
-  "sources": [
-    "~/rwx-research-robust/linemap.json",
-    "~/rwx-research/covmap2.json.gz",
-    "~/rwx-research-robust/usemap.json",
-    "~/rwx-research-robust/readmap.json"
-  ],
-  "build_command": "python3 mapbuild/convert_prototype.py sample/tests.json <sqlglot> maps",
-  "notes": "lines = union of two coverage runs (test_function contexts, inline process pool with pickle round-trip); import-time ('') contexts dropped. classes track Dialect/Parser/Generator/Tokenizer/Expression hierarchies only. reads made by the first test of a setUpClass class are credited to the whole class. test_imports from a static AST scan.",
-  "date": "2026-11-20",
-  "import_time": {
-    "built_by": "python mapbuild/import_time.py <pinned sqlglot> maps 2",
-    "image": "python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 + requirements.lock",
-    "source": "GitHub tarball of eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
-    "stats": "250 roots, 10816 lines run by `import sqlglot`, 27788 lines total; sqlglot.__main__ and tests.gen_fixtures fail to import (expected)",
-    "date": "2026-11-20"
-  },
-  "imports": {
-    "build_command": "SKIP_INTEGRATION=0 <venv python> mapbuild/import_map.py sample/tests.json <scratch copy of sqlglot@eb11aec> maps -j12",
-    "built": "2026-11-20, laptop (python 3.13.12, sqlglot test deps incl. duckdb/pandas), not the pinned image",
-    "facts": "1620 tests each run alone (187 s at -j12), 244 modules, 0 isolation failures; lines-map whole-file sets and classes-map sets are subsets of it (0 violations). No labeled patch used.",
-    "environment_note": "The only `except ImportError` around a repo import is sqlglot/_version (generated, not in the repo), so other optional dependencies cannot change the module closures."
-  }
+ "sqlglot_sha": "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
+ "image": "python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90",
+ "env": {
+  "SKIP_INTEGRATION": "0",
+  "PYTHONHASHSEED": "0"
+ },
+ "tests_traced": 1620,
+ "granularity": "one interpreter per test",
+ "import_time": "import_time.json.gz: mapbuild/import_time.py, one fresh interpreter per module under sqlglot/ and tests/, same image; its 'tests' array lists module roots, not tests",
+ "build_command": "mapbuild/build.sh",
+ "built_at": "2026-11-21T07:15:00Z",
+ "trace_wall_seconds": 85,
+ "jobs": 32,
+ "keys": {
+  "lines.json.gz": 74965,
+  "lines_phase.json.gz": 85325,
+  "lines_full.json.gz": 98476,
+  "classes.json.gz": 1224,
+  "reads.json.gz": 65,
+  "test_imports.json.gz": 61,
+  "import_time.json.gz": 27788
+ },
+ "bytes": {
+  "lines.json.gz": 638319,
+  "lines_phase.json.gz": 773709,
+  "lines_full.json.gz": 1603966,
+  "classes.json.gz": 63293,
+  "reads.json.gz": 17856,
+  "test_imports.json.gz": 17999,
+  "import_time.json.gz": 89455
+ },
+ "json_sha256": {
+  "lines.json.gz": "abf873bd79f3d4f4d7a867f286d68a3727899ff45d215b6ce73f1f1d7aa05abe",
+  "lines_phase.json.gz": "c35eb03ad82c60ec80f24adc8fb372065b1b94bec48e34c71ceb24f17ea2d21e",
+  "lines_full.json.gz": "f3c1836531b6602c05747c97e33ec2fb5c069c6d1d07495236e53a296c5727e9",
+  "classes.json.gz": "bd8a8b68f81fabd18f149d10b2197ce94c315c63a73ad14485a518455f58068b",
+  "reads.json.gz": "ec9bac97b1345881da4247eecf485f6bbe6b312d5b8996d62e9d4c1e5b90e262",
+  "test_imports.json.gz": "60c49d6b4c070cda176471547825565befb8d1970e0db0125da2a81a0c5515a2",
+  "import_time.json.gz": "4c208c9b19b0b50ea325b31036563652cd471bfcd44969ee7091d849cd9e1ed0"
+ },
+ "imports": {
+  "build_command": "SKIP_INTEGRATION=0 python mapbuild/import_map.py sample/tests.json <scratch copy of pinned sqlglot> maps -j4 (--recollect redoes only the collection lists)",
+  "built": "PENDING",
+  "facts": "1620 tests each run alone, 244 modules, 0 isolation failures; collection: 160 modules (101 by import). No labeled patch used.",
+  "environment_note": "The only except ImportError around a repo import is sqlglot/_version (generated, not in the repo), so optional dependencies cannot change the module closures."
+ }
 }
