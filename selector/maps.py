@@ -205,6 +205,7 @@ class Maps:
         self.import_time = ImportTimeMap(directory / "import_time.json.gz",
                                          compiled and compiled / "import_time")
         self.imports = open_map("imports")
+        self.directory = directory
         self._unvouched: frozenset[int] | None = None
         self._file_cache: dict[str, frozenset[int]] = {}
 
