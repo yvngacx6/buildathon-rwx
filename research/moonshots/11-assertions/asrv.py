@@ -526,11 +526,21 @@ def _on_line(code, line):
 LTOOL = 4
 
 
+def _on_start(code, offset):
+    # needed: with LINE alone, CPython 3.13 emits no LINE event for a code object's first line
+    # (one-line lambdas in dispatch tables were invisible -> false drop on private rf8w)
+    fn = code.co_filename
+    if fn.startswith(SQ_PREFIX):
+        U.cov.add((fn[len(SQ) + 1:], code.co_firstlineno))
+    return MON.DISABLE
+
+
 def cov_start():
     U.cov = set()
     MON.use_tool_id(LTOOL, "units")
     MON.register_callback(LTOOL, MON.events.LINE, _on_line)
-    MON.set_events(LTOOL, MON.events.LINE)
+    MON.register_callback(LTOOL, MON.events.PY_START, _on_start)
+    MON.set_events(LTOOL, MON.events.LINE | MON.events.PY_START)
     MON.restart_events()
 
 
@@ -794,6 +804,22 @@ def sliced_child(commit, patch_text, numbers, store):
         if fi is not None:
             changed |= {(fi << 16) | ln for ln in st}
         sources[absf] = new
+        # only edits inside function bodies: a changed module / class body (even of a module
+        # not loaded yet) changes state that skipped units read (false drop on private 22yd)
+        try:
+            ot, nt = {}, {}
+            walk(compile(old, absf, "exec", dont_inherit=True), ot, {})
+            walk(compile(new, absf, "exec", dont_inherit=True), nt, {})
+        except SyntaxError:
+            info["fallback"] = "syntax error"
+            return info
+        if ot.keys() != nt.keys():
+            info["fallback"] = "code tree shape changed"
+            return info
+        for kk, oc in ot.items():
+            if own_sig(oc) != own_sig(nt[kk]) and not (oc.co_flags & 0x1):  # CO_OPTIMIZED: a function
+                info["fallback"] = f"module/class body changed: {oc.co_qualname}"
+                return info
         modname = p[:-3].replace("/", ".")
         if modname.endswith(".__init__"):
             modname = modname[:-9]
@@ -915,6 +941,7 @@ def main():
             info = fork_call(job) or {"fallback": "died"}
             info["child_cpu"] = cpu_children() - c0
             out[c] = info
+            json.dump(out, _real_open(OUT, "w"), default=str)
             t = info.get("tests", {})
             print(f"[{c}] {info.get('fallback', '')} cand={len(cand)} pass={sum(v['v'] == 'pass' for v in t.values())} "
                   f"fail={sum(v['v'] == 'fail' for v in t.values())} cpu={info['child_cpu']:.2f}",
