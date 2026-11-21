@@ -4,10 +4,10 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 
 # sqlglot source at the pinned commit (read-only reference for diffs and AST checks).
 ARG SQLGLOT_SHA=eb11aec4be8cb2122afe713a4816662c3f0fb2fa
-RUN python -c "import io,tarfile,urllib.request; \
-data=urllib.request.urlopen('https://github.com/tobymao/sqlglot/archive/${SQLGLOT_SHA}.tar.gz').read(); \
-tarfile.open(fileobj=io.BytesIO(data)).extractall('/opt', filter='data')" \
- && mv /opt/sqlglot-${SQLGLOT_SHA} /opt/sqlglot
+# Retries with backoff; the tarball's sha256 is checked (docker/fetch_sqlglot.py): a mismatch
+# after every attempt fails the build.
+COPY docker/fetch_sqlglot.py /tmp/fetch_sqlglot.py
+RUN python /tmp/fetch_sqlglot.py ${SQLGLOT_SHA} /opt/sqlglot && rm /tmp/fetch_sqlglot.py
 
 COPY selector /app/selector
 COPY maps /app/maps
