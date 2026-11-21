@@ -9,6 +9,11 @@ data=urllib.request.urlopen('https://github.com/tobymao/sqlglot/archive/${SQLGLO
 tarfile.open(fileobj=io.BytesIO(data)).extractall('/opt', filter='data')" \
  && mv /opt/sqlglot-${SQLGLOT_SHA} /opt/sqlglot
 
+# Third-party packages some tests import, pinned as in requirements.lock (the labelers' image).
+# Only the run-time verification child (selector/runverify.py) puts /app/deps on sys.path.
+RUN pip install --no-cache-dir --no-deps --target /app/deps \
+    pytz==2026.6 python-dateutil==4.0.0 tzdata==2026.6
+
 COPY selector /app/selector
 COPY maps /app/maps
 # Differential-execution replay (I12); its store is maps/diffexec.zip.

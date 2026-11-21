@@ -42,6 +42,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_MAP = REPO / "maps" / "runverify.json.gz"
+# Third-party packages the labelers' image had and some tests import (pytz, dateutil, tzdata,
+# pinned as in requirements.lock), installed at build into a directory only the child sees.
+DEPS = os.environ.get("BR_RUNVERIFY_DEPS", "/app/deps")
 GATE_S = float(os.environ.get("BR_RUNVERIFY_GATE", "0.6"))  # predicted scorer CPU per commit
 SCORER_SLOWDOWN = float(os.environ.get("BR_RUNVERIFY_SLOWDOWN", "2.0"))  # scorer vs map host
 CAP_FACTOR, CAP_EXTRA = 3.0, 0.3  # child CPU cap: 3x the map estimate + 0.3 s (map-host s)
@@ -109,6 +112,8 @@ def _setup_child(root: str, served: dict[str, str], patched_paths: set[str], cap
     sys.path[:] = [root] + [p for p in sys.path
                             if p not in ("", ".") and os.path.realpath(p) != repo
                             and os.path.realpath(p) != os.path.realpath(root)]
+    if os.path.isdir(DEPS):
+        sys.path.append(DEPS)
     sys.path_importer_cache.clear()
     os.chdir(root)
     os.environ["SKIP_INTEGRATION"] = "0"  # as the labelers ran
@@ -411,12 +416,34 @@ def file_flags(root: Path, rel: str, memo: dict | None = None) -> tuple[bool, se
                 elif hit:
                     spawn = True
     res = set()
+
+    def uses(node) -> bool:
+        names = {x.id for x in ast.walk(node) if isinstance(x, ast.Name)}
+        attrs = {x.attr for x in ast.walk(node) if isinstance(x, ast.Attribute)}
+        imps = {a.name.split(".")[0] for x in ast.walk(node) if isinstance(x, ast.Import)
+                for a in x.names}
+        imps |= {(x.module or "").split(".")[0] for x in ast.walk(node)
+                 if isinstance(x, ast.ImportFrom)}
+        return bool(names & bound or attrs & RESOURCE_ATTRS or imps & SPAWN_MODULES
+                    or imps & RESOURCE_MODULES)
+
     for node in tree.body:
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-            names = {x.id for x in ast.walk(node) if isinstance(x, ast.Name)}
-            attrs = {x.attr for x in ast.walk(node) if isinstance(x, ast.Attribute)}
-            if names & bound or attrs & RESOURCE_ATTRS:
+        if isinstance(node, ast.ClassDef):
+            # a test method alone -> that test; anything else in the class (helpers,
+            # fixtures, class body) -> the whole class
+            whole = False
+            for item in node.body:
+                if (isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and item.name.startswith("test")):
+                    if uses(item):
+                        res.add(f"{node.name}::{item.name}")
+                elif uses(item):
+                    whole = True
+            if whole:
                 res.add(node.name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and uses(node):
+            res.add(node.name)
+    nested_spawn = set()
     memo[rel] = (spawn, res | nested_spawn)
     return memo[rel]
 
@@ -452,7 +479,8 @@ def build(root: Path, tests_json: Path, out: Path, reps: int = 2, max_cpu: float
             parts = tid.split("::")
             if len(parts) != 3:
                 res["tests"][tid] = [None, "id"]
-            elif "*" in resource_names or parts[1] in resource_names:
+            elif ("*" in resource_names or parts[1] in resource_names
+                  or f"{parts[1]}::{parts[2]}" in resource_names):
                 res["tests"][tid] = [None, "resource-or-spawn-class"]
             else:
                 todo.append(tid)
