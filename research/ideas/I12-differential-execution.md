@@ -5,6 +5,38 @@ Branch `r1-diffexec-main` is built on main 9b775a4 (c8b4927 plus log commits). T
 **byte-identical to main** on sample, private264, private41 and adversarial46. The 61 unit tests
 pass.
 
+## Shipped (round 2): pinned-image store, on main d2e0730
+
+Branch `r1-diffexec-main`. The store is `maps/diffexec.zip`, built by `mapbuild/diffexec_build.sh`
+in the pinned image.
+
+**How the store is built:**
+- A census pass counts calls first, so functions that will go over the cap are never recorded.
+- Then one pytest process runs per test file.
+- Caps are applied after merging: 50k calls, 300 kB of distinct inputs, 16 kB per input. The
+  store therefore does not depend on the worker count.
+- The effect digest is taken for the first 2 calls of each distinct input.
+- Pickling stops as soon as an input is over the input cap.
+- Recording is skipped while tracemalloc traces, and those phases are marked incomplete.
+- Tests that fail while being recorded are listed in the store and are never dropped. One test
+  did: `test_dialect_attribute_access_is_cached`.
+
+**Size and build time:** 3,488 of 6,678 functions are recorded. The store is 9.4 MB and the
+checked-out tree is 13.9 MB. A no-cache Docker build takes 36 s.
+
+**EC2, pinned image, Makefile flags, median of 3 runs, 0 misses on every set:**
+
+| Set | Simulated s, without → with | Container CPU s | Net s |
+|---|---|---|---|
+| sample | 174.97 → 149.05 | 1.23 → 2.16 | −25.0 |
+| private264 | 2865.29 → 2855.01 | 15.88 → 20.48 | −5.7 |
+| adversarial46 | 1184.36 → 1178.00 | 3.86 → 4.84 | −5.4 |
+| private41 | 480.14 → 479.96 | 2.71 → 3.40 | +0.5 |
+
+`make sample` gives 149.047 s with 0 misses.
+
+The interim laptop store (branch `diffexec-laptop`, 8df22cc) gives the same selections.
+
 ## Verdict
 
 **Feasible, as a store recorded offline and committed to the repo. It is not feasible as a
