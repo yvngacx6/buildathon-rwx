@@ -1486,6 +1486,7 @@ class Selector:
             wide, error = None, exc
         have = have or set()
         base = self._cost(have - slack)
+        kept = None
         if ((wide is None or self._cost(wide | have) - base >= STATE_MIN_GAIN)
                 and all((m.split(".")[0] == "sqlglot" and m != "sqlglot.__main__")  # state.SKIP_MODULES
                         or self._explained_root(m, path, first, last) for m in modules)):
@@ -1493,12 +1494,13 @@ class Selector:
             if found is not None and not [k for k in found["changed"] if k != own]:
                 return set(), True
             if found is not None and wide is not None:
+                # (wide less slow tests; the readers below may still be cheaper)
                 kept = self._import_callers(found, path, first, last, wide, own)
-                if kept is not None:
-                    return kept, "callers"
         if wide is None or self._cost(wide | have) - base >= STATE_MIN_GAIN:
             try:
                 got, _ = self._import_state_users(path, first, last, modules, own)
+                if kept is not None and self._seconds(kept) <= self._seconds(got):
+                    return kept, "callers"
                 if self._state_unread:
                     # some changed value has no seen reader: the run-time callers stand in
                     # for it (`allow_empty`), so they must not be pruned at run time
@@ -1510,6 +1512,8 @@ class Selector:
                     return got, "readers"
             except names.Fallback:
                 pass
+        if kept is not None:
+            return kept, "callers"
         if error is not None:
             raise error
         return wide, False
