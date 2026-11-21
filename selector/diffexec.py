@@ -33,9 +33,9 @@ RESOURCE_MODULES = {"tracemalloc", "gc", "resource", "time", "timeit", "psutil",
                     "signal", "faulthandler", "pyperf"}
 RESOURCE_ATTRS = {"setrecursionlimit", "getrecursionlimit", "getsizeof", "getrefcount",
                   "get_traced_memory", "perf_counter", "process_time", "monotonic"}
-COMMIT_BUDGET_S = float(os.environ.get("BR_DIFFEXEC_COMMIT_S", "3"))
-BATCH_BUDGET_S = float(os.environ.get("BR_DIFFEXEC_BATCH_S", "60"))
-BENEFIT_SHARE = float(os.environ.get("BR_DIFFEXEC_SHARE", "0.3"))
+COMMIT_BUDGET_S = float(os.environ.get("BR_DIFFEXEC_COMMIT_S", "15"))
+BATCH_BUDGET_S = float(os.environ.get("BR_DIFFEXEC_BATCH_S", "100"))
+BENEFIT_SHARE = float(os.environ.get("BR_DIFFEXEC_SHARE", "0.85"))
 
 
 class DiffExec:
@@ -71,7 +71,9 @@ class DiffExec:
     # ── run the replay child ────────────────────────────────────────────────
 
     def _replay(self, jobs, benefit_ms: int = 10_000) -> dict | None:
-        # CPU is charged: spend at most ~30 % of what the replay could save (and at most 3 s).
+        # CPU is charged: spend at most ~85 % of what the replay could save (and at most 15 s).
+        # Generous on purpose: the scorer CPU is ~2x slower than our dev boxes, and a budget
+        # that runs out keeps every test (board S07–S09 lost most diffexec gains that way).
         budget = min(COMMIT_BUDGET_S, BENEFIT_SHARE * benefit_ms / 1000, BATCH_BUDGET_S - self.spent)
         if budget < 0.05:
             return None
