@@ -118,6 +118,10 @@ PARTIAL_USES = frozenset({"truth", "keys"})
 # plain attribute the snapshot compares like any other).
 DEFINITION_TIME_NAMES = frozenset({"__slots__", "__init_subclass__", "__class_getitem__",
                                    "__set_name__", "__all__", "__getattr__", "__path__"})
+# What the TypedDict metaclass stores on the class: data, never looked up implicitly by
+# Python except by the same metaclass building a subclass.
+TYPEDDICT_KEYS = frozenset({"__total__", "__required_keys__", "__optional_keys__",
+                            "__readonly_keys__", "__mutable_keys__"})
 MAX_HOLDER_ENTRIES = 200  # more entries hold import-time objects of a class: do not restrict
 # Class hierarchies the classes map records (maps/MANIFEST.json notes): a test that made an
 # instance of one of these classes (or used it as a dialect) is credited to it and its bases.
@@ -177,6 +181,7 @@ class Selector:
         self._families: dict[tuple, list] = {}  # `_related`: owner class → its family
         self._ancestor_memo: dict[tuple, set | None] = {}
         self._test_imports = None  # testimport.Checker, on first use
+        self._all_test_modules: set[str] | None = None
         self.diffexec = None
         try:
             from .diffexec import DiffExec
@@ -590,7 +595,11 @@ class Selector:
                 first, last = r.span
                 at_import, same_state = self._function_at_import(path, first + r.is_lambda, last,
                                                                  chosen | got)
-                if not got and same_state:
+                if not got and same_state == "readers":
+                    # Never ran under a test; what its runs at import built differently is
+                    # read only by the tests in at_import.
+                    kinds.append(f"unrun def {'.'.join(r.chain) or '<lambda>'}, runs at import")
+                elif not got and same_state:
                     # Never ran under a test, and its runs at import built the same state.
                     kinds.append(f"unrun def {'.'.join(r.chain) or '<lambda>'}, runs at import:"
                                  " import state unchanged")
@@ -605,10 +614,11 @@ class Selector:
                     kinds.append(f"def {'.'.join(r.chain) or '<lambda>'}"
                                  + (f" (-{dropped} slow, off touched statements)" if dropped else ""))
                 if at_import:
-                    kinds.append(f"(runs at import: +{len(at_import - got)})")
+                    kinds.append(f"(runs at import: +{len(at_import - got)}"
+                                 + (", readers of changed import state)" if same_state else ")"))
                     self._mixed_py = True
                     fixed |= at_import
-                elif same_state and got:
+                elif same_state is True and got:
                     kinds.append("(runs at import: import state unchanged)")
                 got |= at_import
             else:
@@ -664,6 +674,10 @@ class Selector:
         narrowing runs unbounded, and if neither applies → ALL.
         """
         base = path in BASE_FILES
+        if r.kind == "class" and r.via_def:
+            got = self._class_hook(path, module, old_tree, new_tree, r, base)
+            if got is not None:
+                return got
         if base and (r.kind not in ("class", "module") or r.via_def):
             raise AllTests(f"{path}: base class / module body")
         if r.kind in ("class", "module") and _may_share(old_tree, new_tree, r):
@@ -674,6 +688,17 @@ class Selector:
             wide_error = None
         except AllTests as exc:
             wide, wide_error = None, exc
+        if (wide_error is not None and str(wide_error).endswith("with no known users")
+                and r.kind in ("class", "module") and not r.via_def):
+            # No test is known to use the class / module (typing-only TypedDicts): the
+            # import-state diff, unbounded as for base files, shows what the edit changes;
+            # the readers of those values are all that can observe it.
+            try:
+                got, why = self._by_state(path, r, self.all_numbers())
+                self.notes.append(f"{'.'.join(r.chain) or module}: no known users, {why}")
+                return got
+            except names.Fallback as exc:
+                self.notes.append(f"{'.'.join(r.chain) or module}: no state narrowing ({exc})")
         if wide_error is not None:
             raise wide_error  # v1 could not bound it (star import, re-export, …): never narrow
         if r.kind in ("class", "module") and not r.via_def:
@@ -709,6 +734,51 @@ class Selector:
         if wide_error is not None:
             raise wide_error
         return wide
+
+    def _class_hook(self, path: str, module: str, old_tree: ast.Module, new_tree: ast.Module,
+                    r: classify.Region, base: bool) -> set[int] | None:
+        """An edit inside a class-creation hook (`__init_subclass__`, a metaclass method,
+        classify.DEFINITION_TIME_METHODS): the def runs while classes are created, at import
+        (sqlglot modules, test modules) or at run time (a test that defines a subclass).
+        Its import-time runs are seen through the import-state diff
+        (`_import_state_users`: readers of every value it builds differently), its run-time
+        runs through the lines map (tests that ran a line of the def), and, as for any def,
+        a class-level table it mutates in place adds the tests that ran a line naming it.
+        None: fall back to the class-body rules (base files: ALL)."""
+        hook = classify.Region("function", r.via_def)
+        defs = _edited_defs(old_tree, new_tree, hook)
+        olds = _edited_defs(old_tree, ast.Module(body=[], type_ignores=[]), hook)
+        if len(olds) != 1:
+            return None
+        old_def = olds[0]
+        first = min([old_def.lineno] + [d.lineno for d in old_def.decorator_list])
+        last = old_def.end_lineno or old_def.lineno
+        wide: set[int] | None = None
+        if not base:
+            try:
+                wide = self._conservative(path, module, old_tree, new_tree, r)
+            except AllTests:
+                wide = None
+            if wide is not None and self._cost(wide) - 2.0 < STATE_MIN_GAIN:
+                return None
+        try:
+            hook = f"C {module}:{'.'.join(r.via_def[:-1])} {r.via_def[-1]}"
+            got, why = self._import_state_users(
+                path, first, last, self.maps.import_time.modules(path, first, last), hook)
+        except names.Fallback as exc:
+            self.notes.append(f"{'.'.join(r.via_def)}: no state narrowing ({exc})")
+            return None
+        got |= self.maps.span(path, first, last)
+        # a table the hook first binds to a fresh object of the new class, then fills, is
+        # that class's own (its import-time contents are in the diff, run-time creators ran
+        # the def); one inherited from a base would be shared with every other class
+        shared = _class_state_writes(defs) - _fresh_tables(defs)
+        if shared:
+            got |= self._mention_runners(shared)
+        if wide is not None and self._seconds(got) >= self._seconds(wide):
+            return None
+        self.notes.append(f"{'.'.join(r.via_def)}: class-creation hook, {why}")
+        return got
 
     def _conservative(self, path: str, module: str, old_tree: ast.Module,
                       new_tree: ast.Module, r: classify.Region) -> set[int]:
@@ -942,13 +1012,34 @@ class Selector:
         touch = set(wide) if wide is not None else set()
         free: set[int] = set()  # readers of module globals
         loose: set[int] = set()  # class-attribute readers restricted only by `touch`
+        typed: set[int] = set()  # tests that name a TypedDict whose key sets changed
+        untyped = False  # some changed value is not a TypedDict key set
         held: set[int] = set()  # class-attribute readers among tests that can hold the class
         in_tests: set[int] = set()
         n_sites = 0
         owners: dict[str, tuple] = {}
         for kind, owner, attr in changed:
+            if kind == "C" and attr in TYPEDDICT_KEYS:
+                # Set by the TypedDict metaclass; Python reads them only when it builds a
+                # TypedDict subclass (at import: in the diff; at run time: a line naming the
+                # class, as does handing the class to anything). Any other read must spell
+                # the name (`X.__required_keys__`) or compute it (getattr, vars, __dict__).
+                # The class object reaches other code only through a line naming it: at run
+                # time those tests are taken; at import only as a base of another class in
+                # its own module (whose key sets are in the diff), else it may be stored.
+                cname = owner.rsplit(":", 1)[-1].rsplit(".", 1)[-1]
+                opath = self._module_path(owner.split(":", 1)[0])
+                if index.mentions(attr) or opath is None or any(
+                        site.when != "run" and not (
+                            site.path == opath and self._old_text(opath).splitlines()[
+                                site.lines[0] - 1].lstrip().startswith("class "))
+                        for site in index.mentions(cname)):
+                    raise names.Fallback(f"{owner}.{attr}: TypedDict read or held at import")
+                typed |= self._mention_runners({cname})
+                continue
             if attr.startswith("__") and attr.endswith("__"):
                 raise names.Fallback(f"{owner}.{attr} is a special name")
+            untyped = True
             if kind == "M":
                 owner_path = self._module_path(owner)
                 if owner_path is None:
@@ -980,7 +1071,8 @@ class Selector:
         # Class-attribute reads stay within the users of the owner classes and their files
         # (the bound `_by_names` relies on); `held` narrows that further.
         got = free | ((loose | held) & touch) | in_tests
-        if not got and not allow_empty:
+        got |= typed
+        if not got and not allow_empty and untyped:
             raise names.Fallback("no test ran a line reading a changed value")
         shown = sorted({f"{o.rsplit(':', 1)[-1]}.{a}" for _, o, a in changed})
         more = f" +{len(shown) - 6}" if len(shown) > 6 else ""
@@ -1249,7 +1341,11 @@ class Selector:
         runs no sqlglot code (`_explained_root`); the diff costs ~1.2 s CPU, so only when the
         dependents add at least STATE_MIN_GAIN to `have` (what the commit selects already).
 
-        Returns (tests, True if the state diff showed no change)."""
+        Otherwise, when the patched package imports, the tests that can observe the changed
+        import-time state (`_import_state_users`) if cheaper than the dependents.
+
+        Returns (tests, True if the state diff showed no change, "readers" if the tests are
+        the readers of the changed state, else False)."""
         modules = self.maps.import_time.modules(path, first, last)
         if not modules:
             return set(), False
@@ -1264,9 +1360,70 @@ class Selector:
             found = self._state_diff()
             if found is not None and not found["changed"]:
                 return set(), True
+        if wide is None or self._cost(wide | have) - self._cost(have) >= STATE_MIN_GAIN:
+            try:
+                got, _ = self._import_state_users(path, first, last, modules)
+                if wide is None or self._seconds(got) < self._seconds(wide):
+                    return got, "readers"
+            except names.Fallback:
+                pass
         if error is not None:
             raise error
         return wide, False
+
+    def _import_state_users(self, path: str, first: int, last: int, modules: set[str],
+                            hook: str | None = None) -> tuple[set[int], str]:
+        """Lines path:first..last run while modules are imported (`modules`, import-time map;
+        `import sqlglot` stands for every importer), and the patched import may build
+        different state: the tests that can observe what that import-time run produced.
+
+        Everything an import of sqlglot modules leaves behind is module globals and class
+        attributes, which the import-state diff (selector/state.py) compares in full
+        (containers, objects, functions with code / defaults / closures); every value it
+        shows changed, and every value derived from one at import, is in the diff. A test can
+        only see the difference by reading one of them: `_state_readers` (run-time readers,
+        restricted to tests that can hold the owner class; cached readers → Fallback).
+        Test modules are not in the diff: one whose own import-time code runs sqlglot code
+        (testimport: not explained) may run these lines itself, so its dependents join
+        (all test modules when the map collapsed the lines to `import sqlglot`).
+        The tests that run the lines later, at run time, come from the lines map (callers).
+        `hook`: the state key of the edited class-creation hook itself (`C mod:Cls
+        __init_subclass__`): Python reads it only while creating classes, which is what
+        this rule follows; its own entry is not a value to find readers of.
+        Fallback: the patched package does not import, a changed special name, no class in
+        the source for a changed class, a read in cached code."""
+        found = self._state_diff()
+        if found is None:
+            raise names.Fallback("import-state diff unavailable")
+        roots = (self._test_modules() if ImportTimeMap.ROOT in modules
+                 else {m for m in modules if m.split(".")[0] == "tests"})
+        extra: set[int] = set()
+        for m in sorted(roots):
+            if not self._explained_root(m, path, first, last):
+                extra |= self._module_dependents(m)
+        for m in modules:
+            if m.split(".")[0] not in ("sqlglot", "tests") or m == "sqlglot.__main__":
+                raise names.Fallback(f"imported by {m}, which the diff does not cover")
+        if hook is not None and hook in found["changed"]:
+            found = dict(found, changed=[k for k in found["changed"] if k != hook])
+        if not found["changed"]:
+            return extra, "state: the patched import builds identical state"
+        # a changed value nobody is seen reading usually means a reader the index is blind
+        # to: only accept that when the lines also run at test time (their callers stand in)
+        got, why = self._state_readers(found, None,
+                                       allow_empty=bool(self.maps.span(path, first, last)))
+        return got | extra, why
+
+    def _test_modules(self) -> set[str]:
+        """Every module under tests/ (dotted names)."""
+        if self._all_test_modules is None:
+            out = set()
+            for p in (self.sqlglot / "tests").rglob("*.py"):
+                rel = p.relative_to(self.sqlglot).with_suffix("")
+                parts = rel.parts[:-1] if rel.name == "__init__" else rel.parts
+                out.add(".".join(parts))
+            self._all_test_modules = out
+        return self._all_test_modules
 
     def _explained_root(self, module: str, path: str, first: int, last: int) -> bool:
         """A test module whose own import-time code runs no sqlglot code of its own
@@ -1655,6 +1812,40 @@ def _class_state_writes(defs: list) -> set[str]:
                 out.add(hit)
     return out
 
+
+
+def _fresh_tables(defs: list) -> set[str]:
+    """Class-level tables that every def in `defs` binds, as a plain top-level statement of
+    its body, to a new object (`cls.X = {...}` / a comprehension / `set(...)` / `dict(...)` /
+    `list(...)` / `x.copy()`) before any other statement mentions `cls.X`, with the receiver
+    (`self` / `cls`) never rebound: the def's later in-place writes to X reach only that
+    object, not a table another class (a base) also holds."""
+    out: set[str] | None = None
+    fresh_calls = {"set", "dict", "list"}
+    for fn in defs:
+        here: set[str] = set()
+        rebound = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)
+                   and n.id in ("self", "cls") and not isinstance(n.ctx, ast.Load)}
+        seen: set[str] = set()  # tables mentioned so far
+        for stmt in fn.body:
+            if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Attribute)
+                    and isinstance(stmt.targets[0].value, ast.Name)
+                    and stmt.targets[0].value.id in ("self", "cls")
+                    and stmt.targets[0].value.id not in rebound):
+                name, v = stmt.targets[0].attr, stmt.value
+                new = (isinstance(v, (ast.Dict, ast.List, ast.Set, ast.DictComp, ast.ListComp,
+                                      ast.SetComp))
+                       or isinstance(v, ast.Call) and (
+                           isinstance(v.func, ast.Name) and v.func.id in fresh_calls
+                           or isinstance(v.func, ast.Attribute) and v.func.attr == "copy"
+                           and not v.args and not v.keywords))
+                inside = {n.attr for n in ast.walk(v) if isinstance(n, ast.Attribute)}
+                if new and name not in seen and name not in inside:
+                    here.add(name)
+            seen |= {n.attr for n in ast.walk(stmt) if isinstance(n, ast.Attribute)}
+        out = here if out is None else out & here
+    return out or set()
 
 _INERT_STMTS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom,
                 ast.Pass, ast.Global, ast.Nonlocal)
