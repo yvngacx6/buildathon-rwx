@@ -9,7 +9,7 @@ CPU. The payoff is still small, because it only applies to clean function-body e
 | sample | about +5 s |
 | private264 | about -2 s |
 | P (practice-style) | -2.6 (net); +0.4 without the warm-up charge |
-| Q300 | __Q__ |
+| Q300 | -2.6 (net); +0.4 without the warm-up charge |
 
 - After two soundness fixes: **0 false drops in 2,811 labeled verdicts** (sample and private).
 - The prototype found **two false drops** first. Both are fixed (§Soundness). One of the two is a
@@ -87,13 +87,13 @@ commits:
 
 | | sample | private264 | P | Q300 |
 |---|---|---|---|---|
-| eligible (sliceable) commits | 8 / 30 | 47 / 264 | 165 / 465 | __Qn__ |
+| eligible (sliceable) commits | 8 / 30 | 47 / 264 | 165 / 465 | 83 / about 250 |
 | verdicts vs labels | 70 / 70 exact | 2,740 exact; 1 extra fail; **0 false drops** | – | – |
-| gain, θ = 0.05 | 9.3 | 0.7 | 0.9 | __Qg__ |
-| scorer CPU, θ = 0.05 (+3.0 warm-up) | 1.0 | 0.3 | 0.6 | __Qc__ |
-| **net per 40, θ = 0.05** | **+5.3** | **-2.5** | **-2.6** | __Qnet__ |
-| net per 40, θ = ∞ | +6.1 | -8.6 | -2.0 | __Qinf__ |
-| commits → [] per 40 | 4.0 | 0.3 | 0.3 | |
+| gain, θ = 0.05 | 9.3 | 0.7 | 0.9 | 0.9 |
+| scorer CPU, θ = 0.05 (+3.0 warm-up) | 1.0 | 0.3 | 0.6 | 0.5 |
+| **net per 40, θ = 0.05** | **+5.3** | **-2.5** | **-2.6** | **-2.6** |
+| net per 40, θ = ∞ | +6.1 | -8.6 | -2.0 | -3.0 |
+| commits → [] per 40 | 4.0 | 0.3 | 0.3 | 0.3 |
 
 Where the sample gain comes from: 2qn5, 8y7j and fryt each go from about 2 s to 0, and bj7g gains a
 little. Each is a small set of dialect candidates that all pass.
