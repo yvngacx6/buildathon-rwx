@@ -51,6 +51,8 @@ TESTS = {
 SUITES = {"tpch": "optimizer/tpc-h/", "tpcds": "optimizer/tpc-ds/"}
 SCORER_SLOWDOWN = 2.0
 BUDGET_S = float(os.environ.get("BR_SUBTEST_S", "12"))
+STAGE = os.environ.get("BR_SUBTEST_STAGE", "1") != "0"  # moon-05 checkpoint verification
+FALLBACK = os.environ.get("BR_SUBTEST_FALLBACK", "0") != "0"  # checkpoint differs → whole query
 SHARE = 0.6  # spend at most this share of what dropping saves
 
 
@@ -86,6 +88,101 @@ def run_query(q: dict, schema: dict, tables: dict, opt: bool):
         out_duck = transpile(q["sql"], write="duckdb")[0]
         out_opt = transpile(q["optimized"], write="duckdb")[0]
     return out_exec, out_duck, out_opt
+
+
+# ── moon-05: stage split of one executed query (checkpoints) ──────────────────
+#
+# The pool worker of test_execute_tpcds receives pickle(parse_one(sql)) and runs
+# sqlglot.executor.execute on it. execute's body is mirrored here window by window, calling the
+# very objects execute() calls (looked up in sqlglot.executor's namespace):
+#   prep:  ensure_tables, ensure_schema, the supported_table_args check
+#   optb:  optimize(...) and the eager logger.debug argument expression.sql(pretty=True)
+#   plan:  Plan(expression)
+#   post:  PythonExecutor(tables).execute(plan) + the result's pickle round trip
+# Checkpoints: the post-parse pickle (what the worker receives) and a type-strict digest of the
+# optimized expression after the debug .sql() (what Plan receives). A change whose touched
+# statements run only in parse / optb can be verified by re-running those windows and comparing
+# the checkpoint digests; plan / post are then identical (same code, same input).
+
+def strict_digest(root) -> str:
+    """Digest of an expression tree: classes, every arg key (None-valued too) in order, value
+    types, DType values, .type, comments, _meta, parent / arg_key / index links and sharing."""
+    from sqlglot.expressions import Expr
+    h = hashlib.blake2b(digest_size=16)
+    seen: dict[int, int] = {}
+    stack = [(root, None, None, None)]
+    while stack:
+        node, parent, key, index = stack.pop()
+        if not isinstance(node, Expr):
+            h.update(b"V")
+            h.update(repr((type(node).__name__, node)).encode())
+            continue
+        nid = id(node)
+        if nid in seen:
+            h.update(b"R%d" % seen[nid])
+            continue
+        seen[nid] = len(seen)
+        cls = type(node)
+        h.update(f"N{cls.__module__}.{cls.__qualname__}".encode())
+        if parent is not None:
+            h.update(repr((node.parent is parent, node.arg_key == key, node.index == index)).encode())
+        t = getattr(node, "_type", None)
+        if t is not None and t is not node:
+            h.update(b"T" + strict_digest(t).encode())
+        if getattr(node, "comments", None):
+            h.update(repr(("C", node.comments)).encode())
+        m = getattr(node, "_meta", None)
+        if m is not None:
+            h.update(repr(("M", sorted((k, type(v).__name__, repr(v)) for k, v in m.items()))).encode())
+        args = node.args
+        h.update(repr(("K", tuple(args))).encode())
+        items = list(args.items())
+        for k, v in reversed(items):
+            if type(v) is list:
+                stack.append(("]", None, None, None))
+                for i in range(len(v) - 1, -1, -1):
+                    stack.append((v[i], node, k, i))
+                stack.append(("[", None, None, None))
+            else:
+                stack.append((v, node, k, None))
+    return h.hexdigest()
+
+
+def exec_windows(expr, schema, used, cov_factory=None, swap_until=None):
+    """execute(expr, schema=schema, tables=used) window by window.
+    → ({window: coverage}, result digest)."""
+    import sqlglot.executor as E
+    covs = {}
+
+    def window(name, fn):
+        cov = cov_factory() if cov_factory else None
+        if cov:
+            cov.start()
+        try:
+            return fn()
+        finally:
+            if cov:
+                covs[name] = cov.stop()
+
+    def prep():
+        tables_ = E.ensure_tables(used, dialect=None)
+        schema_ = E.ensure_schema(schema, dialect=None)
+        if tables_.supported_table_args and tables_.supported_table_args != schema_.supported_table_args:
+            raise E.ExecuteError("Tables must support the same table args as schema")
+        return tables_, schema_
+
+    tables_, schema_ = window("prep", prep)
+
+    def optb():
+        e = E.optimize(expr, schema_, leave_tables_isolated=True, dialect=None)
+        e.sql(pretty=True)
+        return e
+
+    oe = window("optb", optb)
+    d_opt = strict_digest(oe)
+    plan = window("plan", lambda: E.Plan(oe))
+    res = window("post", lambda: pickle.loads(pickle.dumps(E.PythonExecutor(tables=tables_).execute(plan))))
+    return covs, d_opt, digest_table(res)
 
 
 # ── build ─────────────────────────────────────────────────────────────────────
@@ -221,6 +318,9 @@ def build(root: Path, out: Path) -> None:
                 phases["parse"] = cov.stop()
                 outs = {}
                 if q["execute"]:
+                    pexpr = pickle.dumps(expr)
+                    outs["pexpr"] = pexpr
+                    outs["d_parse"] = strict_digest(pickle.loads(pexpr))
                     cov = _Cov(prefix)
                     cov.start()
                     used = {t.name: tables[suite][t.name] for t in find_tables(e2)}
@@ -228,6 +328,33 @@ def build(root: Path, out: Path) -> None:
                     res = pickle.loads(pickle.dumps(res))
                     phases["exec"] = cov.stop()
                     outs["exec"] = digest_table(res)
+                    # moon-05: the same execute, window by window, in a fresh fork
+                    def windows():
+                        e3 = pickle.loads(pexpr)
+                        cov = _Cov(prefix)
+                        cov.start()
+                        u = {t.name: tables[suite][t.name] for t in find_tables(e3)}
+                        ft = cov.stop()
+                        covs, d_opt, dres = exec_windows(e3, schemas[suite], u, lambda: _Cov(prefix))
+                        covs["prep"] = {k: sorted(set(v) | set(ft.get(k, ()))) for k, v in
+                                        list(covs["prep"].items()) + list(ft.items())}
+                        return covs, d_opt, dres
+
+                    def stage_timed():
+                        t0 = time.process_time()
+                        e4 = pickle.loads(pexpr)
+                        import sqlglot.executor as E
+                        sch = E.ensure_schema(schemas[suite], dialect=None)
+                        oe = E.optimize(e4, sch, leave_tables_isolated=True, dialect=None)
+                        oe.sql(pretty=True)
+                        d2 = strict_digest(oe)
+                        cpu_stage = time.process_time() - t0
+                        return d2, cpu_stage
+                    covs, d_opt, dres = _in_fork(windows)
+                    d2, cpu_stage = _in_fork(stage_timed)
+                    phases["win"] = covs
+                    outs["d_opt"] = d_opt if (dres == outs["exec"] and d2 == d_opt) else None
+                    outs["cpu_stage"] = cpu_stage
                 cov = _Cov(prefix)
                 cov.start()
                 outs["duck"] = transpile(q["sql"], write="duckdb")[0]
@@ -359,8 +486,20 @@ class SubTest:
                 if hit:
                     if not q["stable"]:
                         return None
-                    todo.append((suite, i, kind == "optimized"))
-                    cpu += q["cpu_opt"] if kind == "optimized" else q["cpu_exec"]
+                    x = (suite, i, kind == "optimized", "full", False, False, False)
+                    win = ph.get("win")
+                    if STAGE and kind == "execute" and q["execute"] and win and q["outs"].get("d_opt"):
+                        wl = {}
+                        for w in win.values():
+                            for f, ls in w.items():
+                                wl.setdefault(f, set()).update(ls)
+                        glue = {f: sorted(set(ls) - wl.get(f, set())) for f, ls in ph["exec"].items()}
+                        later = any(_hit(win[w], spans) for w in ("prep", "plan", "post"))
+                        if not later and not _hit(glue, spans):
+                            x = (suite, i, False, "stage", _hit(ph["parse"], spans),
+                                 _hit(win["optb"], spans), _hit(ph["duck"], spans))
+                    todo.append(x)
+                    cpu += self._cpu(x)
             out[n] = todo
         return out, cpu
 
@@ -450,8 +589,11 @@ class SubTest:
                         f" {self.last_child:.2f}s)")
 
     def _cpu(self, x):
-        suite, i, opt = x
+        suite, i, opt, mode, parse_hit, optb_hit, duck_hit = x
         q = self.meta()["suites"][suite][i]
+        if mode == "stage":
+            # parse / duck transpile: a few ms; optb from the checkpoint: its pinned CPU
+            return 0.02 + (q["outs"]["cpu_stage"] if optb_hit else 0.0)
         return q["cpu_opt"] if opt else q["cpu_exec"]
 
 
@@ -535,8 +677,42 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
         return False
     import contextlib
     tables: dict = {}
+    import sqlglot.executor as E
+    from sqlglot import parse_one as _parse_one, transpile as _transpile
+    full = []
+    # checkpoint-verified queries first (cheap; a divergence ends the child early)
+    for suite, i, opt, mode, parse_hit, optb_hit, duck_hit in todo:
+        if mode != "stage":
+            full.append((suite, i, opt))
+            continue
+        q = meta["suites"][suite][i]
+        signal.setitimer(signal.ITIMER_PROF, 3 * q["outs"]["cpu_stage"] + 0.8)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                if duck_hit and _transpile(q["sql"], write="duckdb")[0] != q["outs"]["duck"]:
+                    return False
+                if parse_hit:
+                    e = pickle.loads(pickle.dumps(_parse_one(q["sql"])))
+                    if strict_digest(e) != q["outs"]["d_parse"]:
+                        if not FALLBACK: return False
+                        full.append((suite, i, opt))  # parse differs: run the whole query
+                        continue
+                if optb_hit:
+                    e = pickle.loads(q["outs"]["pexpr"])
+                    sch = E.ensure_schema(meta["schemas"][suite], dialect=None)
+                    oe = E.optimize(e, sch, leave_tables_isolated=True, dialect=None)
+                    oe.sql(pretty=True)
+                    if strict_digest(oe) != q["outs"]["d_opt"]:
+                        if os.environ.get("SUBTEST_DEBUG"):
+                            print("subtest stage diff:", suite, i, file=sys.stderr)
+                        if not FALLBACK: return False
+                        full.append((suite, i, opt))  # optimized tree differs: run it all
+                        continue
+            except Exception:  # noqa: BLE001
+                return False
+    tables: dict = {}
     with zipfile.ZipFile(store) as zf:
-        for suite, i, opt in todo:
+        for suite, i, opt in full:
             q = meta["suites"][suite][i]
             # each query (with its table loading): at most 3x its pinned CPU + 0.8 s, else the
             # child ends (→ keep)
