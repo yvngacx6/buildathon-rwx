@@ -13,7 +13,7 @@
 | Commits with ≥ 1 test dropped | 39 (6.5 %) | 34 (6 %) |
 | Sim s saved | 68.5 s = **−4.6 s / 40** | 53.6 s = **−3.8 s / 40**: practice_like −17.6 s/120 = −5.9/40; private −24.4/264; private41 −8.6/41; adv2 −3.0/65; adv 0; **sample 0** (laptop c1: −1.4 on bj7g) |
 | Reaches `[]` | **0** | **0** |
-| Misses | P: real pytest of every dropped test in its patched tree (`truth.py`): c1 36/36 commits (150 tests) PASS; c2 (pinned image): **39/39 commits, 180 dropped tests, all PASS** | **0 misses.** 490 labeled-failing optimizer tests reached the pruner and all were kept; 198 tests dropped, none labeled failing |
+| Misses | P: real pytest of every dropped test in its patched tree (`truth.py`): c1 36/36 commits (150 tests) PASS; c2 (pinned image): **39/39 commits, 180 dropped tests, all PASS**. Negative control: the tests verification kept in 0hs5, 21wp and 73wr all FAIL in the same harness | **0 misses.** 490 labeled-failing optimizer tests reached the pruner and all were kept; 198 tests dropped, none labeled failing |
 | Verify-child CPU | 14.9 s per 600 → ×2 scorer = **2.0 s / 40** | ≈ 1.0 s / 40 (practice_like) |
 | Parent CPU (lazy store load 0.37 s + lookup) | +3.3 s per 600 → ×2 = **0.4 s / 40** | +0.4…0.8 s per set |
 
@@ -30,8 +30,8 @@ edits (`tests/fixtures/optimizer/*.sql` → readers) and definition-time edits. 
 test, so slicing fixture edits by case gains nothing (not built).
 
 **P(works on the board as measured) ≈ 65 %. P(moonshot) ≈ 0 %. Expected gain ≈ 1–2 s per 40 practice commits, 0 misses.**
-Ship it only if a round has spare capacity. It is cheap to land: the build step is 3 min on 8 jobs (≈ 6 min on the 4-core
-build), the store is 0.76 MB in the image, and nothing goes in the repo.
+Ship it only if a round has spare capacity. Landing it needs a Dockerfile line, `PYTHONHASHSEED=0 python -m selector.cases build /opt/sqlglot /app/index/cases.pkl 4`. That line is NOT on the branch. Measured build: 3m15s wall with 8 jobs in the pinned image, about 5.6 CPU-min, mostly fork syscalls, plus a ~1 min single-threaded warm pass. Whoever lands it must check the total image build against the 10-min limit (
+The store is 0.76 MB in the image and nothing goes in the repo. The CPU figures were measured on rwx-big, and ×2 is the c7i-calibrated scorer factor, so treat it as approximate.
 
 ## Mechanism
 
