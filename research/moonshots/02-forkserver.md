@@ -3,10 +3,9 @@
 **Verdict: not a moonshot. Do not build it for the final.** The prototype works and is accurate. On
 labeled commits it got every verdict right: **0 false passes and 0 false fails across 98 commits**.
 It still cannot pay for itself. Running a test costs more CPU than the test's recorded seconds,
-and the scorer runs about 2x slower than the laptop. On practice-style commits (set P) the best
-gated variant comes out at **-0.5 to +0.8 s per 40 commits**. On the sample set it is +7 to +9 s.
-That does not get practice from about 190 s toward 120 s.
-Chance it helps the final measurably (more than 2 s): **about 10%**. Expected gain: **about 0 to +2 s per 40 commits**.
+and the scorer runs about 2x slower than the laptop. Best gated variant per 40 commits: **P (practice-style) -1.0 to -0.2 s**, private +0.4 to +0.8 s,
+sample +7 to +10 s. It cannot move practice from about 190 s toward 120 s. Chance it helps the final
+measurably (more than 2 s): **about 10%**. Expected gain: **about 0 to +2 s per 40 commits**.
 
 ## Structural reason (this alone decides it)
 
@@ -29,7 +28,7 @@ Chance it helps the final measurably (more than 2 s): **about 10%**. Expected ga
   failing tests. The board diagnostic puts our non-slow cost at about 128 s. The part the oracle
   could remove is paid for at 2.6x in CPU.
 
-## Prototype: `research/moonshots/02-forkserver/forksrv.py` (about 420 lines, laptop, Python 3.13 venv)
+## Prototype: `research/moonshots/02-forkserver/forksrv.py` (about 470 lines, laptop, Python 3.13 venv)
 
 1. **Warm-up (parent).** Import sqlglot and all 60 test modules once. `sys.monitoring` PY_START
    records which code objects ran during import. The parent wraps `open()` to record data files read
@@ -80,28 +79,17 @@ Inputs:
 | Fidelity vs labels: false passes / false fails | 0 / 0 (26 commits) | 0 / 0 (72 commits) | no labels |
 | Earlier run, swap path only (15 sample commits) | exact match | | |
 
-Per-commit cost examples (child CPU against recorded seconds of the cheap candidates):
+Child CPU against recorded seconds of the cheap candidates: 2jrq 12.8 / 6.8 s; 3utz 11.5 / 9.7 s
+(35 failing tests fail fast); 66ks 4.7 / 0.07 s (DuckDB class fixture); 535z 6.5 / 1.6 s;
+8y7j 0.25 / 0.03 s. Sample total: 73.9 s child CPU against 49.7 s recorded.
 
-| Commit | Child CPU | Recorded |
-|---|---|---|
-| 2jrq | 12.8 s | 6.8 s |
-| 3utz (35 failing tests fail fast) | 11.5 s | 9.7 s |
-| 66ks (5 executor tests: the DuckDB class fixture) | 4.7 s | 0.07 s |
-| 535z (snowflake + optimizer) | 6.5 s | 1.6 s |
-| 8y7j | 0.25 s | 0.03 s |
-
-Totals over sample: 73.9 s child CPU against 49.7 s recorded.
-
-**Economics per 40 commits.** Our selection is unchanged, except that cheap tests the oracle proved
-passing are dropped. Charged at 2x the measured child CPU, plus warm-up once.
-
-Gate (uses no labels): run the oracle only when
-`cost(sel) - cost(slow part) > M * 2 * predicted_cpu`, where `predicted_cpu` = per-test CPU plus the
-`setUpClass` CPU of the classes involved.
+**Economics per 40 commits.** Selection unchanged, except that cheap tests proven passing are
+dropped. Charged at 2x measured child CPU, plus warm-up once. Label-free gate: run the oracle only when
+`cost(sel) - cost(slow part) > M * 2 * predicted_cpu` (per-test CPU plus `setUpClass` CPU).
 
 | Variant (M=2) | sample | private | P |
 |---|---|---|---|
-| Always run all cheap candidates | -61.7 | -307.5 | (similar) |
+| Always run all cheap candidates | -61.7 | -307.5 | about -720 (model) |
 | Gated, any tests (warm-up 2.6 s) | +0.7 | -1.1 | -3.5 |
 | Gated, excluding optimizer and executor tests (lazy warm-up 0.4 s) | **+8.7** | **+0.8** | **-0.2** |
 
@@ -111,8 +99,7 @@ Gated-light details:
 - An earlier fail-fast model (stop at the first failure, labels from answers) gave a similar
   ceiling: +2 to +8 s per 40, before warm-up and setUpClass costs.
 
-Sample overstates the gain. It contains many fixture-only commits whose one candidate passes. On P,
-the practice-style set, the net is zero within noise.
+Sample overstates the gain. It contains many fixture-only commits whose one candidate passes. On P, the practice-style set, the net is zero within noise.
 
 ## Fidelity risks and fallbacks (all point toward "keep the test")
 
@@ -139,13 +126,12 @@ the practice-style set, the net is zero within noise.
   allowed (PyPI) and the image has no size limit. The 64 MB `/tmp` and 256-process limit are not an
   issue: one fork at a time, about 200 MB copy-on-write.
 
-## What would make it worth it (and why each fails)
+## What would make it worth it (none suffices)
 
-- **Cheaper tests.** Run only the assertions or subtests that reach the patched code. That is
-  per-call replay, which is diffexec (I12), already shipped.
-- **Make class fixtures warm** (run `setUpClass` in the parent). This removes about 1.6-4 s per
-  executor commit. Those commits still have to zero out, and on P they rarely do.
-- **Faster warm-up.** Already lazy: 0.4 s scorer for dialect-only gates. Not the bottleneck.
+Running only the assertions that reach the patched code is per-call replay, which is diffexec (I12),
+already shipped. A warm `setUpClass` saves about 1.6-4 s per executor commit, but those commits still
+have to zero out, and on P they rarely do. Warm-up is already lazy (0.4 s scorer) and is not the
+bottleneck.
 
 ## Side finding worth taking (small, low risk)
 
@@ -158,13 +144,8 @@ is 1-2 diffs per 40 on practice, so about 1 s per 40. Not worth the risk this la
 
 ## Files
 
-- `02-forkserver/forksrv.py`: the prototype.
-  - Run: `venv/bin/python forksrv.py SQLGLOT DATA SELECTOR_STDOUT OUT.json`
-  - Options: `[--maxrec 1.5] [--shard i/n] [--only c1,c2] [--baseline --keep-times]`
-- `02-forkserver/econ2.py`: fail-fast model.
-- `02-forkserver/econ3.py`: measured CPU, gate.
-- `02-forkserver/econ3_light.py`: gate excluding optimizer and executor tests.
-- `02-forkserver/cold.py`: child CPU against warm baseline.
-- `02-forkserver/partial.py`: import CPU.
-- Raw outputs (scratch, not committed):
-  `/tmp/claude-1000/-home-aditya-Desktop/917d9e69-42b9-4bef-9e78-d244939af294/scratchpad/m02/`
+All under `02-forkserver/`. `forksrv.py` is the prototype
+(`forksrv.py SQLGLOT DATA SELECTOR_STDOUT OUT.json [--maxrec 1.5] [--shard i/n] [--only c1,c2] [--baseline --keep-times]`).
+`econ2.py` is the fail-fast model, `econ3.py` / `econ3_light.py` the gated models on measured CPU, and
+`cold.py` / `partial.py` the CPU probes. Raw outputs (not committed):
+`/tmp/claude-1000/-home-aditya-Desktop/917d9e69-42b9-4bef-9e78-d244939af294/scratchpad/m02/`.
