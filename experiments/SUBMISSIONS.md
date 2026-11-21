@@ -11,3 +11,4 @@
 | S07 | 11-21 03:24 | 27d27a7 | + differential execution (pinned store), r4-gap | 149.0 | 2721.3 / 0 (264); adv 0/46; p41 0/41 | 205.6 (202.8 sim + 2.9 CPU) | 0/40 | Practice only −6.8 sim vs sample −26. |
 | S08 | 11-21 05:06 | 286a308 | + r7-robust2 (6 miss fixes: shared-state aliasing, class-table writes) | 149.0 | adv2 0/65 (was 6/65) | 217.0 (214.1 sim + 2.9 CPU) | 0/40 | +11.4 s sim vs S07 on practice only; investigating (r11-ab). |
 | S09 | 11-21 06:08 | 321c834 | + r10 dialect state, r11 fix, r9 removed bindings, r8 diffexec stand-ins | 114.6 | 2517.8 / 0 (264); adv2 0/65 | 207.8 (205.2 sim + 2.7 CPU) | 0/40 | Practice sim WORSE than S07 (202.8) despite sample −34 s. Hypothesis: diffexec time budgets exhausted on slower scorer CPU. |
+| S10 | 11-21 07:09 | 150ec36 | + diffexec budgets for slower scorer, r12 dialect-reach miss fix | 115.1 | 2524.7 / 0 (264) | pending | pending | Test of budget hypothesis. |
