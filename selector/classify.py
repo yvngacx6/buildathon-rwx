@@ -483,4 +483,16 @@ def _yields(node: ast.AST) -> bool:
 
 
 def top_level_classes(tree: ast.Module) -> list[str]:
-    return Scopes(tree).top_level_classes()
+    """`Scopes(tree).top_level_classes()`: classes outside any def or class body (module
+    level, also inside module-level if / try / with / match), in source order."""
+    out = []
+    todo = list(reversed(tree.body))
+    while todo:
+        node = todo.pop()
+        if isinstance(node, ast.ClassDef):
+            out.append(node.name)
+        elif not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for name in reversed(node._fields):
+                if name in _NESTED_STMTS:
+                    todo.extend(reversed(getattr(node, name, None) or ()))
+    return out

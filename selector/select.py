@@ -67,7 +67,7 @@ import os
 import re
 from pathlib import Path, PurePosixPath
 
-from . import classify, diff, nameindex, names, pack, state
+from . import classify, diff, nameindex, names, pack
 from . import maps as maps_module
 from .maps import ImportTimeMap, Maps
 
@@ -121,6 +121,8 @@ class Selector:
         self._slow = {n for n, s in self._secs.items() if s >= SLOW_SECONDS}
         self._untraced: set[int] | None = None
         self._sources: dict[str, str] | None = None
+        self._some_sources: dict[str, str | None] = {}  # `_source` before `_all_sources`
+        self._classes_of: dict[str, list[str]] = {}
         self._name_index: nameindex.NameIndex | None = None
         self._files: list[diff.FilePatch] = []  # the current commit's files
         self._state: dict | None | bool = False  # its import-state diff (False: not yet run)
@@ -495,6 +497,8 @@ class Selector:
                     except diff.PatchError:
                         self._state = None
                         return None
+            from . import state  # imported on first use: few commits need it
+
             snapshot = Path(os.environ.get("BR_STATE", state.DEFAULT_PATH))
             self._state = state.diff(self.sqlglot, snapshot, patched)
         return self._state  # type: ignore[return-value]
@@ -721,9 +725,11 @@ class Selector:
     def _import_dependents(self, path: str) -> set[int]:
         """Tests that fail if module `path` cannot be imported: dependents of every module
         whose import (per the import-time map) runs the module's top-level statements."""
-        tree = ast.parse(self._all_sources()[path])
+        source = self._source(path)
+        if source is None:
+            raise KeyError(path)
         got: set[int] = set()
-        for stmt in tree.body:
+        for stmt in ast.parse(source).body:
             modules = self.maps.import_time.modules(path, stmt.lineno, stmt.lineno)
             if any(m == "tests" or m.startswith("tests.") for m in modules):
                 # A test module fails to import: a collection error, which by default
@@ -741,9 +747,8 @@ class Selector:
             if path.startswith("tests/"):
                 hit = set(self._by_file.get(path, set())) | self.maps.test_imports.get(path)
             else:
-                source = self._all_sources().get(path)
-                classes = classify.top_level_classes(ast.parse(source)) if source else []
-                hit = set(self.maps.whole_file(path)) | self.maps.module_users(module, classes)
+                hit = set(self.maps.whole_file(path)) | self.maps.module_users(
+                    module, self._top_level_classes(path))
             self._dependents[module] = hit
         return hit
 
@@ -799,7 +804,7 @@ class Selector:
                 if breaks is not None and breaks.search(self._all_sources()[other]):
                     got |= self._import_dependents(other)
                 users = self.maps.whole_file(other) | self.maps.module_users(
-                    _module_of(other), classify.top_level_classes(ast.parse(self._all_sources()[other])))
+                    _module_of(other), self._top_level_classes(other))
                 if not users:
                     raise AllTests(f"{path}: names imported by {other}, which has no known users")
                 got |= users
@@ -815,7 +820,8 @@ class Selector:
         mentions = re.compile(r"\b(" + "|".join(map(re.escape, sorted(names))) + r")\b") if names else None
         out = []
         for other, text in self._all_sources().items():
-            if other == path or not refers.search(text):
+            # every alternative of `refers` contains `leaf`: a cheap test first
+            if other == path or leaf not in text or not refers.search(text):
                 continue
             if f"{module} import *" in text or f".{leaf} import *" in text:
                 raise AllTests(f"{path}: star-imported by {other}")
@@ -824,6 +830,25 @@ class Selector:
         return out
 
     # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _source(self, path: str) -> str | None:
+        """`self._all_sources().get(path)`, reading only that file."""
+        if self._sources is not None:
+            return self._sources.get(path)
+        if path not in self._some_sources:
+            file = self.sqlglot / path
+            self._some_sources[path] = (file.read_text(errors="replace")
+                                        if path.startswith(("sqlglot/", "tests/"))
+                                        and path.endswith(".py") and file.is_file() else None)
+        return self._some_sources[path]
+
+    def _top_level_classes(self, path: str) -> list[str]:
+        """Top-level classes of a pinned source file (none if it is not one)."""
+        if path not in self._classes_of:
+            source = self._source(path)
+            self._classes_of[path] = (classify.top_level_classes(ast.parse(source))
+                                      if source else [])
+        return self._classes_of[path]
 
     def _all_sources(self) -> dict[str, str]:
         if self._sources is None:

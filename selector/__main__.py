@@ -8,6 +8,7 @@ Environment overrides (for local evaluation):
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
@@ -19,6 +20,9 @@ from .select import ALL_FRACTION, Selector
 
 
 def main() -> None:
+    # A short run that builds large syntax trees: the cycle collector would rescan them over
+    # and over and find nothing (trees free by reference count). Off saves ~20 % of CPU.
+    gc.disable()
     started = time.process_time()
     data = Path(os.environ.get("BR_DATA", "/data"))
     sqlglot = Path(os.environ.get("BR_SQLGLOT", "/opt/sqlglot"))

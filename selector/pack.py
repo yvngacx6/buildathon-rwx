@@ -6,6 +6,8 @@ We try every worker count k = 1..8 with longest-first (LPT) packing and keep the
 
 from __future__ import annotations
 
+import heapq
+
 WORKER_COST_MS = 2_000
 MAX_WORKERS = 8
 
@@ -19,10 +21,12 @@ def lpt(tests: list[tuple[int, int]], k: int) -> tuple[list[list[int]], int]:
     """Pack (number, ms) pairs onto k workers, longest first. Returns (workers, max load)."""
     workers: list[list[int]] = [[] for _ in range(k)]
     loads = [0] * k
+    heap = [(0, i) for i in range(k)]  # (load, worker): the least loaded, lowest index first
     for number, ms in sorted(tests, key=lambda t: (-t[1], t[0])):
-        i = loads.index(min(loads))
+        load, i = heap[0]
         workers[i].append(number)
-        loads[i] += ms
+        loads[i] = load + ms
+        heapq.heapreplace(heap, (loads[i], i))
     workers = [w for w in workers if w]
     return workers, max(loads) if loads else 0
 
