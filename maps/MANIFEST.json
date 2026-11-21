@@ -48,5 +48,40 @@
   "facts": "1620 tests each run alone, 244 modules, 0 isolation failures; collection: 160 modules (101 by import). No labeled patch used.",
   "environment_note": "The only except ImportError around a repo import is sqlglot/_version (generated, not in the repo), so optional dependencies cannot change the module closures."
  },
- "classes_run": "classes_run.json.gz: mapbuild/classes_run.py from trace_one.py traces (r6, same image/sha; every trace's classes equals classes.json.gz): classes minus objects made while a sqlglot/ module body executes"
+ "classes_run": "classes_run.json.gz: mapbuild/classes_run.py from trace_one.py traces (r6, same image/sha; every trace's classes equals classes.json.gz): classes minus objects made while a sqlglot/ module body executes",
+ "diffexec": {
+  "file": "diffexec.zip",
+  "what": "per sqlglot function: deduplicated call inputs seen while each test ran, with a digest of each call's effect (args after the call + result/exception). Built only from the pinned commit's own test run; no labels, patches or mutants. See research/ideas/I12-differential-execution.md.",
+  "image": "python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 + requirements.lock",
+  "sqlglot_sha": "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
+  "env": {
+   "PYTHONHASHSEED": "0",
+   "SKIP_INTEGRATION": "0"
+  },
+  "build_command": "mapbuild/diffexec_build.sh",
+  "granularity": "one pytest process per test file; caps applied after merging",
+  "caps": {
+   "calls_per_function": 50000,
+   "distinct_input_bytes_per_function": 300000,
+   "bytes_per_input": 16000
+  },
+  "test_files": 58,
+  "jobs": 4,
+  "record_wall_seconds": "about 3,000 on 4 cores (EC2, census 124 s), done as a first run plus a RESUME=1 rerun of tests/test_serde.py after the early-abort fix; that rerun alone took 41 s",
+  "record_cpu_seconds": "not measured over both runs; the slow file before the fix (test_serde) alone used about 1,550 CPU-s",
+  "functions": 6678,
+  "functions_recorded": 3488,
+  "dead_by_reason": {
+   "calls": 220,
+   "bytes": 450,
+   "generator": 285,
+   "input": 2235
+  },
+  "tests_failed_while_recorded": 1,
+  "bytes": 9367581,
+  "sha256": "b9fdddd5228bdc33b9a67577194e8063e35e91e9dedf54ca905d847a8f29a2f6",
+  "tests_failed_while_recorded_ids": [
+   "tests/test_dialect_imports.py::TestDialectImports::test_dialect_attribute_access_is_cached"
+  ]
+ }
 }
