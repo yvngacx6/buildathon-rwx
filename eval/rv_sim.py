@@ -37,6 +37,9 @@ for flag, dst in (("--slow", None), ("--gate", gates), ("--share", shares)):
         else:
             dst.append(float(args[i + 1]))
         del args[i:i + 2]
+nodiff = "--skip-differs" in args
+if nodiff:
+    args.remove("--skip-differs")
 off, opn = load(args[0]), load(args[1])
 gates = gates or [0.4, 0.6, 0.8, 1.0, 1.5, 2.0]
 shares = shares or [0.0]
@@ -49,6 +52,8 @@ for share in shares:
             base += cost_off
             cost_open, why = opn[c]
             m = NOTE.search(why)
+            if m and nodiff and "dx differs" in why:
+                m = None
             if m and slow * float(m[1]) <= max(g, share * cost_off):
                 child = float(m[2])
                 nv += 1

@@ -51,6 +51,9 @@ CAP_FACTOR, CAP_EXTRA = 4.0, 0.3  # child CPU cap: 4x the map estimate + 0.3 s (
 # Also verify when the predicted scorer CPU is at most this share of what dropping the whole
 # selection would save (its scorer cost: busiest worker + 2 s per worker).
 SHARE = float(os.environ.get("BR_RUNVERIFY_SHARE", "0"))
+# diffexec replayed the recorded calls of a remaining test and saw a different effect: that
+# test very likely fails, so a run would only confirm it (label-free; a cost decision only).
+SKIP_DIFFERS = os.environ.get("BR_RUNVERIFY_SKIP_DIFFERS", "1") != "0"
 BATCH_S = float(os.environ.get("BR_RUNVERIFY_BATCH_S", "20"))  # total child CPU per run
 SPAWN_MODULES = {"multiprocessing", "concurrent", "subprocess", "threading", "_thread",
                  "socket", "asyncio", "pty"}
@@ -672,9 +675,13 @@ class RunVerify:
             order.extend(tid for _, tid in sorted(items))
         return order, est
 
-    def prune(self, files, numbers: set[int]) -> tuple[set[int], str]:
+    def prune(self, files, numbers: set[int], hints: dict | None = None) -> tuple[set[int], str]:
         if not numbers:
             return numbers, ""
+        kinds = {(hints or {}).get(self.sel._id_of[n]) for n in numbers} - {None}
+        dx = "differs" if "differs" in kinds else ("other" if kinds else "none")
+        if SKIP_DIFFERS and dx == "differs":
+            return numbers, "runverify: skip (diffexec saw a remaining test differ)"
         got = self.plan(numbers)
         if isinstance(got, str):
             return numbers, f"runverify: skip ({got})"
@@ -700,18 +707,18 @@ class RunVerify:
             return numbers, f"runverify: keep ({type(e).__name__})"
         self.spent += SCORER_SLOWDOWN * cpu
         if res is None:
-            return numbers, f"runverify: keep (child died / CPU cap; est {est:.2f}s, child {cpu:.2f}s)"
+            return numbers, f"runverify: keep (child died / CPU cap, dx {dx}; est {est:.2f}s, child {cpu:.2f}s)"
         if res.get("anomaly"):
             why = res["anomaly"][:80].replace(";", ",")
-            return numbers, f"runverify: keep (anomaly: {why}; est {est:.2f}s, child {cpu:.2f}s)"
+            return numbers, f"runverify: keep (anomaly: {why}, dx {dx}; est {est:.2f}s, child {cpu:.2f}s)"
         num_of = self.sel._number_of
         passed = {num_of[t] for t in res["passed"] if t in num_of}
         failed = res["failed"]
         if not failed and passed != numbers:
-            return numbers, f"runverify: keep (incomplete; est {est:.2f}s, child {cpu:.2f}s)"
+            return numbers, f"runverify: keep (incomplete, dx {dx}; est {est:.2f}s, child {cpu:.2f}s)"
         rest = numbers - passed
         return rest, (f"runverify: {len(passed)} passed, {len(failed)} failed {failed[:3]}, {len(rest)} kept "
-                      f"(verdicts; est {est:.2f}s, child {cpu:.2f}s)")
+                      f"(dx {dx}; est {est:.2f}s, child {cpu:.2f}s)")
 
 
 if __name__ == "__main__":

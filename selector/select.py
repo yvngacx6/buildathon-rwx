@@ -236,6 +236,8 @@ class Selector:
         self._chains = {}  # diffexec: changed function chains per file
         self._defaults = {}  # diffexec: default-only files → [(name, first line, {param: (old, new)})]
         self._spans = {}  # subtest: OLD-file spans of the touched statements per file
+        if self.diffexec is not None:
+            self.diffexec.why_kept = {}  # this commit's replay verdicts only (runverify hint)
         per_file: list[tuple[str, set[int]]] = []
         try:
             for fp in files:
@@ -266,7 +268,8 @@ class Selector:
         if chosen and self.runverify is not None:
             # Last: run what is left, if cheap, on the patched code; drop what passes.
             try:
-                chosen, note = self.runverify.prune(self._files, chosen)
+                hints = self.diffexec.why_kept if self.diffexec is not None else {}
+                chosen, note = self.runverify.prune(self._files, chosen, hints)
             except Exception as e:  # noqa: BLE001
                 note = f"runverify: keep ({type(e).__name__})"
             if note:
