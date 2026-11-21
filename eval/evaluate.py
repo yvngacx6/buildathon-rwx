@@ -13,6 +13,11 @@ A set is a directory with commits/*.patch, tests.json and answers.json
 
 Prints simulated seconds, misses (with the missed commit ids and kinds), and selector CPU.
 Needs BR_SQLGLOT to point at a sqlglot checkout at the pinned commit.
+
+CPU is os.times() children of the selector, which includes every process it waited for, so with
+selector/verify.py on it includes the verify server and each forked pytest run. Verification
+needs pytest and requirements.lock installed: without them the server fails and every commit
+stays static. Measure verify in the image (container CPU is logged from cgroup cpu.stat).
 """
 
 from __future__ import annotations
