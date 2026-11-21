@@ -19,6 +19,7 @@ from .select import ALL_FRACTION, Selector
 
 
 def main() -> None:
+    _hashseed_for_diffexec()
     started = time.process_time()
     data = Path(os.environ.get("BR_DATA", "/data"))
     sqlglot = Path(os.environ.get("BR_SQLGLOT", "/opt/sqlglot"))
@@ -50,6 +51,23 @@ def main() -> None:
 
     sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
     print(f"cpu {time.process_time() - started:.2f}s", file=sys.stderr)
+
+
+def _hashseed_for_diffexec() -> None:
+    """The diffexec store was recorded with PYTHONHASHSEED=0; replays fork from this process,
+    so run it with the same seed (re-exec once, ~20 ms). Nothing else here depends on it."""
+    if os.environ.get("PYTHONHASHSEED") == "0" or os.environ.get("BR_DIFFEXEC", "1") == "0":
+        return
+    store = Path(os.environ.get("BR_DIFFEXEC_STORE",
+                                Path(__file__).resolve().parent.parent / "diffexec_store"))
+    if not (store / "index.pkl").is_file():
+        return
+    try:
+        sys.stdout.flush()
+        os.execve(sys.executable, [sys.executable, "-m", "selector"],
+                  dict(os.environ, PYTHONHASHSEED="0"))
+    except OSError:
+        pass  # replays fall back to a child process
 
 
 if __name__ == "__main__":

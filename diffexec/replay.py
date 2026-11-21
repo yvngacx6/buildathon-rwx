@@ -1,0 +1,268 @@
+"""Run time: replay recorded calls of the patched functions, old code vs new code.
+
+Invoked by the selector as a child process (``python -m diffexec.replay``) with
+PYTHONHASHSEED=0 and a JSON request on stdin:
+
+    {"root": "/opt/sqlglot", "store": "<store dir>", "deadline_s": 20,
+     "files": [{"path": "sqlglot/x.py", "new_text": "..."}]}
+
+Answer on stdout (JSON):
+
+    {"bail": null | "<reason>",
+     "codes": {"<path>::<qualname>::<line>": {"state": "ok" | "dead:<why>" | "nocalls",
+                                              "phases": {"<phase>": "ok" | "bad" | "incomplete"}}},
+     "stats": {...}}
+
+A blob (one recorded call input) is "ok" only if
+  recorded effect digest == digest(old code on the input) == digest(new code on the input),
+the old and new runs emit the same log records, warnings and stdout, and the new run is not
+much slower. The effect digest covers the arguments after the call (mutations, aliasing)
+and the result or exception. During the "new" run every live function object of a changed
+code object has its ``__code__`` swapped, so recursive and nested calls also run new code.
+Anything unexpected → the phase is not "ok" → the selector keeps the tests.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import functools
+import gc
+import gzip
+import importlib
+import io
+import json
+import logging
+import os
+import pickle
+import signal
+import sys
+import time
+import types
+import warnings
+
+DEBUG = bool(os.environ.get("DIFFEXEC_DEBUG"))
+GEN_FLAGS = 0x20 | 0x80 | 0x100 | 0x200
+
+
+def _walk(top):
+    """Code objects of a module in a deterministic order, keyed (qualname, occurrence)."""
+    out, seen = {}, {}
+    todo = [top]
+    while todo:
+        c = todo.pop(0)
+        n = seen.get(c.co_qualname, 0)
+        seen[c.co_qualname] = n + 1
+        out[(c.co_qualname, n)] = c
+        todo.extend(k for k in c.co_consts if isinstance(k, types.CodeType))
+    return out
+
+
+class _OverTime(BaseException):
+    pass
+
+
+def _raise_overtime(signum, frame):
+    raise _OverTime()
+
+
+@contextlib.contextmanager
+def _cpu_limit(seconds: float):
+    """Interrupt a replayed call (e.g. a patched loop that never ends) after `seconds` of CPU."""
+    old = signal.signal(signal.SIGPROF, _raise_overtime)
+    signal.setitimer(signal.ITIMER_PROF, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_PROF, 0)
+        signal.signal(signal.SIGPROF, old)
+
+
+def phase_name(p) -> str:
+    return p if isinstance(p, str) else f"{p[0]}|{p[1]}"
+
+
+class _Logs(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self.got = []
+
+    def emit(self, record):
+        try:
+            self.got.append((record.name, record.levelno, record.getMessage()))
+        except Exception as e:  # noqa: BLE001
+            self.got.append(("<format error>", type(e).__name__))
+
+
+def main() -> None:
+    print(json.dumps(run_request(json.load(sys.stdin))))
+
+
+def run_request(req: dict) -> dict:
+    t_start = time.process_time()
+    deadline = t_start + float(req.get("deadline_s", 20))
+    root = os.path.realpath(req["root"])
+    sys.path.insert(0, root)
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 10000))
+    from diffexec import serial
+
+    out = {"bail": None, "codes": {}, "stats": {}}
+    with open(os.path.join(req["store"], "index.pkl"), "rb") as fh:
+        index = pickle.load(fh)
+
+    plan = []  # (key str, store entry, old code, new code, module name)
+    swaps = []  # (old code, new code)
+    for f in req["files"]:
+        path = f["path"]
+        filename = os.path.join(root, path)
+        with open(filename, "rb") as fh:
+            old_top = compile(fh.read(), filename, "exec", dont_inherit=True)
+        new_top = compile(f["new_text"].encode(), filename, "exec", dont_inherit=True)
+        old_codes, new_codes = _walk(old_top), _walk(new_top)
+        if old_codes.keys() != new_codes.keys():
+            out["bail"] = f"{path}: functions added, removed or reordered"
+            break
+        module = path[:-3].replace("/", ".").removesuffix(".__init__")
+        for k, o in old_codes.items():
+            n = new_codes[k]
+            if serial.code_digest(o) == serial.code_digest(n):
+                continue
+            swaps.append((filename, o, n))
+            if o.co_freevars != n.co_freevars or o.co_cellvars != n.co_cellvars:
+                out["bail"] = f"{path}: {o.co_qualname} changes its closure layout"
+                break
+            if serial.code_digest(o, shallow=True) == serial.code_digest(n, shallow=True):
+                continue  # differs only in nested code objects, which are verified themselves
+            if o is old_top or not (o.co_flags & 0x01):  # module or class body: definition time
+                out["bail"] = f"{path}: {o.co_qualname} body (definition time) changed"
+                break
+            key = f"{path}::{o.co_qualname}::{o.co_firstlineno}"
+            plan.append((key, index.get((path, o.co_qualname, o.co_firstlineno)), o, n, module))
+        if out["bail"]:
+            break
+    if out["bail"] or not plan:
+        out["stats"]["cpu_s"] = round(time.process_time() - t_start, 3)
+        return out
+
+    modules = {}
+    for _, _, _, _, m in plan:
+        modules[m] = importlib.import_module(m)
+    for f in req["files"]:
+        importlib.import_module(f["path"][:-3].replace("/", ".").removesuffix(".__init__"))
+
+    # live function objects of every changed code object (methods, closures, dict entries ...)
+    by_key = {}
+    for filename, o, n in swaps:
+        by_key[(filename, o.co_qualname, o.co_firstlineno)] = (o, n)
+    live = []  # (function, old live code, new code)
+    caches = []
+    for obj in gc.get_objects():
+        if type(obj) is types.FunctionType:
+            c = obj.__code__
+            hit = by_key.get((c.co_filename, c.co_qualname, c.co_firstlineno))
+            if hit is not None:
+                live.append((obj, c, hit[1]))
+        elif type(obj) is functools._lru_cache_wrapper:
+            caches.append(obj)
+
+    def set_mode(new: bool):
+        for fn, old_c, new_c in live:
+            fn.__code__ = new_c if new else old_c
+        serial.CODE_OVERRIDE.clear()
+        if new:
+            for (filename, q, line), (_, n) in by_key.items():
+                serial.CODE_OVERRIDE[(filename, q, line)] = n
+        for c in caches:
+            c.cache_clear()
+
+    def run(code, module, data):
+        vals, cells = pickle.loads(data)
+        closure = tuple(types.CellType() if c == serial._EMPTY else types.CellType(c)
+                        for c in cells) or None
+        fn = types.FunctionType(code, modules[module].__dict__, code.co_name, None, closure)
+        npos = code.co_argcount
+        nkw = code.co_kwonlyargcount
+        names = code.co_varnames
+        args = list(vals[:npos])
+        kwargs = {names[npos + i]: vals[npos + i] for i in range(nkw)}
+        rest = list(vals[npos + nkw:])
+        if code.co_flags & 0x04:
+            args.extend(rest.pop(0))
+        if code.co_flags & 0x08:
+            kwargs.update(rest.pop(0))
+        handler = _Logs()
+        rootlog = logging.getLogger()
+        rootlog.addHandler(handler)
+        stdout = io.StringIO()
+        t0 = time.process_time()
+        try:
+            with warnings.catch_warnings(record=True) as warned, contextlib.redirect_stdout(stdout):
+                warnings.simplefilter("always")
+                try:
+                    outcome = ("ret", fn(*args, **kwargs))
+                except Exception as e:  # noqa: BLE001
+                    outcome = ("exc", type(e).__module__, type(e).__qualname__, str(e))
+        finally:
+            rootlog.removeHandler(handler)
+        cpu = time.process_time() - t0
+        digest = serial.digest_cmp((tuple(vals), outcome))
+        side = (handler.got, [(w.category.__name__, str(w.message)) for w in warned], stdout.getvalue())
+        return digest, side, cpu
+
+    n_blobs = n_ok = 0
+    for key, entry, old_code, new_code, module in plan:
+        info = {"state": "ok", "phases": {}}
+        out["codes"][key] = info
+        if entry is None:
+            info["state"] = "nocalls"
+            continue
+        dead, fileno = entry
+        if dead:
+            info["state"] = f"dead:{dead}"
+            continue
+        if old_code.co_flags & GEN_FLAGS:
+            info["state"] = "dead:generator"
+            continue
+        with gzip.open(os.path.join(req["store"], "c", f"{fileno}.pkl.gz"), "rb") as fh:
+            rec = pickle.load(fh)
+        live_old = next((c for fn, c, _ in live if c.co_qualname == old_code.co_qualname
+                         and c.co_firstlineno == old_code.co_firstlineno), old_code)
+        verdict = []
+        overtime = False
+        for data, recorded, status in rec["blobs"]:
+            n_blobs += 1
+            if overtime or status != "ok" or recorded is None or time.process_time() > deadline:
+                verdict.append(False)
+                continue
+            try:
+                set_mode(False)
+                with _cpu_limit(max(0.0, deadline - time.process_time()) + 0.01):
+                    d_old, side_old, cpu_old = run(live_old, module, data)
+                set_mode(True)
+                with _cpu_limit(min(max(0.0, deadline - time.process_time()), 10 * cpu_old + 0.2) + 0.01):
+                    d_new, side_new, cpu_new = run(new_code, module, data)
+                ok = (d_old == recorded == d_new and side_old == side_new
+                      and cpu_new <= 5 * cpu_old + 0.05)
+                if DEBUG and not ok:
+                    print(f"[diffexec] {key}: recorded==old {d_old == recorded} old==new {d_old == d_new} "
+                          f"side {side_old == side_new} cpu {cpu_old:.4f}/{cpu_new:.4f}", file=sys.stderr)
+            except BaseException as e:  # noqa: BLE001  (includes RecursionError, unpicklable output)
+                if DEBUG:
+                    print(f"[diffexec] {key}: error {type(e).__name__}: {e}", file=sys.stderr)
+                ok = False
+                overtime = isinstance(e, _OverTime)  # likely a loop that never ends: stop here
+            finally:
+                set_mode(False)
+            n_ok += ok
+            verdict.append(ok)
+        for phase, idxs in rec["uses"].items():
+            if idxs is None:
+                v = "incomplete"
+            else:
+                v = "ok" if all(verdict[i] for i in idxs) else "bad"
+            info["phases"][phase_name(phase)] = v
+    out["stats"] = {"blobs": n_blobs, "ok": n_ok, "cpu_s": round(time.process_time() - t_start, 3)}
+    return out
+
+
+if __name__ == "__main__":
+    main()
