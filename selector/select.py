@@ -183,6 +183,12 @@ class Selector:
             self.diffexec = DiffExec.create(self)
         except Exception:  # noqa: BLE001  (diffexec is an optional pruner)
             self.diffexec = None
+        self.subtest = None
+        try:
+            from .subtest import SubTest
+            self.subtest = SubTest.create(self)
+        except Exception:  # noqa: BLE001  (optional pruner)
+            self.subtest = None
 
     def all_numbers(self) -> set[int]:
         return set(self._all)
@@ -201,6 +207,7 @@ class Selector:
         self._mixed_py = False  # a .py behaviour change diffexec cannot replay
         self._chains = {}  # diffexec: changed function chains per file
         self._defaults = {}  # diffexec: default-only files → [(name, first line, {param: (old, new)})]
+        self._spans = {}  # subtest: OLD-file spans of the touched statements per file
         per_file: list[tuple[str, set[int]]] = []
         try:
             for fp in files:
@@ -215,6 +222,8 @@ class Selector:
             if note:
                 reasons.append(note)
             per_file = [(p, got - dropped.get(p, set())) for p, got in per_file]
+        if self._jobs and self.subtest is not None and not self._mixed_py and not self._defaults:
+            per_file = self._subtest(per_file, reasons)
         for _, got in per_file:
             chosen |= got
         if chosen:
@@ -222,6 +231,29 @@ class Selector:
                 self._untraced = self.maps.untraced()
             chosen |= self._untraced
         return chosen & self._all, "; ".join(reasons)
+
+    def _subtest(self, per_file, reasons):
+        """Drop TPC executor tests whose touched queries re-run with the pinned outputs."""
+        from . import pack
+        prunable = {p: nums for p, _, nums in self._jobs}
+        cands = set(self.subtest.numbers)
+        for p, got in per_file:
+            cands -= got - prunable.get(p, set())
+        cands &= set().union(*(got for _, got in per_file))
+        if not cands:
+            return per_file
+        ms_of = {n: pack.duration_ms(s) for n, s in self._secs.items()}
+        everything = set().union(*(got for _, got in per_file))
+        base = pack.cost_ms(pack.pack(everything, ms_of), ms_of)
+
+        def benefit(only):
+            rest = everything - only
+            return base - (pack.cost_ms(pack.pack(rest, ms_of), ms_of) if rest else 0)
+
+        dropped, note = self.subtest.prune(self._jobs, self._spans, cands, benefit)
+        if note:
+            reasons.append(note)
+        return [(p, got - dropped) for p, got in per_file]
 
     def _benefit(self, per_file, only: set[int] | None = None) -> int:
         """Cost saved (ms) if diffexec dropped every prunable test (or every prunable test in
@@ -546,6 +578,8 @@ class Selector:
                     and self._defaults_unread() else None)
         for r in found:
             if r.kind == "function":
+                self._spans.setdefault(path, []).extend(
+                    r.statements if r.statements is not None else [r.span])
                 ran = self.maps.span(path, *r.span)
                 got = self._slow_tests_off_statements(path, ran, r)
                 if got and r.signature and defaults:
