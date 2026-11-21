@@ -93,6 +93,8 @@ SLOW_SECONDS = 5.0  # tests at least this slow get the statement-level rule in f
 # costs at least this much more than the cheapest selection it could give. r5-tune: 1.2 adds
 # diffs that save ~1.8 s each; ≤1.0 adds diffs that save ~0.5 s (< their CPU).
 STATE_MIN_GAIN = 1.2
+EXPR_ROOT = "sqlglot.expressions.core:Expr"
+MAX_HOLDER_ENTRIES = 200  # more entries hold import-time objects of a class: do not restrict
 # Class hierarchies the classes map records (maps/MANIFEST.json notes): a test that made an
 # instance of one of these classes (or used it as a dialect) is credited to it and its bases.
 TRACKED_ROOTS = {
@@ -561,7 +563,8 @@ class Selector:
                 users = None
             else:
                 if owner not in owners:
-                    owners[owner] = self._class_owner(owner, info, with_instances, index)
+                    owners[owner] = self._class_owner(owner, info, with_instances, index,
+                                                      found.get("holders"))
                 owner_path, chain, users = owners[owner]
                 touch |= self.maps.whole_file(owner_path) | self._class_users(
                     _module_of(owner_path), [chain])
@@ -632,10 +635,15 @@ class Selector:
         return None
 
     def _class_owner(self, key: str, info: dict, with_instances: set[str],
-                     index: nameindex.NameIndex) -> tuple[str, tuple[str, ...], set[int] | None]:
+                     index: nameindex.NameIndex, holders: dict | None = None
+                     ) -> tuple[str, tuple[str, ...], set[int] | None]:
         """(source path, class chain, tests that can hold the class; None: do not restrict)
         for a changed class. A class made by `type(...)` at import (a dialect's default
-        Tokenizer) stands for its nearest ancestor defined in the source."""
+        Tokenizer) stands for its nearest ancestor defined in the source.
+
+        Objects of the class built at import (a template parsed into a module constant) are
+        reached through the state entries that hold them (`holders`, build-time snapshot):
+        the tests that ran a line reading one of those entries join the holders."""
         meta = info.get(key)
         if not meta:
             raise names.Fallback(f"no class info for {key}")
@@ -647,21 +655,68 @@ class Selector:
             raise names.Fallback(f"{key}: no class in the source")
         chain = tuple(qual.split("."))
         family = index.check_class(path, chain)  # Fallback: bases / decorators outside view
-        if {key, real} & with_instances:
-            return path, chain, None  # objects built at import: a test need not make one
         if not ({key, real, *mro} & TRACKED_ROOTS):
             return path, chain, None  # the classes map does not record this hierarchy
-        return path, chain, self._holders(family, index)
+        # Expression classes: who made one at run time (classes_run), plus who read an entry
+        # holding one made at import. Other roots are also credited by dialect lookups, which
+        # the holder table does not follow: those keep the classes map, unrestricted if made
+        # at import.
+        expr = EXPR_ROOT in {key, real, *mro} and self.maps.classes_run is not None
+        users = self._holders(family, index, run=expr)
+        if {key, real} & with_instances:  # objects built at import: a test need not make one
+            if not expr:
+                return path, chain, None
+            via = self._entry_readers({key, real}, holders, index)
+            if via is None:
+                return path, chain, None
+            users |= via
+        return path, chain, users
+
+    def _entry_readers(self, keys: set[str], holders: dict | None,
+                       index: nameindex.NameIndex) -> set[int] | None:
+        """Tests that ran a line reading a state entry that holds an import-time object of
+        one of the classes `keys` (or a subclass). None: cannot tell (no holder table, an
+        entry without a source name, a read in code cached across tests, too many)."""
+        if holders is None or self.maps.classes_run is None:
+            return None
+        entries = sorted({e for k in keys for e in holders.get(k, ())})
+        if not entries or len(entries) > MAX_HOLDER_ENTRIES:
+            return None
+        got: set[int] = set()
+        for entry in entries:
+            kind, owner, name = entry.split(" ", 2)
+            if kind == "M":
+                owner_path, chain = self._module_path(owner), ()
+            else:
+                module, _, qual = owner.partition(":")
+                if "#" in owner or "<" in qual or not qual:
+                    return None
+                owner_path, chain = self._module_path(module), tuple(qual.split("."))
+            if owner_path is None or (name.startswith("__") and name.endswith("__")):
+                return None
+            for site in index.sites(name, owner_path, chain, False):
+                if site.path.startswith("tests/"):
+                    got |= (self.maps.span(site.path, *site.lines) if site.when == "run"
+                            else self._by_file.get(site.path, set())
+                            | set(self.maps.test_imports.get(site.path)))
+                elif site.when == "run":
+                    got |= self.maps.span(site.path, *site.lines)
+                elif site.memo:
+                    return None  # a cached result may hand the object to any later test
+                # other import-time reads: what they build is itself a holder entry
+        return got
 
     def _holders(self, family: list[tuple[str, tuple[str, ...]]],
-                 index: nameindex.NameIndex) -> set[int]:
-        """Tests that can hold one of these classes (or an object of one)."""
+                 index: nameindex.NameIndex, run: bool = False) -> set[int]:
+        """Tests that can hold one of these classes (or an object of one). `run`: count
+        objects made at run time only (classes_run; the caller adds import-time holders)."""
         users: set[int] = set()
+        made = self._made_users if run else self._class_users
         for p, ch in family:  # the class, its subclasses and their outer classes
-            users |= self._class_users(_module_of(p), [ch])
+            users |= made(_module_of(p), [ch])
             if len(ch) == 1:  # class attributes that hold it (`Parser = MySQLParser`)
                 for hp, hch in index.holders(ch[0]):
-                    users |= self._class_users(_module_of(hp), [hch])
+                    users |= made(_module_of(hp), [hch])
             for site in index.mentions(ch[0]):  # lines that name the class (or its outer)
                 if site.typecheck:
                     continue  # isinstance(x, C) does not hand C on
@@ -680,7 +735,9 @@ class Selector:
         chain: tuple[str, ...] = ()
         if r.kind == "class":
             chain = r.chain
-            users = self._holders(index.check_class(path, chain), index)
+            # a lower bound: run-time makers only (the holder entries only add tests)
+            users = self._holders(index.check_class(path, chain), index,
+                                  run=path.startswith("sqlglot/expressions/"))
         got: set[int] = set()
         for name in direct:
             for site in index.sites(name, path, chain, True):
@@ -762,6 +819,19 @@ class Selector:
                     module, self._top_level_classes(path))
             self._dependents[module] = hit
         return hit
+
+    def _made_users(self, module: str, chains) -> set[int]:
+        """`_class_users` from the classes_run map: tests that made an object of the class
+        outside an import of a sqlglot module (objects made at import are reached through
+        their holder entries, `_entry_readers`). Without that map, `_class_users`."""
+        run = self.maps.classes_run
+        if run is None:
+            return self._class_users(module, chains)
+        out: set[int] = set()
+        for chain in chains:
+            for cut in range(1, len(chain) + 1):
+                out |= run.get(f"{module}.{'.'.join(chain[:cut])}")
+        return out
 
     def _class_users(self, module: str, chains) -> set[int]:
         out: set[int] = set()

@@ -22,7 +22,7 @@ import zlib
 from array import array
 from pathlib import Path
 
-MAP_FILES = ("lines", "classes", "reads", "test_imports", "import_time", "imports")
+MAP_FILES = ("lines", "classes", "classes_run", "reads", "test_imports", "import_time", "imports")
 SHARDED = ("lines", "import_time")  # keys "<path>:<line>": one compiled file per path
 ISOLATION_FAILURE = "<isolation-failure>"  # imports map: tests whose record may be incomplete
 COMPILED = Path(__file__).resolve().parent.parent / "index" / "maps"
@@ -190,6 +190,10 @@ class Maps:
 
         self.lines = open_map("lines")
         self.classes = open_map("classes")
+        # classes_run: instantiations outside sqlglot module bodies (objects made at import
+        # are reached through the state entries that hold them); without it, `classes`
+        self.classes_run = (open_map("classes_run")
+                            if (directory / "classes_run.json.gz").is_file() else None)
         self.reads = open_map("reads")
         self.test_imports = open_map("test_imports")
         self.import_time = ImportTimeMap(directory / "import_time.json.gz",

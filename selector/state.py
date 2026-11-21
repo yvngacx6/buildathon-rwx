@@ -82,6 +82,11 @@ class Snapshot:
         self.classes: list[tuple[str, type]] = []
         self.instances: dict[str, int] = {}  # class key → objects of it found in the state
         self.entries: dict[str, str] = {}
+        # track: which entries hold objects of which classes (build-time snapshot only)
+        self.track = False
+        self.inside: list[set[str]] = []  # per object being digested: instance keys within
+        self.inst_in: dict[int, frozenset[str]] = {}  # memoized object → instance keys within
+        self.held: dict[str, set[str]] = {}  # entry → keys of classes it holds objects of
 
     def _register(self, cls: type, path: str) -> str:
         key = self.class_key.get(id(cls))
@@ -119,6 +124,8 @@ class Snapshot:
             return f"str:{v!r}" if len(v) < 64 else _h("str", v)
         hit = self.memo.get(id(v))
         if hit is not None:
+            if self.track and self.inside:
+                self.inside[-1] |= self.inst_in.get(id(v), frozenset())
             return hit
         if t in _SCALARS:
             return f"{t.__name__}:{v!r}"
@@ -132,11 +139,22 @@ class Snapshot:
             return f"<cycle:{len(self.path) - pos}>"
         pos = self.path[id(v)] = len(self.path)
         saved, self.low = self.low, pos
-        out = self._fp(v, depth)
+        if self.track:
+            self.inside.append(set())
+            try:
+                out = self._fp(v, depth)
+            finally:
+                within = self.inside.pop()
+            if self.inside:
+                self.inside[-1] |= within
+        else:
+            out = self._fp(v, depth)
         del self.path[id(v)]
         if self.low >= pos:
             self.memo[id(v)] = out
             self.keep.append(v)
+            if self.track and within:
+                self.inst_in[id(v)] = frozenset(within)
         self.low = min(saved, self.low)
         return out
 
@@ -197,6 +215,8 @@ class Snapshot:
         if self._ours(cls):
             key = self._register(cls, f"<anon>.{cls.__module__}.{cls.__qualname__}")
             self.instances[key] = self.instances.get(key, 0) + 1
+            if self.track:
+                self.inside[-1].add(key)
         state = []
         d = getattr(v, "__dict__", None)
         if isinstance(d, dict):
@@ -235,7 +255,7 @@ class Snapshot:
                     continue
                 if isinstance(v, type) and self._ours(v) and v.__module__ == name:
                     self._register(v, f"{name}:{g}")
-                self.entries[f"M {name} {g}"] = self.fp(v)
+                self.entries[f"M {name} {g}"] = self._entry(f"M {name} {g}", v)
         i = 0
         while i < len(self.classes):  # classes found while digesting join the queue
             key, cls = self.classes[i]
@@ -245,8 +265,31 @@ class Snapshot:
                     continue
                 if isinstance(v, type) and self._ours(v):
                     self._register(v, f"{key}.{a}")
-                self.entries[f"C {key} {a}"] = self.fp(v)
+                self.entries[f"C {key} {a}"] = self._entry(f"C {key} {a}", v)
             self.entries[f"C {key} __mro__"] = _h([self.fp(b) for b in cls.__mro__])
+
+    def _entry(self, entry: str, v: object) -> str:
+        if not self.track:
+            return self.fp(v)
+        self.inside = [set()]
+        out = self.fp(v)
+        if self.inside[0]:
+            self.held[entry] = self.inside[0]
+        self.inside = []
+        return out
+
+    def holders(self) -> dict[str, list[str]]:
+        """Class key → the entries whose value holds an object of that class or of a
+        subclass (objects built at import that tests reach through those entries)."""
+        mro = {key: [key] + [self.class_key.get(id(b)) for b in cls.__mro__[1:]]
+               for key, cls in self.classes}
+        out: dict[str, set[str]] = {}
+        for entry, keys in self.held.items():
+            for key in keys:
+                for k in mro.get(key, [key]):
+                    if k:
+                        out.setdefault(k, set()).add(entry)
+        return {k: sorted(v) for k, v in out.items()}
 
     def instance_mro(self) -> list[str]:
         """Keys of every class that some object in the state (built at import) is an
@@ -298,7 +341,7 @@ class _PatchedLoader(importlib.machinery.SourceFileLoader):
         return compile(self._source, self.path, "exec", dont_inherit=True)
 
 
-def take(root: str, patched: dict[str, str]) -> Snapshot:
+def take(root: str, patched: dict[str, str], track: bool = False) -> Snapshot:
     import pkgutil
     import warnings
 
@@ -315,6 +358,7 @@ def take(root: str, patched: dict[str, str]) -> Snapshot:
     for name in names:
         importlib.import_module(name)
     snap = Snapshot(package)
+    snap.track = track
     snap.take()
     return snap
 
@@ -335,9 +379,10 @@ def unordered(snap: Snapshot, keys) -> dict[str, str | None]:
 def _main(argv: list[str]) -> None:
     cmd, root = argv[0], argv[1]
     if cmd == "snap":  # snap <root> <out>
-        snap = take(root, {})
+        snap = take(root, {}, track=True)
         Path(argv[2]).write_bytes(pickle.dumps(
             {"entries": snap.entries, "info": snap.info(), "instances": snap.instance_mro(),
+             "holders": snap.holders(),
              "unordered": unordered(snap, snap.entries)}, pickle.HIGHEST_PROTOCOL))
         return
     if cmd == "diff":  # diff <root> <old>; stdin: {"path": patched source}
@@ -371,9 +416,13 @@ def compare(snap: Snapshot, old: dict, patched: dict[str, str]) -> dict:
             changed.append(k)
     keys = {k.split(" ")[1] for k in changed if k.startswith("C ")}
     info = snap.info(keys)
+    info = {k: info.get(k) or old["info"].get(k) for k in keys}
+    held = old.get("holders")
+    wanted = keys | {m for k in keys for m in (info.get(k) or {}).get("mro", []) if m}
     return {"changed": sorted(changed),
-            "info": {k: info.get(k) or old["info"].get(k) for k in keys},
-            "instances": sorted(set(snap.instance_mro()) | set(old["instances"]))}
+            "info": info,
+            "instances": sorted(set(snap.instance_mro()) | set(old["instances"])),
+            "holders": None if held is None else {k: held[k] for k in wanted if k in held}}
 
 
 def _module_of_key(key: str) -> str:
@@ -413,6 +462,11 @@ def build(root: Path, out: Path, samples: int = BUILD_SAMPLES) -> bool:
     base["loose"] = sorted(varies("entries") - volatile)
     base["volatile"] = sorted(volatile)
     base["files"] = source_files(root)
+    holders: dict[str, set[str]] = {}
+    for r in runs:  # every sample's holders: an entry found holding an object in any import
+        for k, v in r.get("holders", {}).items():
+            holders.setdefault(k, set()).update(v)
+    base["holders"] = {k: sorted(v) for k, v in holders.items()}
     out.write_bytes(pickle.dumps(base, pickle.HIGHEST_PROTOCOL))
     return True
 
