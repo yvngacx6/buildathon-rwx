@@ -106,6 +106,13 @@ SLOW_SECONDS = 5.0  # tests at least this slow get the statement-level rule in f
 # diffs that save ~1.8 s each; ≤1.0 adds diffs that save ~0.5 s (< their CPU).
 STATE_MIN_GAIN = 1.2
 EXPR_ROOT = "sqlglot.expressions.core:Expr"
+# Site.use values: a read that only uses part of the value. The floor (`_state_floor`) leaves
+# such reads out, since the diff may show that part unchanged.
+PARTIAL_USES = frozenset({"truth", "keys"})
+# Names whose value Python itself consumes while building a class / module (not stored as a
+# plain attribute the snapshot compares like any other).
+DEFINITION_TIME_NAMES = frozenset({"__slots__", "__init_subclass__", "__class_getitem__",
+                                   "__set_name__", "__all__", "__getattr__", "__path__"})
 MAX_HOLDER_ENTRIES = 200  # more entries hold import-time objects of a class: do not restrict
 # Class hierarchies the classes map records (maps/MANIFEST.json notes): a test that made an
 # instance of one of these classes (or used it as a dialect) is credited to it and its bases.
@@ -154,6 +161,7 @@ class Selector:
         self._state: dict | None | bool = False  # its import-state diff (False: not yet run)
         self._state_error: str | None = None  # file that failed the patched import, if known
         self._direct: dict[str, bool] | None = None  # names `_by_names` saw edited
+        self._inert: names.BodyChange | None = None  # … and the whole change it accepted
         self.notes: list[str] = []  # why a definition-time region was (not) narrowed
         self._dependents: dict[str, set[int]] = {}
         self._jobs: list = []
@@ -514,7 +522,7 @@ class Selector:
         if wide_error is not None:
             raise wide_error  # v1 could not bound it (star import, re-export, …): never narrow
         if r.kind in ("class", "module") and not r.via_def:
-            self._direct = None
+            self._direct = self._inert = None
             try:
                 got, why = self._by_names(path, old_tree, new_tree, r, wide)
                 if wide is not None and self._seconds(got) >= self._seconds(wide):
@@ -525,6 +533,7 @@ class Selector:
                 self.notes.append(f"{'.'.join(r.chain) or module}: no narrowing ({exc})")
                 try:
                     direct, self._direct = self._direct, None
+                    inert, self._inert = self._inert, None
                     if wide is not None:
                         # A selection is never cheaper than this floor (2 s if unknown).
                         floor = (self._cost(self._state_floor(path, r, direct, wide))
@@ -532,7 +541,7 @@ class Selector:
                         if self._cost(wide) - max(floor, 2.0) < STATE_MIN_GAIN:
                             raise names.Fallback(f"at most {self._cost(wide) - max(floor, 2.0):.1f}"
                                                  " s to win: not worth an import-state diff")
-                    got, why = self._by_state(path, r, wide)
+                    got, why = self._by_state(path, r, wide, inert)
                     if wide is not None and self._seconds(got) >= self._seconds(wide):
                         raise names.Fallback(f"{why}, but no cheaper")
                     self.notes.append(f"{'.'.join(r.chain) or module}: {why}")
@@ -553,10 +562,15 @@ class Selector:
         if not users:
             if r.kind == "module" or not r.classes:
                 got |= self._importer_users(path, old_tree, new_tree)
-            else:
+            elif r.kind != "function":
                 # A class the classes map does not record (enums, namespaces): other modules
                 # read it through the class object (`ErrorLevel.RAISE`, `DType.BPCHAR.value`)
                 # without running a line of this file or making one.
+                # Not for a method body (an unrun def): it changes only what a call computes,
+                # and a call runs the def's own lines (coverage) or happens at import
+                # (_function_at_import), whoever names the class. Matching by bare name would
+                # also pull in every unrelated class of that name (executor `Table` → every
+                # test naming exp.Table: ~ALL).
                 got |= self._mention_runners({name for chain in r.classes for name in chain})
             users = self.maps.module_users(module, classify.top_level_classes(old_tree))
         got |= users
@@ -601,6 +615,7 @@ class Selector:
             old_body, new_body = old_tree.body, new_tree.body
         change = names.body_change(old_body, new_body, old_tree)
         self._direct = change.names  # for `_state_floor`, if this falls back later
+        self._inert = change  # for `_by_state`: plain assignments of inert values
         direct: set[int] = set()
         for first, last in change.lambda_spans:  # a lambda body only runs when called
             got = self.maps.span(path, first, last)
@@ -629,8 +644,14 @@ class Selector:
                 if touch is not None and (owner_path, owner_chain) != (path, r.chain):
                     touch |= self.maps.whole_file(owner_path) | self._class_users(
                         _module_of(owner_path), [owner_chain])
+            # an in-place literal edit: reads of only its truth / keys may see no change
+            kept = (change.same.get(name, frozenset())
+                    if (owner_path, owner_chain) == (path, r.chain if r.kind == "class" else ())
+                    else frozenset())
             for site in index.sites(name, owner_path, owner_chain, name in change.new_names):
                 n_sites += 1
+                if site.when == "run" and site.use and site.use in kept:
+                    continue
                 if (site.when == "run" and not site.dynamic and not site.path.startswith("tests/")
                         and self.maps.import_time.modules(site.path, *site.lines)):
                     # a def body that also runs at import (`sql_names()` building the
@@ -714,8 +735,8 @@ class Selector:
             self._state = found
         return self._state  # type: ignore[return-value]
 
-    def _by_state(self, path: str, r: classify.Region,
-                  wide: set[int] | None) -> tuple[set[int], str]:
+    def _by_state(self, path: str, r: classify.Region, wide: set[int] | None,
+                  inert: names.BodyChange | None = None) -> tuple[set[int], str]:
         """Tests that can observe what the edit changes in import-time state (idea I22).
 
         Class-creation consumers (metaclass `__new__`, `__init_subclass__`, calls handed the
@@ -742,6 +763,14 @@ class Selector:
         changed = [k.split(" ", 2) for k in found["changed"]]
         own_module = _module_of(path)
         own = (f"{own_module}:{'.'.join(r.chain)}" if r.kind == "class" else own_module)
+        if (not changed and inert is not None and not inert.lambda_spans and not inert.sets
+                and not (inert.names.keys() & DEFINITION_TIME_NAMES)):
+            # The edit only assigns inert values (names.body_change), so all it can do is
+            # change the namespace the class / module is built from, and the patched import
+            # builds exactly the same state, package-wide: whatever read the edited values
+            # at creation (a metaclass overwriting the attribute, `SUPPORTS_COLUMN_JOIN_MARKS
+            # = "(+)" in KEYWORDS`) produced the same result. Nothing can observe it.
+            return set(), "state: the patched import builds identical state"
         if not any(kind == ("C" if r.kind == "class" else "M") and owner == own
                    for kind, owner, _ in changed):
             # the edit must show up: else the snapshot is blind to it
@@ -771,8 +800,9 @@ class Selector:
                 owner_path, chain, users = owners[owner]
                 touch |= self.maps.whole_file(owner_path) | self._class_users(
                     _module_of(owner_path), [chain])
+            same = frozenset(found.get("same", {}).get(f"{kind} {owner} {attr}", ()))
             for site in index.sites(attr, owner_path, chain, True):
-                for bucket, got in self._site_reads(index, site, attr):
+                for bucket, got in self._site_reads(index, site, attr, same=same):
                     n_sites += 1
                     if bucket == "tests":
                         in_tests |= got
@@ -794,12 +824,19 @@ class Selector:
                      f"held {len(held)}, tests {len(in_tests)})")
 
     def _site_reads(self, index: nameindex.NameIndex, site: names.Site, attr: str,
-                    depth: int = 0) -> list[tuple[str, set[int]]]:
+                    depth: int = 0, same: frozenset[str] = frozenset()
+                    ) -> list[tuple[str, set[int]]]:
         """Tests that can observe the value read at `site`, as (bucket, tests): "tests" (test
         code reads it), "loose" (a dynamic read: any object), "held" (a read through an
         object of the owner). Follows `site.flow`: a value bound to a local that is bound
         once is observed where the local is loaded; a value handed to a constructor that only
-        stores it is observed where that attribute is read."""
+        stores it is observed where that attribute is read.
+
+        `same`: what the edit leaves unchanged in the value ("truth": bool(value), "keys": the
+        set of keys / elements; state.compare). A run-time read that only uses that part
+        (Site.use: `if x.NAME:`, `k in x.NAME`) cannot observe the edit: no tests."""
+        if site.when == "run" and site.use and site.use in same:
+            return []
         if site.path.startswith("tests/") and not site.dynamic:
             if site.when == "run":
                 return [("tests", self.maps.span(site.path, *site.lines))]
@@ -817,14 +854,19 @@ class Selector:
         flow = site.flow if site.when == "run" and not site.dynamic and depth < 3 else None
         if flow is not None and flow[0] == "local":
             got: set[int] = set()
-            for first, last in flow[1]:
+            uses = flow[2] if len(flow) > 2 else ("",) * len(flow[1])
+            for (first, last), use in zip(flow[1], uses):
+                if use and use in same:
+                    continue  # this load only tests what the edit keeps
                 got |= self.maps.span(site.path, first, last)
             return [(bucket, got)]
         if flow is not None and flow[0] == "attr":
             _, path, chain, stored = flow
             out = []
             for inner in index.sites(stored, path, tuple(chain), False):
-                out += self._site_reads(index, inner, stored, depth + 1)
+                # the stored attribute holds the same object: same projections
+                out += self._site_reads(index, inner, stored, depth + 1,
+                                        same if not inner.dynamic else frozenset())
             return out
         # "def" sites outside cached code run at import: their products are in the diff; the
         # line map still shows any test that ran them later.
@@ -944,7 +986,7 @@ class Selector:
         got: set[int] = set()
         for name in direct:
             for site in index.sites(name, path, chain, True):
-                for bucket, tests in self._site_reads(index, site, name):
+                for bucket, tests in self._site_reads(index, site, name, same=PARTIAL_USES):
                     if bucket == "tests" or users is None:
                         got |= tests
                     elif bucket == "loose":

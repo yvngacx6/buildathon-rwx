@@ -9,4 +9,4 @@
 | S05 | 11-21 01:20 | 8585937 | + CPU cut (compiled stdlib, marshal shards) | 179.9 | 2882.7 / 0 (264) | 210.8 (209.5 sim + 1.3 CPU) | 0/40 | CPU −1.9 s. |
 | S06 | 11-21 02:22 | d2e0730 | + tune, class-attr narrowing, wide-class (2 miss fixes) | 175.0 | 2865.3 / 0 (264); adv 0/46 | 210.8 (209.5 sim + 1.3 CPU) | 0/40 | Practice sim unchanged since S04: practice commits not in these mechanisms. Diffexec is the lever. |
 | S07 | 11-21 03:24 | 27d27a7 | + differential execution (pinned store), r4-gap | 149.0 | 2721.3 / 0 (264); adv 0/46; p41 0/41 | 205.6 (202.8 sim + 2.9 CPU) | 0/40 | Practice only −6.8 sim vs sample −26. |
-| S08 | 11-21 05:06 | 286a308 | + r7-robust2 (6 miss fixes: shared-state aliasing, class-table writes) | 149.0 | adv2 0/65 (was 6/65) | pending | pending | |
+| S08 | 11-21 05:06 | 286a308 | + r7-robust2 (6 miss fixes: shared-state aliasing, class-table writes) | 149.0 | adv2 0/65 (was 6/65) | 217.0 (214.1 sim + 2.9 CPU) | 0/40 | +11.4 s sim vs S07 on practice only; investigating (r11-ab). |
