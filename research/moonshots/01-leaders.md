@@ -43,7 +43,7 @@ Score impact is per 40 practice commits. Final risk is for 60 final commits at 3
 
 | Strategy | Practice score it explains | Final risk | Evidence |
 |---|---|---|---|
-| (a) Heavy run-time execution (run the candidates, output only failures) | cannot reach 126. Best exec policy = our static score at f ≥ 1 (f = scorer CPU / recorded s) | low (exec only prunes) | Model on 205 practice-style labeled commits (`ours.py`): exec-everything 473–806 s/40 vs static 317 at f = 1–2.5. Static output parallelises (cost = max worker + 2k), exec pays Σ. Wins only for sets < ~1.5 CPU-s with no failure. Report 03: ~4 s. |
+| (a) Heavy run-time execution (run the candidates, output only failures) | cannot reach 126. Best exec policy = our static score at f ≥ 1 (f = scorer CPU / recorded s) | low (exec only prunes) | Model on 205 practice-style labeled commits (`ours205.py`): exec-everything 451–754 s/40 vs static 304.7 at f = 1–2.5; best threshold policy saves ≤ 0.4 s/40. Static output parallelises (cost = max worker + 2k), exec pays Σ. Wins only for sets < ~1.5 CPU-s with no failure. Report 03: ~4 s. |
 | (b) Slow-test gamble: "slow test only if it ran the changed line" | explains the low slow cost only if practice was lucky. The rule still wastes 139 s/40 on practice-style labeled data | **0.015 miss/commit → 0.9 misses → +263 s** (practice-style); 13%/commit on other kinds | `slowrisk.py` (below) |
 | (b') "never run slow tests" | impossible: 1 practice commit needs one (S11) | 6 misses → +1,840 s | – |
 | (c) Mutation kill matrix (patch/site → failures). **Banned.** | ≈ oracle + CPU ≈ 65–115. Leaders at 126+ is weak evidence against a complete key | DQ if read ("top entries are read"); fails on new kinds | – |
@@ -63,12 +63,12 @@ Score impact is per 40 practice commits. Final risk is for 60 final commits at 3
 | stmt: ran the changed statement (our r2 rule, before verification) | 1 (0.005): tiyl, import-time | 240 s | 32 (0.12) |
 | never | 21 (0.10) | 0 | 40 (0.15) |
 
-- P(slow test fails | it ran the exact changed line) on practice-style commits:
-  - tpcds 16/40 = 0.40
-  - tpch 3/9
-  - optimized_tpch 2/9
+- P(slow test fails | it ran the exact changed line), population A (`slowstatsA.py`):
+  - tpcds 15/36 = 0.42
+  - tpch 3/8
+  - optimized_tpch 2/8
   - max_nodes 1/5
-- Dropping a line-covered tpcds therefore costs 0.40 × 300 = 120 s expected, against a 21.5 s saving. No rational static rule drops it. Only verification can (our r17/r18/r20).
+- Dropping a line-covered tpcds therefore costs 0.42 × 300 = 120 s expected, against a 21.5 s saving. No rational static rule drops it. Only verification can (our r17/r18/r20).
 - **Conclusion:** a leader with low slow cost on practice either verifies (as we do) or got lucky on practice. The lucky kind pays ≈ 0.3–0.9 misses in a 60-commit final.
 
 ## 3. Why the leaders are not plain coverage, and what that does to them in the final
@@ -102,6 +102,9 @@ Score impact is per 40 practice commits. Final risk is for 60 final commits at 3
   - A one-token change on statement S changes behaviour only in a process that executes S.
   - Two exceptions are function-wide effects, so guard them: compile old and new def, and if `co_varnames`, `co_cellvars`, `co_freevars`, `co_flags` (generator / coroutine) or `co_argcount`-like fields differ, use the function rule. Cheap.
   - Short-circuited continuation lines (2jrq) are covered, because any line of the statement counts.
+  - **Pure insertions (an added line):** select the tests of the PREVIOUS statement in the same block, or of the block header if the insert is first in its block (∪ the next statement).
+  - My emulation (`stmt_span`) used the next statement only, which is not a superset of the tests that reach the insertion point. The 0-miss evidence is almost all one-token replacements, so it does not test inserts.
+  - Reuse `classify.touched_statements`; do not port `stmt_span`.
 - **Map determinism.**
   - Traced 204 random non-slow tests under PYTHONHASHSEED = 1 and 2 on the laptop and compared them with the shipped map (seed 0, pinned image). There were **0 differing sqlglot lines in 204/204 tests** (avg 1,528 lines each; `seeds.py`, `seedcmp.py`).
   - Builds mapsA vs mapsC differ only in `executor/*` (288 keys, one-sided additions from a tracer change). Keep the function rule in `sqlglot/executor/*` or union both maps.
@@ -127,7 +130,7 @@ Score impact is per 40 practice commits. Final risk is for 60 final commits at 3
 
 ## 5. What NOT to copy
 
-- Do not copy a line-only or "never" slow policy, or any drop of a slow test that ran the touched statement without verification. 40% of those fail.
+- Do not copy a line-only or "never" slow policy, or any drop of a slow test that ran the touched statement without verification. 42% of those fail.
 - Do not ship a kill matrix: banned, and it is also an answer key for the final's mutant family.
 - Do not copy whole-candidate run-time execution: CPU ≥ the parallel static cost.
 
