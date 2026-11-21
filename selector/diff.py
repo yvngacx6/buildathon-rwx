@@ -20,6 +20,8 @@ class PatchError(Exception):
 class Hunk:
     old_start: int  # 1-based line number in the old file
     lines: list[str] = field(default_factory=list)  # each starts with ' ', '-' or '+'
+    old_at: int = 0  # 0-based index where `apply` found the hunk in the old file
+    new_at: int = 0  # 0-based index of the same spot in the new file
 
 
 @dataclass
@@ -104,10 +106,34 @@ def apply(old_text: str, patch: FilePatch) -> str:
         after = [l[1:] for l in hunk.lines if l[:1] in (" ", "+")]
         start = _find(old, before, max(hunk.old_start - 1, 0), cursor)
         out.extend(old[cursor:start])
+        hunk.old_at, hunk.new_at = start, len(out)
         out.extend(after)
         cursor = start + len(before)
     out.extend(old[cursor:])
     return "".join(out)
+
+
+def changed_lines(patch: FilePatch) -> tuple[list[int], list[int]]:
+    """1-based (removed lines in the old file, added lines in the new file).
+
+    Call after `apply`, which records where each hunk really landed.
+    """
+    removed: list[int] = []
+    added: list[int] = []
+    for hunk in patch.hunks:
+        o, n = hunk.old_at + 1, hunk.new_at + 1
+        for line in hunk.lines:
+            tag = line[:1]
+            if tag == "-":
+                removed.append(o)
+                o += 1
+            elif tag == "+":
+                added.append(n)
+                n += 1
+            else:
+                o += 1
+                n += 1
+    return removed, added
 
 
 def _find(old: list[str], block: list[str], hint: int, floor: int) -> int:
