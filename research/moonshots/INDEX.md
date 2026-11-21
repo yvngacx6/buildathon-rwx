@@ -14,10 +14,11 @@ new moonshot angle is started in its slot.
 | 06 | Generic sub-test decomposition | moon-06 | running | |
 | 07 | Calibrated risk model (P(first place)) | moon-07 | done | ✗ AUC 0.56 (no better than base rate); keep 0-miss policy. Spin-offs → R22 (import-run slow tests w/ 0 touched lines never fail), moon-12 (record tpcds callees). |
 | 08 | Practice-board experiment design | moon-08 | done | Slot plan adopted in part (ablations; always pick final explicitly after diagnostics). Score-encoded 'telemetry word' REJECTED: it circumvents 'you never see what your program printed' — not used. |
-| 09 | Final-round strategy | moon-09 | running | |
+| 09 | Final-round strategy | moon-09 | done | Deterministic under ±2x CPU. Must-fix: global wall deadline, Dockerfile download retry, Selector-construction guard, config/no-reader files → R25. Gap is practice-like code commits → moon-16. |
 | 10 | Wildcard ideas | moon-10 | done | 17 angles; V1 = run leftover cheap tests via plain unittest (agrees with labels 418/418), gated ≤0.6 s → −3…−9 s/40 → R24. Fixture-case slicing → moon-15. |
 | 11 | Assertion-level slicing: verify only the affected assertions of cheap tests | moon-11 | running | |
 | 12 | Compact tree-table input encoding so diffexec can record tpcds/max_nodes callees | moon-12 | running | |
 | 13 | Cut container CPU 4.9 s → <1 s (native/cached hot paths, cheaper state diff) | moon-13 | running | |
 | 14 | Fixture-edit precision: per-pair/per-line fixture reads and pair semantics (fixture readers ≈11% of A/B cost) | moon-14 | running | |
 | 15 | Per-fixture-case slicing for code edits (generalise r17 to test_annotate_funcs, test_qualify_columns, check_file loops) | moon-15 | running | |
+| 16 | Practice-like code commits: per-mechanism over-selection breakdown + targeted fixes | moon-16 | running | |
