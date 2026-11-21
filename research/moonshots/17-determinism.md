@@ -1,8 +1,11 @@
 # Moonshot 17 — Determinism audit
 
-**Verdict.** On a quiet machine main's output does not change from run to run. Every flip we
-saw (2 commits out of ~470 commit-runs) came from a **wall-clock guard that fired while the host
-was stalled** (load average 35–80, swapping 5 GB). CPU-time budgets, hash seeds, blob loading
+**Verdict.** On a quiet machine main's output is byte-identical from run to run. On EC2, in
+the pinned image with a 2-CPU container, every run so far gave the same output (see "EC2
+reruns"), including runs where 6 busy loops shared the container's 2 CPUs. Every flip we saw
+(2 commits out of ~470 laptop commit-runs) came from a **wall-clock guard that fired while the
+host was stalled** (load average 35–80, swapping 5 GB). We then reproduced the op07 flip on
+demand: main flips it in 2/2 runs at a 0.05-CPU quota, and `moon-17` flips it in 0/2. CPU-time budgets, hash seeds, blob loading
 order and digests gave identical decisions in every run. Fixed on `moon-17`: wall clocks no
 longer decide anything. Each child is capped by its own CPU (ITIMER_PROF / RLIMIT_CPU), and the
 wall timeout only catches a child that blocks. A capped child that overruns still keeps
@@ -52,12 +55,12 @@ jobs instead of subtest's). That is not run-to-run noise.
 
 | # | where | decides | kind | main | risk | fix on moon-17 |
 |---|---|---|---|---|---|---|
-| 1 | diffexec `_replay_fork` parent | whole replay → None | **wall** budget+5 s | observed flip (op07) | high on a stalled host | wall guard 4·b+30 s; child RLIMIT_CPU 2·b+3 s (SIGXCPU → keep) |
-| 2 | state `_run` | import-state diff → None (→ ALL / no narrowing) | **wall** 60 s | observed flip (ktz3) | high on a stalled host | RLIMIT_CPU 60 s in the child, wall 180 s |
+| 1 | diffexec `_replay_fork` parent | whole replay → None | **wall** budget+5 s | observed flip (op07); reproduced at 0.05 CPU | high on a stalled host | wall guard min(4·b+30 s, global budget left); child RLIMIT_CPU 2·b+3 s (SIGXCPU → keep) |
+| 2 | state `_run` | import-state diff → None (→ ALL / no narrowing) | **wall** 60 s | observed flip (ktz3) | high on a stalled host | RLIMIT_CPU 60 s set in the child's `_main` (no preexec_fn, so no slower fork path), wall min(180 s, global budget left) |
 | 3 | subtest / slowverify `verify` parent | verification → keep | **wall** 2·b+2 s | not observed | medium | wall 4·b+30 s; the child's ITIMER_PROF already caps CPU |
 | 4 | genmem `run_child` | keep | **wall** 2·b+5 s | not observed | medium | 4·b+30 s; ITIMER_PROF in the child |
 | 5 | diffexec child: `process_time() > deadline` per blob | blob → not ok | CPU | late=0 everywhere, ≤0.35 of budget | low (flips only near the budget) | kept; `late` counter in the note. Proposal below |
-| 6 | diffexec child: `cpu_new <= 5·cpu_old + 0.05`, per-call cap 10·cpu_old+0.2 | blob → not ok | CPU ratio | never fired | low (needs a ≈5× slowdown) | kept |
+| 6 | diffexec child: `cpu_new <= 5·cpu_old + 0.05`, per-call cap 10·cpu_old+0.2 | blob → not ok | CPU ratio, single sample | did not fire in our runs (retry=0); likely 66ks mechanism under swap | medium under memory pressure | one re-measure (min of two pairs) before a timing-only rejection |
 | 7 | diffexec `BATCH_BUDGET_S - spent` | budget for later commits | CPU, cumulative | spent ≤ 4 s/set ≪ 100 | low | kept |
 | 8 | subtest per-query ITIMER 3·cpu_q+0.8, total min(6, 2.5·est+1) | verification fails → keep | CPU against **build-time** CPU | 0.52 s used | low if build = run hardware | kept (see rebuild note) |
 | 9 | subtest plan `spend ≤ min(12, 0.6·gain)` with build-time `cpu_exec` | which TPC tests are verified | **build-time timing** | fixed per image | different across *rebuilds* | proposal: commit the per-query estimates |
@@ -85,6 +88,41 @@ jobs instead of subtest's). That is not run-to-run noise.
 * **Global wall deadline (moon-09 R25)** is the one wall clock that has to stay. It should trip
   only in a real overrun (> 4 min), never at normal load.
 
-## EC2 reruns (scorer-like image, 2-CPU container, host shared with ~9 other containers)
+## EC2 reruns (rwx-big, `blast-mapbuild` image = python 3.13 + /opt/sqlglot, `--cpus 2`)
 
-PENDING
+Index built in the container. Base = origin/main (bd16852), fix = moon-17. Odd runs are idle;
+even runs put 6 busy loops in the same 2-CPU container, so the selector gets ≈2/7 of a CPU and
+wall time stretches 3–5×.
+
+| set | base runs | fix runs | outputs (md5) | total s |
+|---|---|---|---|---|
+| sample | 5 | 5 (+4 with the blob retry) | **1 distinct** across all of them | 115.1 every run |
+| private41 | 5 | 5 | **1 distinct** | 388.9 every run |
+| adversarial2 | 5 | 5 | ADV | |
+| practice_like | 5 | 5 | PRAC | |
+| op07 alone, `--cpus 0.1` | 3 | 3 | same (child needs 0.85 s of CPU, ≈8.5 s wall, under the 9.4 s guard) | |
+| op07 alone, `--cpus 0.05` | **2/2 flip**: `no answer`, 127 tests, 7.6 s | **0/2 flip**: dropped 123, 2.4 s | | |
+
+* In the real image, 66ks gives `dropped 46 (blobs 2531/2543)` in all 10 sample runs; the 12
+  failing blobs also fail there. So 66ks is stable in the image too.
+* **CPU impact of the fix: none measurable.** Parent `cpu` on private41 is 3.45–3.75 s (base)
+  against 3.46–3.75 s (fix); total container user time is 12.45–12.59 s against 12.38–12.68 s
+  on idle runs. `late` = 0 and `retry` = 0 on every commit.
+* **Seconds impact: 0 s on every labeled set when the host is quiet.** On a starved host each
+  avoided flip saves ≈5 s (op07 +5.2 s, ktz3 +4.9 s), plus the 300 s risk of a run that
+  overruns (now bounded by the global budget).
+
+## Why moon-06 saw 66ks change
+
+Moon-06 forked from 4826380, and nothing in `maps/diffexec.zip`, `diffexec/` or `selector/`
+changed between there and main. Its sample run of main scored 140.2 s against our 115.1 s:
+about 25 s, which is the cost of keeping test_execute_tpcds for 66ks. That run happened on the
+laptop during the same memory-pressure period. The most likely mechanism (not reproduced) is
+the per-blob timing check: `cpu_new ≤ 5·cpu_old + 0.05` with a per-call cap of
+10·cpu_old + 0.2 s. `process_time` includes system CPU, and direct page reclaim under swap
+pressure is charged to the faulting process. So one reclaim spike of more than 50 ms during a
+"new" run marks the blob not ok, and with it every test phase that uses the blob. Context.table
+runs in every TPC-DS query, so test_execute_tpcds is the most exposed test. moon-17 now
+re-measures a timing-only failure once (min of two old/new pairs) before rejecting the blob.
+The digest comparison is never retried. Cost: only on timing failures, which number 0 on every
+labeled set.
