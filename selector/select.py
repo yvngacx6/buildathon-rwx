@@ -246,6 +246,8 @@ class Selector:
             wide_error = None
         except AllTests as exc:
             wide, wide_error = None, exc
+        if wide_error is not None:
+            raise wide_error  # v1 could not bound it (star import, re-export, …): never narrow
         if r.kind in ("class", "module") and not r.via_def:
             try:
                 got, why = self._by_names(path, old_tree, new_tree, r, wide)

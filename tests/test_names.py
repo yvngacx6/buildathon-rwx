@@ -96,6 +96,8 @@ FILES = {
     "sqlglot/helper.py": HELPER,
     "sqlglot/user.py": USER,
     "tests/test_tsql.py": TEST,
+    "sqlglot/consts.py": "K = 1\n",
+    "sqlglot/stars.py": "from sqlglot.consts import *\n\n\ndef f():\n    return K\n",
 }
 T = ["tests/test_a.py::TestA::test_week", "tests/test_a.py::TestA::test_limit",
      "tests/test_a.py::TestA::test_table", "tests/test_a.py::TestA::test_cached",
@@ -225,3 +227,8 @@ def test_non_assignment_in_class_body_falls_back(selector):
 def test_decorated_class_with_side_effects_falls_back(selector):
     got = run(selector, D, "class TSQL(Dialect):", "@register\nclass TSQL(Dialect):")
     assert got == CONSERVATIVE_TSQL
+
+
+def test_when_v1_cannot_bound_a_module_edit_never_narrow(selector):
+    # consts.K is star-imported by stars.py: v1 answers ALL, and so must we.
+    assert run(selector, "sqlglot/consts.py", "K = 1", "K = 2") == EVERYONE
