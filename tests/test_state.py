@@ -71,7 +71,31 @@ class Core:
 def build(cls):
     return cls.CACHED  # @build
 '''
-FILES = {"sqlglot/__init__.py": "", "sqlglot/dialect.py": DIALECT}
+BASE = '''\
+class Base:
+    TABLE = {"a": 1, "b": 2}
+
+    def get(self, key):
+        return self.TABLE.get(key)  # @table
+'''
+CHILD = '''\
+from sqlglot.base import Base
+
+
+class Child(Base):
+    TABLE = {**Base.TABLE}
+    TABLE.pop("a")
+'''
+CHILD2 = '''\
+from sqlglot.base import Base
+
+
+class Child2(Base):
+    TABLE = {**Base.TABLE, "c": 3}
+    TABLE.pop("a")
+'''
+FILES = {"sqlglot/__init__.py": "", "sqlglot/dialect.py": DIALECT, "sqlglot/base.py": BASE,
+         "sqlglot/child.py": CHILD, "sqlglot/child2.py": CHILD2}
 T = [f"tests/test_a.py::TestA::test_{i}" for i in range(8)]
 TRIE, TRIE_OTHER, PARTS, PARTS_USE, CORE, ESC, KW, BUILD = range(8)
 D = "sqlglot/dialect.py"
@@ -170,8 +194,8 @@ def test_snapshot_of_other_source_is_not_used(repo, tmp_path, monkeypatch):
     (other / D).write_text(DIALECT + "\n# changed size\n")
     (other / "sqlglot/__init__.py").write_text("")
     assert state.diff(other, snapshot, {}) is None
-    assert state.diff(root, snapshot, {}) == {"changed": [], "info": {}, "instances": [],
-                                              "holders": {}}
+    assert state.diff(root, snapshot, {}) == {"changed": [], "digests": {}, "info": {},
+                                              "instances": [], "holders": {}}
 
 
 def test_diff_reports_derived_values(repo):
@@ -179,3 +203,35 @@ def test_diff_reports_derived_values(repo):
     new = DIALECT.replace('"A": 1, "BB": 2}', '"A": 1, "BB": 3, "CC": 4}')
     got = state.diff(root, snapshot, {D: new})
     assert got["changed"] == ["C sqlglot.dialect:TSQL KEYWORDS", "C sqlglot.dialect:TSQL TRIE"]
+
+
+def run_file(selector: Selector, path: str, old: str, before: str, after: str):
+    assert old.count(before) == 1
+    new = old.replace(before, after, 1)
+    return selector.select("".join(difflib.unified_diff(
+        old.splitlines(True), new.splitlines(True), f"a/{path}", f"b/{path}")))
+
+
+def test_alias_mutating_another_modules_dict_is_all(selector):
+    # Child.TABLE now IS Base.TABLE: the pop in Child's body removes "a" from Base's dict, so
+    # every test that runs after sqlglot.child is imported sees it, users of Child or not.
+    # Here Child2 (imported after Child) then copies Base.TABLE without "a" and its own
+    # pop("a") fails: the edit breaks the import of another module, also ALL.
+    got, why = run_file(selector, "sqlglot/child.py", CHILD, "TABLE = {**Base.TABLE}",
+                        "TABLE = Base.TABLE")
+    assert got == set(range(len(T))), why
+    assert "breaks the import of sqlglot/child2.py" in why
+
+
+def test_alias_that_also_changes_the_own_value_is_all(selector):
+    # Child2.TABLE changes too, and its new value equals Base.TABLE's new value; Base.TABLE
+    # is still not a copy of it (they differed before the edit).
+    got, why = run_file(selector, "sqlglot/child2.py", CHILD2, 'TABLE = {**Base.TABLE, "c": 3}',
+                        "TABLE = Base.TABLE")
+    assert got == set(range(len(T))), why
+    assert "outside the patched modules" in why
+
+
+def test_mutation_of_own_copy_is_not_all(selector):
+    got, why = run_file(selector, "sqlglot/child.py", CHILD, 'TABLE.pop("a")', 'TABLE.pop("b")')
+    assert "outside the patched modules" not in why

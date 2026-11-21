@@ -394,10 +394,29 @@ def _main(argv: list[str]) -> None:
         if old.get("files") != source_files(Path(root)):
             sys.exit("the snapshot describes other source")
         patched = json.loads(sys.stdin.read())
-        snap = take(root, patched)
+        try:
+            snap = take(root, patched)
+        except Exception as exc:  # noqa: BLE001 - the patched package does not import
+            print(json.dumps({"import_error": _failing_file(exc, root)}))
+            return
         print(json.dumps(compare(snap, old, patched)))
         return
     sys.exit("usage: state.py snap <root> <out> | diff <root> <old>")
+
+
+def _failing_file(exc: BaseException, root: str) -> str | None:
+    """The package file (repo-relative) whose code raised `exc` while importing, or None."""
+    base = os.path.realpath(root) + os.sep
+    files = [getattr(exc, "filename", None)] if isinstance(exc, SyntaxError) else []
+    tb = exc.__traceback__
+    while tb is not None:
+        files.append(tb.tb_frame.f_code.co_filename)
+        tb = tb.tb_next
+    for f in reversed([f for f in files if f]):
+        real = os.path.realpath(f)
+        if real.startswith(base + "sqlglot" + os.sep):
+            return real[len(base):].replace(os.sep, "/")
+    return None
 
 
 def compare(snap: Snapshot, old: dict, patched: dict[str, str]) -> dict:
@@ -424,6 +443,8 @@ def compare(snap: Snapshot, old: dict, patched: dict[str, str]) -> dict:
     held = old.get("holders")
     wanted = keys | {m for k in keys for m in (info.get(k) or {}).get("mro", []) if m}
     return {"changed": sorted(changed),
+            # (old, new) value digests of each changed entry (None: no such entry)
+            "digests": {k: (before.get(k), new.get(k)) for k in changed},
             "info": info,
             "instances": sorted(set(snap.instance_mro()) | set(old["instances"])),
             "holders": None if held is None else {k: held[k] for k in wanted if k in held}}

@@ -524,3 +524,61 @@ def test_pure_rename_without_hunks_is_seen(selector):
 def test_deleted_empty_file_is_seen(selector):
     text = "diff --git a/tests/helpers.py b/tests/helpers.py\ndeleted file mode 100644\nindex e69de29..0000000\n"
     assert run(selector, text + edit("README.md", "hello", "hi")) == ALL
+
+
+PARSER = '''\
+_REGISTRY = []
+
+
+class Parser:
+    TABLE = {"A": 1}
+
+    def connect(self):
+        self.TABLE["PRIOR"] = 2
+        out = self.parse()
+        self.TABLE.pop("PRIOR")
+        return out
+
+    def note(self, x):
+        _REGISTRY.append(x)
+        self.errors.append(x)
+
+    def local(self, x):
+        seen = set()
+        seen.add(x)
+        return seen
+
+    def through_alias(self, x):
+        table = self.TABLE
+        table[x] = 1
+        registry = _REGISTRY
+        registry.append(x)
+'''
+
+
+def test_run_time_writes_to_class_tables_are_shared_state():
+    import ast
+
+    from selector import classify, select
+
+    tree = ast.parse(PARSER)
+    fns = {f.name: f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)}
+    region = lambda name: classify.Region("function", ("Parser", name))  # noqa: E731
+    defs = lambda name: select._edited_defs(tree, tree, region(name))  # noqa: E731
+    assert select._class_state_writes(defs("connect")) == {"TABLE"}
+    assert select._class_state_writes(defs("note")) == set()  # self.errors: per object
+    assert classify._writes_shared_state(fns["connect"])
+    assert classify._writes_shared_state(fns["note"])  # _REGISTRY.append
+    assert not classify._writes_shared_state(fns["local"])
+    assert classify._writes_shared_state(fns["through_alias"])  # table = self.TABLE; table[x] = 1
+
+
+def test_deleting_a_one_line_lambda_entry_changes_the_table():
+    import ast
+
+    from selector import classify
+
+    old = 'class P:\n    T = {\n        "A": lambda self: 1,\n        "B": lambda self: 2,\n    }\n'
+    new = old.replace('        "A": lambda self: 1,\n', "")
+    got = classify.regions(ast.parse(old), ast.parse(new), [3], [])
+    assert {r.kind for r in got} == {"function", "class"}, got
