@@ -35,4 +35,5 @@ RUN python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig
  && PYTHONHASHSEED=0 python -m selector.slowverify build /opt/sqlglot /app/index/slowverify.pkl \
  && chmod -R a+rX /app /opt/sqlglot
 # -S: no site module (the selector needs only the standard library).
+ENV BR_DIAG_DROP_IDS=test_max_nodes
 CMD ["python", "-S", "-m", "selector"]
