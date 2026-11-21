@@ -8,7 +8,7 @@ new moonshot angle is started in its slot.
 |---|---|---|---|---|
 | 01 | Reverse-engineer the leaders | moon-01 | done | Practice oracle ≈ 95 s; leaders 10–60 s above it, us ~100 above. Copy: statement-level selection for ALL tests (−10…−25 s), TPC fixture-entry rule (−8 s), CPU 4.9→2 s (−3 s) → R23. |
 | 02 | Warm fork-server: near-free test execution | moon-02 | done | ✗ Works (0 disagreements on 98 labeled) but per-test CPU ≈1.3× recorded secs (≈2.6× on scorer); net ≈ 0 s/40. Not built. |
-| 03 | General semantic equivalence (value profiles) | moon-03 | running | |
+| 03 | General semantic equivalence (value profiles) | moon-03 | done | ✗ ~1–2 s/40; most edits aren't comparisons/boolops. Warning: pickle-only paths (serde) invisible to non-pickling recorders → relayed to R23. |
 | 04 | Build-time recording beyond the 20 MB repo limit | moon-04 | running | |
 | 05 | Divergence-point re-execution of slow tests | moon-05 | running | |
 | 06 | Generic sub-test decomposition | moon-06 | done | Full mechanism not worth it; zero-CPU special case STMT_SECONDS=0 (statement rule for all tests) 0 misses/440, −9…−14 s/40 → folded into R23. Flagged diffexec nondeterminism on 66ks → moon-17. |
@@ -23,3 +23,4 @@ new moonshot angle is started in its slot.
 | 15 | Per-fixture-case slicing for code edits (generalise r17 to test_annotate_funcs, test_qualify_columns, check_file loops) | moon-15 | running | |
 | 16 | Practice-like code commits: per-mechanism over-selection breakdown + targeted fixes | moon-16 | running | |
 | 17 | Determinism audit: identical input → identical output across runs/load (diffexec/subtest budgets, hash seeds, fork timing) | moon-17 | running | |
+| 18 | Red-team soundness review of all run-time pruners (diffexec, subtest, slowverify, genmem, r19 import-fn, statement rule) | moon-18 | running | |
