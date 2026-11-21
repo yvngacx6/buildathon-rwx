@@ -1,5 +1,7 @@
 # Ideas backlog
 
+**Target: the oracle.** Perfect knowledge scores 94.4 s on the sample (≈3.15 s/commit), 0 misses. Leaders are at ≈3.7 s/commit. Every round attacks the largest gap between our cost and the oracle cost, per commit, with 0 misses on every set.
+
 Status: `todo` · `running` · `kept` · `rejected` · `parked`. Each idea links to its LOG.md entries.
 Source refs: `research/FINDINGS.md`, `research/PLAN.md`, `research/agent-reports/`.
 
@@ -16,3 +18,6 @@ Source refs: `research/FINDINGS.md`, `research/PLAN.md`, `research/agent-reports
 | I09 | Line map inside large functions, to keep slow tests out | todo | Phase E. |
 | I10 | Run-time execution of cheap candidate sets | parked | ~4 s gain, risk (report 03). |
 | I11 | Expected-cost rule for slow tests | todo | Only if mapped-in; never drop on guess. |
+| I12 | Differential execution: record each function's inputs during the pinned-commit test run; at run time, run old vs new function on those inputs; a test whose recorded calls all give identical results cannot fail | todo | Ambitious. Attacks "edit changes nothing" commits (12/30 in sample) that still select tpcds. |
+| I13 | Bytecode-equivalence filter (compile old/new function; equal co_code+consts → no-op) | todo | Wider than AST filter, still structural. |
+| I14 | Oracle-gap report in eval: per commit, our cost − oracle cost, sorted | todo | Drives every round. |
