@@ -205,6 +205,12 @@ class Selector:
             self.slowverify = SlowVerify.create(self)
         except Exception:  # noqa: BLE001  (optional pruner)
             self.slowverify = None
+        self.cases = None
+        try:
+            from .cases import Cases
+            self.cases = Cases.create(self)
+        except Exception:  # noqa: BLE001  (optional pruner)
+            self.cases = None
         self.genmem = None
         try:
             from .genmem import GenMem
@@ -245,7 +251,7 @@ class Selector:
                 reasons.append(note)
             per_file = [(p, got - dropped.get(p, set())) for p, got in per_file]
         if self._jobs and not self._mixed_py and not self._defaults:
-            for pruner in (self.subtest, self.slowverify):
+            for pruner in (self.subtest, self.slowverify, self.cases):
                 if pruner is not None:
                     per_file = self._subtest(per_file, reasons, pruner)
         if self.genmem is not None:
