@@ -322,6 +322,49 @@ def build(root: Path, out: Path, jobs: int = 4) -> None:
 _BUILD_TRACED = None
 
 
+def warm_pass(root: Path, store: Path) -> None:
+    """Cache-hit paths: the real cases run in WARM pool workers / the warm pytest process, where
+    a case can take branches (memo hits, already-built tables) its cold run never takes. Run every
+    case twice in one process in fixture order and store the lines any warm run executes that the
+    case's own cold run did not ("warm-only"); a touched statement on one of them -> keep."""
+    root = root.resolve()
+    sys.setrecursionlimit(1000)
+    _warm(str(root))
+    meta = pickle.loads(zlib.decompress(store.read_bytes()))
+    prefix = str(root) + "/"
+    cold: dict[int, dict] = {}
+    for f, d in meta["inv"].items():
+        for ln, sid in d.items():
+            for i in meta["sets"][sid]:
+                cold.setdefault(i, {}).setdefault(f, set()).add(ln)
+
+    def run():
+        import tests.helpers  # noqa: F401
+        ns = helper_namespace(str(root))
+        extra: dict[str, set] = {}
+        for _ in range(2):
+            for i, c in enumerate(meta["cases"]):
+                cov = _Cov(prefix)
+                cov.start()
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        run_case(c, ns, meta["annotate_schema"])
+                except Exception:  # noqa: BLE001
+                    pass
+                lines = cov.stop()
+                ci = cold.get(i, {})
+                for f, ls in lines.items():
+                    new = set(ls) - ci.get(f, set())
+                    if new:
+                        extra.setdefault(f, set()).update(new)
+        return {f: sorted(v) for f, v in extra.items()}
+
+    meta["warm_only"] = _in_fork(run)
+    print(f"warm-only lines: {sum(map(len, meta['warm_only'].values()))} in "
+          f"{len(meta['warm_only'])} files", file=sys.stderr)
+    store.write_bytes(zlib.compress(pickle.dumps(meta), 6))
+
+
 def _traced_entry(i):
     return _BUILD_TRACED(i)
 
@@ -376,8 +419,8 @@ class Cases:
         meta = self.meta()
         if not meta or any(p in BANNED_FILES for p in spans):
             return None
-        if _hit(meta["global"], spans):
-            return None
+        if _hit(meta["global"], spans) or _hit(meta.get("warm_only", {}), spans):
+            return None  # set-up, or a line only warm runs take (cache hits): keep
         hit = self._hit_cases(spans)
         out = {}
         for n in numbers:
@@ -534,5 +577,8 @@ def _run_test_cases(todo, meta, ns) -> bool:
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "build":
         build(Path(sys.argv[2]), Path(sys.argv[3]), int(sys.argv[4]) if len(sys.argv) > 4 else 4)
+        warm_pass(Path(sys.argv[2]), Path(sys.argv[3]))
+    elif len(sys.argv) == 4 and sys.argv[1] == "warm":
+        warm_pass(Path(sys.argv[2]), Path(sys.argv[3]))
     else:
         sys.exit("usage: python -m selector.cases build SQLGLOT_ROOT OUT.pkl [jobs]")
