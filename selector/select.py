@@ -106,6 +106,10 @@ DOC_SUFFIXES = (".md", ".rst", ".txt", ".html", ".png", ".svg", ".jpg")
 DOC_FILES = {"LICENSE", "Makefile", "CHANGELOG", ".gitignore", ".pre-commit-config.yaml"}
 CONFIG_FILES = {"pyproject.toml", "setup.cfg"}
 ALWAYS_ALL = {"pytest.ini", "tox.ini", "conftest.py", "setup.py"}
+# Repository metadata at the root: nothing pytest or sqlglot reads (R3, research/moonshots/
+# 09-final.md). Only when the reads map shows no test reading the file; else readers / ALL.
+REPO_META = {"MANIFEST.in", ".gitmodules", ".gitpod.yml", ".gitattributes", ".editorconfig",
+             ".git-blame-ignore-revs", ".mailmap", ".dockerignore", "CODEOWNERS"}
 # Selection cost ≥ this × ALL cost → just run ALL. r5-tune: 0.85 fired on 32.8 s selections
 # (0.89 × ALL, 4 s dearer, never needed on any set); 0.95 keeps the free hedge near equal cost.
 ALL_FRACTION = 0.95
@@ -148,6 +152,12 @@ class GlobalEffect(AllTests):
     is imported, in the same process, can see it. ALL, never the import bound."""
 
 
+class StateDiffOff(GlobalEffect):
+    """The run is past its time budget's verification phase (__main__): the import-state
+    diff is off. Its callers use it both to narrow and to detect global effects, so a
+    commit that needs it takes ALL (never the import bound)."""
+
+
 class Selector:
     def __init__(self, tests: list[dict], sqlglot: Path, maps: Path) -> None:
         self.tests = tests
@@ -187,6 +197,7 @@ class Selector:
         self._ancestor_memo: dict[tuple, set | None] = {}
         self._test_imports = None  # testimport.Checker, on first use
         self._all_test_modules: set[str] | None = None
+        self.state_diff_off = False  # `degrade`
         self.diffexec = None
         try:
             from .diffexec import DiffExec
@@ -214,6 +225,14 @@ class Selector:
 
     def all_numbers(self) -> set[int]:
         return set(self._all)
+
+    def degrade(self) -> None:
+        """Stop every run-time verification for the rest of the run (__main__'s deadline).
+        diffexec / subtest / slowverify / genmem only drop tests from the static selection,
+        so without them the selection is a superset; the import-state diff also detects
+        global effects, so with it off a commit that needs it takes ALL (StateDiffOff)."""
+        self.diffexec = self.subtest = self.slowverify = self.genmem = None
+        self.state_diff_off = True
 
     # ── entry point ────────────────────────────────────────────────────────────
 
@@ -337,12 +356,20 @@ class Selector:
                     and name_of(new) not in ALWAYS_ALL and name_of(new) != "__init__.py"):
                 raise AllTests(f"{fp.old_path} renamed to {new}")
             return self._import_bound(fp.old_path, f"{fp.old_path} renamed", removed=True)
+        if path == "setup.py" and fp.old_path and fp.new_path:
+            return self._root_setup(fp)
         if name in ALWAYS_ALL:
             raise AllTests(f"{path} is test configuration")
         if path.startswith(DOC_DIRS) or path.endswith(DOC_SUFFIXES) or name in DOC_FILES:
             return set(), "docs"
         if name in CONFIG_FILES:
             return self._config(fp)
+        if path in REPO_META:
+            readers = set()
+            for p in {fp.old_path, fp.new_path} - {None}:
+                readers |= self.maps.reads.get(p)
+            if not readers:
+                return set(), "repository metadata, no reader"
         if fp.is_binary or not path.endswith(".py"):
             readers = self.maps.reads.get(path)
             if readers:
@@ -398,6 +425,22 @@ class Selector:
                 if "pytest" in section or "pytest" in rows[line - 1]:
                     raise AllTests(f"{fp.path}: pytest configuration changed")
         return set(), "config, no pytest section"
+
+    def _root_setup(self, fp: diff.FilePatch) -> tuple[set[int], str]:
+        """The root setup.py: no test imports or runs it (pytest collects test_*.py only), so
+        an edit with the same syntax tree (comments, blank lines) changes nothing. Any other
+        edit, or a reader in the reads map → ALL (as before R3)."""
+        if self.maps.reads.get(fp.path):
+            raise AllTests(f"{fp.path} is test configuration")
+        try:
+            old_text = (self.sqlglot / fp.path).read_bytes().decode("utf-8")
+            new_text = diff.apply(old_text, fp)
+            same = ast.dump(ast.parse(old_text)) == ast.dump(ast.parse(new_text))
+        except (OSError, diff.PatchError, UnicodeDecodeError, SyntaxError, ValueError):
+            same = False
+        if not same:
+            raise AllTests(f"{fp.path} is test configuration")
+        return set(), "root setup.py, same syntax tree, no reader"
 
     def _python(self, fp: diff.FilePatch) -> tuple[set[int], str]:
         path = fp.path
@@ -1044,6 +1087,8 @@ class Selector:
     def _state_diff(self) -> dict | None:
         """What the commit changes in the state sqlglot builds at import (once per commit)."""
         if self._state is False:
+            if self.state_diff_off:
+                raise StateDiffOff("import-state diff off (time budget)")
             patched = {}
             for fp in self._files:
                 if fp.path.startswith("sqlglot/") and fp.path.endswith(".py") and fp.old_path:
