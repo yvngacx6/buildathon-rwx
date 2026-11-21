@@ -331,8 +331,6 @@ class Selector:
             readers = set()
             for p in {fp.old_path, fp.new_path} - {None}:
                 readers |= self.maps.reads.get(p)
-            if fp.old_path == fp.new_path and path in TPC_FIXTURES:
-                return self._tpc_fixture(fp, readers)
             return readers, "fixture → readers"
         if fp.old_path and fp.new_path and fp.old_path != fp.new_path:
             # The old module is gone; nothing at the pinned commit imports the new path –
@@ -366,41 +364,6 @@ class Selector:
                 raise
             # Every narrower rule gave up: fall back to the import bound of this one module.
             return self._import_bound(path, str(exc))
-
-    def _tpc_fixture(self, fp: diff.FilePatch, readers: set[int]) -> tuple[set[int], str]:
-        """tpc-h.sql / tpc-ds.sql (r23). tests/test_executor.py reads both files in
-        TestExecutor.setUpClass (`load_sql_fixture_pairs`, so the reads map credits every
-        test of the class) and consumes:
-          test_execute_tpch / test_execute_tpcds  (meta, sql) of each pair of its own file
-                                                  (`for args, sql, _`, `_, sql, _`)
-          test_optimized_tpch                     (sql, expected) of each tpc-h pair
-          every other TestExecutor test           nothing (only that setUpClass succeeds)
-        Re-parse old and new text exactly as tests/helpers.py does; if the new text makes it
-        raise (a `#` line without `:`, a query of only `#` lines, undecodable text) every
-        reader stays. Otherwise drop the TestExecutor tests whose part did not change.
-        Readers outside test_executor.py (test_optimizer's check_file) always stay."""
-        path = fp.path
-        try:
-            old_text = self._old_text(path)
-            new_text = diff.apply(old_text, fp)
-            if "\r" in old_text + new_text or "\ufffd" in new_text:
-                raise ValueError("carriage return")  # text mode would translate newlines
-            old_pairs = _fixture_pairs(old_text)
-            new_pairs = _fixture_pairs(new_text)
-        except Exception:  # noqa: BLE001  (setUpClass would fail too: whole class)
-            return readers, "fixture → readers"
-        queries = [(m, q) for m, q, _ in old_pairs] != [(m, q) for m, q, _ in new_pairs]
-        halves = [(q, e) for _, q, e in old_pairs] != [(q, e) for _, q, e in new_pairs]
-        prefix = "tests/test_executor.py::TestExecutor::"
-        tpch = path.endswith("tpc-h.sql")
-        keep_ids = set()
-        if queries:
-            keep_ids.add(prefix + ("test_execute_tpch" if tpch else "test_execute_tpcds"))
-        if tpch and halves:
-            keep_ids.add(prefix + "test_optimized_tpch")
-        got = {n for n in readers
-               if not self._id_of.get(n, "").startswith(prefix) or self._id_of[n] in keep_ids}
-        return got, f"tpc fixture → readers of the changed part (-{len(readers - got)})"
 
     def _import_bound(self, path: str, why: str, removed: bool = False) -> tuple[set[int], str]:
         """Every test an edit confined to module `path` can reach: the tests that load it
@@ -1832,32 +1795,6 @@ def _check_compiles(path: str, old_tree: ast.Module, new_tree: ast.Module,
 PICKLE_FILES = {"sqlglot/serde.py"}
 PICKLE_HOOKS = frozenset({"__reduce__", "__reduce_ex__", "__getstate__", "__setstate__",
                           "__getnewargs__", "__getnewargs_ex__", "__copy__", "__deepcopy__"})
-TPC_FIXTURES = {"tests/fixtures/optimizer/tpc-h/tpc-h.sql",
-                "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"}
-
-
-def _fixture_pairs(text: str) -> list[tuple[dict, str, str]]:
-    """tests/helpers.py `load_sql_fixture_pairs` on `text` (same code: `_filter_comments`,
-    split on `;`, `_extract_meta`), raising where it raises."""
-    text = "\n".join([line for line in text.splitlines() if line and not line.startswith("--")])
-    statements = text.split(";")
-    size = len(statements)
-    out = []
-    for i in range(0, size, 2):
-        if i + 1 < size:
-            sql = statements[i].strip()
-            meta = {}
-            sql_lines = sql.split("\n")
-            j = 0
-            while sql_lines[j].startswith("#"):
-                key, val = sql_lines[j].split(":", maxsplit=1)
-                meta[key.lstrip("#").strip()] = val.strip()
-                j += 1
-            sql = "\n".join(sql_lines[j:])
-            out.append((meta, sql, statements[i + 1].strip()))
-    return out
-
-
 _SHAPE = ("co_argcount", "co_posonlyargcount", "co_kwonlyargcount", "co_nlocals",
           "co_flags", "co_varnames", "co_cellvars", "co_freevars", "co_name")
 
