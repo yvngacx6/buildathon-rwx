@@ -123,6 +123,7 @@ class Selector:
         self._sources: dict[str, str] | None = None
         self._some_sources: dict[str, str | None] = {}  # `_source` before `_all_sources`
         self._classes_of: dict[str, list[str]] = {}
+        self._old_trees: dict[str, ast.Module] = {}
         self._name_index: nameindex.NameIndex | None = None
         self._files: list[diff.FilePatch] = []  # the current commit's files
         self._state: dict | None | bool = False  # its import-state diff (False: not yet run)
@@ -246,15 +247,14 @@ class Selector:
             new_text = diff.apply(old_text, fp)
         except (diff.PatchError, UnicodeDecodeError) as exc:
             raise AllTests(f"{path}: hunk does not apply ({type(exc).__name__})") from None
+        same = classify.SameAst(old_text, new_text)
         try:
-            old_tree = ast.parse(old_bytes)
+            old_tree = self._old_tree(path, old_bytes)
             new_tree = ast.parse(new_text.encode("utf-8"))
-            compile(new_tree, path, "exec")
+            _check_compiles(path, old_tree, new_tree, same)
         except (SyntaxError, ValueError) as exc:  # the module no longer imports
             raise AllTests(f"{path}: {type(exc).__name__}") from None
-        classify.strip_docstrings(old_tree)
         classify.strip_docstrings(new_tree)
-        same = classify.SameAst(old_text, new_text)
         if same(old_tree, new_tree):
             return set(), "same syntax tree (ignoring comments and docstrings)"
         lost = _bindings(old_tree) - _bindings(new_tree)
@@ -850,6 +850,14 @@ class Selector:
                                       if source else [])
         return self._classes_of[path]
 
+    def _old_tree(self, path: str, old_bytes: bytes) -> ast.Module:
+        """The pinned file's syntax tree, docstrings stripped (parsed once per run: nothing
+        changes the trees after `strip_docstrings`)."""
+        tree = self._old_trees.get(path)
+        if tree is None:
+            tree = self._old_trees[path] = classify.strip_docstrings(ast.parse(old_bytes))
+        return tree
+
     def _all_sources(self) -> dict[str, str]:
         if self._sources is None:
             self._sources = {}
@@ -862,6 +870,67 @@ class Selector:
     def _old_text(self, path: str) -> str:
         source = self.sqlglot / path
         return source.read_text() if source.is_file() else ""
+
+
+def _check_compiles(path: str, old_tree: ast.Module, new_tree: ast.Module,
+                    same: classify.SameAst) -> None:
+    """Raise what `compile(new_tree, path, "exec")` raises, without compiling again the
+    top-level statements whose text is the old file's (the old file compiles).
+
+    A compile error stays inside one top-level statement but for two module-wide rules:
+    `from __future__` imports must lead the file (and change how the rest compiles), and
+    module-level `global` / `nonlocal`. So when the leading docstring and future imports
+    are the old ones, no other future import exists, and the module scope has no global /
+    nonlocal, only the leading statements and the new top-level statements are compiled.
+    Otherwise (or without both texts, see SameAst) the whole module is."""
+    lead = _leading_futures(new_tree.body)
+    if same.old is not None and _same_lead(old_tree, new_tree, lead, same):
+        old = {classify.text_key(s, same.old) for s in old_tree.body}
+        new = [s for s in new_tree.body[lead:] if classify.text_key(s, same.new) not in old]
+        new_tree = ast.Module(body=new_tree.body[:lead] + new, type_ignores=new_tree.type_ignores)
+    compile(new_tree, path, "exec")
+
+
+def _same_lead(old_tree: ast.Module, new_tree: ast.Module, lead: int,
+               same: classify.SameAst) -> bool:
+    """The first `lead` statements (docstring, future imports) have the old text, the old
+    file has no more future imports, and the new module scope has no other future import
+    and no global / nonlocal."""
+    scope = list(_module_scope(new_tree.body))
+    return (sum(map(_is_future, scope)) == lead - _has_docstring(new_tree.body)
+            and not any(isinstance(s, (ast.Global, ast.Nonlocal)) for s in scope)
+            and len(old_tree.body) >= lead
+            and not (len(old_tree.body) > lead and _is_future(old_tree.body[lead]))
+            and [classify.text_key(s, same.old) for s in old_tree.body[:lead]]
+            == [classify.text_key(s, same.new) for s in new_tree.body[:lead]])
+
+
+def _module_scope(body: list[ast.stmt]):
+    """Statements that run in the module's own scope (not inside a def or class body)."""
+    for stmt in body:
+        yield stmt
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for name in ("body", "orelse", "finalbody"):
+            yield from _module_scope(getattr(stmt, name, None) or [])
+        for part in getattr(stmt, "handlers", None) or getattr(stmt, "cases", None) or []:
+            yield from _module_scope(part.body)
+
+
+def _is_future(stmt: ast.stmt) -> bool:
+    return isinstance(stmt, ast.ImportFrom) and stmt.module == "__future__"
+
+
+def _has_docstring(body: list[ast.stmt]) -> bool:
+    return bool(body) and classify._is_docstring(body[0])
+
+
+def _leading_futures(body: list[ast.stmt]) -> int:
+    """Length of the leading docstring + `from __future__` imports."""
+    n = int(_has_docstring(body))
+    while n < len(body) and _is_future(body[n]):
+        n += 1
+    return n
 
 
 def _module_of(path: str) -> str:

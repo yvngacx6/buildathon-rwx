@@ -132,11 +132,15 @@ class SameAst:
         return repr(x) == repr(y)
 
     def _same_text(self, a: ast.stmt, b: ast.stmt) -> bool:
-        first_a, first_b = _first_line(a), _first_line(b)  # decorators come before `def`
-        return (a.col_offset == b.col_offset and a.end_col_offset == b.end_col_offset
-                and a.lineno - first_a == b.lineno - first_b
-                and a.end_lineno - first_a == b.end_lineno - first_b
-                and self.old[first_a - 1:a.end_lineno] == self.new[first_b - 1:b.end_lineno])
+        return text_key(a, self.old) == text_key(b, self.new)
+
+
+def text_key(stmt: ast.stmt, lines: list[str]) -> tuple:
+    """All a statement's syntax tree depends on: its source lines and its place in them
+    (a def or class starts at its first decorator)."""
+    first = _first_line(stmt)
+    return (stmt.col_offset, stmt.end_col_offset, stmt.lineno - first, stmt.end_lineno - first,
+            tuple(lines[first - 1:stmt.end_lineno]))
 
 
 def _first_line(node: ast.AST) -> int:
