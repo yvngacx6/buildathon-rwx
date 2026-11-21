@@ -318,9 +318,23 @@ def test_test_helper_function_no_test_ran_selects_importers(selector):
 def test_test_helper_function_run_at_import_selects_importers(selector):
     # A body that runs while a test module is imported (collection) is invisible to the
     # lines map: keep the importers rule.
-    selector.maps.import_time.modules = lambda path, first, last: (
+    selector.maps.import_time.modules = lambda path, first, last, start=None: (
         {"tests.test_lib"} if path == "tests/helpers.py" else set())
     assert run(selector, edit("tests/helpers.py", 'return TABLE["a"]', 'return TABLE["a"] + 1')) == {A, B, U}
+
+
+def test_import_time_map_start_keys_cover_one_line_lambdas(tmp_path):
+    # moon-18: defining a lambda runs its line, so a lambda region skips its own line; a
+    # one-line lambda CALLED at import emits no LINE event of its own, only PY_START, which
+    # mapbuild/import_time.py records as "<path>:-<line>".
+    from selector.maps import ImportTimeMap
+    body = {"tests": ["sqlglot", "sqlglot.x"],
+            "map": {"sqlglot/p.py:7": [0], "sqlglot/p.py:-7": [1]}}
+    (tmp_path / "it.json.gz").write_bytes(gzip.compress(json.dumps(body).encode()))
+    m = ImportTimeMap(tmp_path / "it.json.gz")
+    assert m.modules("sqlglot/p.py", 8, 7) == set()  # the lambda's line skipped
+    assert m.modules("sqlglot/p.py", 8, 7, 7) == {"sqlglot.x"}  # ... but its call is seen
+    assert m.modules("sqlglot/p.py", 7, 7) == {"sqlglot"}
 
 
 def test_test_helper_signature_change_selects_importers(selector):

@@ -7,7 +7,7 @@
  },
  "tests_traced": 1620,
  "granularity": "one interpreter per test",
- "import_time": "import_time.json.gz: mapbuild/import_time.py, one fresh interpreter per module under sqlglot/ and tests/, same image; its 'tests' array lists module roots, not tests",
+ "import_time": "import_time.json.gz: mapbuild/import_time.py, one fresh interpreter per module under sqlglot/ and tests/, same image; its 'tests' array lists module roots, not tests; keys '<path>:-<line>' (moon-18) = a code object starting on that line was called (PY_START), merged into the LINE keys of the original build unchanged",
  "build_command": "mapbuild/build.sh",
  "built_at": "2026-11-21T07:15:00Z",
  "trace_wall_seconds": 85,
@@ -19,7 +19,7 @@
   "classes.json.gz": 1224,
   "reads.json.gz": 65,
   "test_imports.json.gz": 61,
-  "import_time.json.gz": 27788,
+  "import_time.json.gz": 29759,
   "classes_run.json.gz": 1224
  },
  "bytes": {
@@ -29,7 +29,7 @@
   "classes.json.gz": 64154,
   "reads.json.gz": 17856,
   "test_imports.json.gz": 17999,
-  "import_time.json.gz": 89455,
+  "import_time.json.gz": 96688,
   "classes_run.json.gz": 67657
  },
  "json_sha256": {
@@ -39,7 +39,7 @@
   "classes.json.gz": "582f2739689d643eec867719478fc4823f9a3489ee04d7c82109f2cd85451c1d",
   "reads.json.gz": "ec9bac97b1345881da4247eecf485f6bbe6b312d5b8996d62e9d4c1e5b90e262",
   "test_imports.json.gz": "60c49d6b4c070cda176471547825565befb8d1970e0db0125da2a81a0c5515a2",
-  "import_time.json.gz": "4c208c9b19b0b50ea325b31036563652cd471bfcd44969ee7091d849cd9e1ed0",
+  "import_time.json.gz": "d761dad55eae1934423e30cf4aaad6deb759841f5dd2c42051c8204e8214864f",
   "classes_run.json.gz": "ddf32f27db2af5fbc5763cafab12ac4bc8cfd49a7a07f5b05d2119120da09cb6"
  },
  "imports": {
