@@ -76,6 +76,11 @@ class BodyChange:
     names: dict[str, bool] = field(default_factory=dict)  # changed name → copies may be followed
     lambda_spans: list[tuple[int, int]] = field(default_factory=list)  # old-file line spans
     new_names: set[str] = field(default_factory=set)  # names added or removed (dir() sees them)
+    # a changed statement builds a set: its iteration order can follow the literal's order,
+    # which the state snapshot (sets digested sorted) does not see
+    sets: bool = False
+    # name → what an in-place edit provably keeps of the value ("truth", "keys"; Site.use)
+    same: dict[str, frozenset[str]] = field(default_factory=dict)
 
 
 def _key(stmt: ast.stmt) -> str:
@@ -100,6 +105,9 @@ def body_change(old_body: list[ast.stmt], new_body: list[ast.stmt],
     removed = _unmatched(old_body, old_keys, new_keys)
     added = _unmatched(new_body, new_keys, old_keys)
     out = BodyChange()
+    out.sets = any(isinstance(n, (ast.Set, ast.SetComp)) or (
+        isinstance(n, ast.Call) and _last_name(n.func) in ("set", "frozenset"))
+        for stmt in removed + added for n in ast.walk(stmt))
     known = _KnownNames(old_tree)
     old_by_target: dict[tuple[str, ...], ast.stmt] = {}
     for stmt in removed:
@@ -137,11 +145,52 @@ def body_change(old_body: list[ast.stmt], new_body: list[ast.stmt],
             same_kind = _kind(old.value) == _kind(stmt.value)
             for name in names:
                 out.names[name] = out.names.get(name, True) and same_kind
+            if len(names) == 1:
+                kept = _kept(old.value, stmt.value)
+                if kept:
+                    out.same[names[0]] = kept
     for names in old_by_target:  # removed assignments: readers now see the inherited value
         for n in names:
             out.names[n] = False
             out.new_names.add(n)
     return out
+
+
+def _shape(node: ast.AST) -> tuple[bool | None, frozenset | None]:
+    """(truth, set of keys / elements) of a literal display, statically; None: unknown."""
+    if isinstance(node, ast.Constant):
+        try:
+            return bool(node.value), None
+        except Exception:  # noqa: BLE001
+            return None, None
+    if isinstance(node, ast.Dict):
+        items = node.keys
+    elif isinstance(node, (ast.Set, ast.List, ast.Tuple)):
+        items = node.elts
+    else:
+        return None, None
+    if any(k is None or isinstance(k, ast.Starred) for k in items):
+        return None, None  # ** / * unpacking: size and members unknown
+    truth = bool(items)
+    if not all(isinstance(k, ast.Constant) for k in items):
+        return truth, None
+    try:
+        return truth, frozenset((type(k.value), k.value) for k in items)
+    except TypeError:
+        return truth, None
+
+
+def _kept(old: ast.AST, new: ast.AST) -> frozenset[str]:
+    """What reads of truth / membership see unchanged between two literal values."""
+    if type(old) is not type(new):
+        return frozenset()
+    (t0, k0), (t1, k1) = _shape(old), _shape(new)
+    kept = set()
+    if t0 is not None and t0 == t1:
+        kept.add("truth")
+    if k0 is not None and k0 == k1:
+        kept.add("keys")
+    return frozenset(kept)
 
 
 def _unmatched(body: list[ast.stmt], keys: list[str], other_keys: list[str]) -> list[ast.stmt]:
@@ -297,6 +346,12 @@ class Site:
     #   ("attr", path, chain, attr)      `Cls(..., kw=x.NAME)`, whose __init__ only does
     #                                    `self.attr = kw`: the readers of `attr`
     flow: tuple | None = None
+    # How a run-time `x.NAME` read uses the value, when that is all it can observe:
+    #   "truth"  only its truth (`if x.NAME:`, `not`, `bool()`, an and / or operand in such a
+    #            test)
+    #   "keys"   only membership (`k in x.NAME`)
+    #   ""       anything else (the value itself)
+    use: str = ""
 
 
 @dataclass
@@ -587,6 +642,10 @@ class Index:
                         flow = self._flow(path, node, ctx.func, stmt)
                         if flow is not None:
                             site = dataclasses.replace(site, flow=flow)
+                    if kind == "attr" and site.when == "run" and not site.dynamic:
+                        use = _use(node, self._parents(path))
+                        if use:
+                            site = dataclasses.replace(site, use=use)
                     occ.setdefault(key, []).append((path, kind, ctx.kind, ctx.chain, site))
             for ref, holder, _ in facts["class_refs"]:
                 class_refs.setdefault(ref, set()).add(holder)
@@ -708,6 +767,7 @@ class Index:
         if stores != 1 or not loads:
             return None
         spans = []
+        uses: dict[tuple[int, int], set[str]] = {}
         for n in loads:
             first, last = n.lineno, n.end_lineno or n.lineno
             up = parents.get(id(n))
@@ -718,7 +778,11 @@ class Index:
                 head_end = body[0].lineno - 1 if isinstance(body, list) and body else up.end_lineno
                 first, last = min(first, up.lineno), max(last, up.lineno, head_end or up.lineno)
             spans.append((first, last))
-        return ("local", tuple(sorted(set(spans))))
+            uses.setdefault((first, last), set()).add(_use(n, parents))
+        spans = sorted(set(spans))
+        # per span, how its loads use the value ("" if any load uses it otherwise)
+        return ("local", tuple(spans),
+                tuple(next(iter(uses[sp])) if len(uses[sp]) == 1 else "" for sp in spans))
 
     def _init_flow(self, call: ast.Call, kw: str | None, pos: int | None) -> tuple | None:
         """`Cls(..., kw=<read>)` (or positional) where `Cls` is one repo class whose own
@@ -768,6 +832,8 @@ class Index:
         """Reads whose attribute name is computed: getattr(x, v), vars(x), dir(x), x.__dict__."""
         if self._dynamic is None:
             self._dynamic = []
+            modules = {p[:-3].replace("/", ".").removesuffix(".__init__")
+                       for p in self.sources if p.endswith(".py")}
             for path, text in self.sources.items():
                 if not re.search(r"getattr|hasattr|setattr|delattr|vars\(|dir\(|__dict__|getmembers",
                                  text):
@@ -776,7 +842,6 @@ class Index:
                 for p in ast.walk(self.tree(path)):
                     for c in ast.iter_child_nodes(p):
                         parents[id(c)] = p
-                modules = self._module_aliases(path)
                 for node, ctx, stmt in self.walk(path):
                     found = _dynamic(node, parents)
                     if found is None:
@@ -792,47 +857,10 @@ class Index:
                     site = dataclasses.replace(self._site(path, node, ctx, stmt), dynamic=True,
                                                lookup=lookup)
                     self._dynamic.append((path, node, site, allowed,
-                                          kind == "names", _on_module(node, ctx.func, modules)))
+                                          kind == "names",
+                                          _on_module(node, ctx.func, self.tree(path), modules)))
         return self._dynamic
 
-    def _module_aliases(self, path: str) -> dict[str, str]:
-        """Names a file's top-level imports bind to repo modules (`exp` → sqlglot.expressions)."""
-        known = {q[:-3].replace("/", ".").removesuffix(".__init__") for q in self.sources}
-        out: dict[str, str] = {}
-        for stmt in self.tree(path).body:
-            if isinstance(stmt, ast.Import):
-                for a in stmt.names:
-                    if a.asname and a.name in known:
-                        out[a.asname] = a.name
-                    elif not a.asname and a.name.split(".")[0] in known:
-                        out[a.name.split(".")[0]] = a.name.split(".")[0]
-            elif isinstance(stmt, ast.ImportFrom) and stmt.module and not stmt.level:
-                for a in stmt.names:
-                    if f"{stmt.module}.{a.name}" in known:
-                        out[a.asname or a.name] = f"{stmt.module}.{a.name}"
-        # a name bound anywhere else in the file (a later import, an assignment, a parameter,
-        # a local in some def) may not be the module where it is read
-        top = {id(s) for s in self.tree(path).body if isinstance(s, (ast.Import, ast.ImportFrom))}
-        counts: dict[str, int] = {}
-        for n in ast.walk(self.tree(path)):
-            if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load):
-                out.pop(n.id, None)
-            elif isinstance(n, ast.arg):
-                out.pop(n.arg, None)
-            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                out.pop(n.name, None)
-            elif isinstance(n, (ast.Global, ast.Nonlocal)):
-                for name in n.names:
-                    out.pop(name, None)
-            elif isinstance(n, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and n.name:
-                out.pop(n.name, None)
-            elif isinstance(n, (ast.Import, ast.ImportFrom)):
-                for a in n.names:
-                    bound = a.asname or a.name.split(".")[0]
-                    counts[bound] = counts.get(bound, 0) + 1
-                    if id(n) not in top:
-                        out.pop(bound, None)
-        return {k: v for k, v in out.items() if counts.get(k) == 1}
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────────────────
@@ -874,51 +902,161 @@ def _dotted(node: ast.AST) -> str:
     return ".".join(reversed(parts))
 
 
-def _on_module(node: ast.AST, func: ast.AST | None,
-               modules: dict[str, str] | None = None) -> re.Pattern | None:
+def _on_module(node: ast.AST, func: ast.AST | None, tree: ast.Module | None = None,
+               modules: set[str] | frozenset[str] = frozenset()) -> re.Pattern | None:
     """When the dynamic access is applied to a module object, a pattern for the module names
-    it can be; else None. A module object: `import_module(<name>)` / `__import__(<name>)`,
-    a top-level import alias of a repo module (`modules`), or a local of the function that
-    only `name = <one of those>` statements bind."""
+    it can be; else None. The receiver is a module when it is `import_module(<name>)` /
+    `__import__(<name>, ...)`, a module-level import alias of a repo module (`exp` after
+    `from sqlglot import expressions as exp`), or a local of the enclosing def whose every
+    binding is a plain assignment of one of those (`m = __import__(p) if ... else exp`)."""
     if not (isinstance(node, ast.Call) and node.args):
         return None
     receiver = node.args[0]
-    sources = [receiver]
-    if (isinstance(receiver, ast.Name) and receiver.id not in (modules or {})
+    aliases = _module_aliases(tree, modules) if tree is not None else {}
+    if (isinstance(receiver, ast.Name) and receiver.id not in aliases
             and isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef))):
-        own = list(_own_nodes(func))
-        sources = [s.value for s in own if isinstance(s, ast.Assign)
-                   and any(isinstance(t, ast.Name) and t.id == receiver.id for t in s.targets)]
-        bare = {id(s.target) for s in own if isinstance(s, ast.AnnAssign) and s.value is None}
-        stores = [n for n in own if isinstance(n, ast.Name) and n.id == receiver.id
-                  and not isinstance(n.ctx, ast.Load) and id(n) not in bare]
-        params = {a.arg for a in func.args.posonlyargs + func.args.args + func.args.kwonlyargs}
-        if (not sources or len(stores) != len(sources) or receiver.id in params
-                or any(isinstance(n, (ast.Global, ast.Nonlocal)) and receiver.id in n.names
-                       for n in own)
-                or any(isinstance(s, ast.Assign) and (len(s.targets) != 1
-                                                      or not isinstance(s.targets[0], ast.Name))
-                       and any(isinstance(t, ast.Name) and t.id == receiver.id
-                               for tgt in s.targets for t in ast.walk(tgt))
-                       for s in own)):
+        sources = _local_values(func, receiver.id)
+        if not sources:
             return None
+    else:
+        sources = [receiver]
     parts = []
-    for source in sources:
-        if isinstance(source, ast.Name) and source.id in (modules or {}):
-            parts.append(".*")  # a module also holds what it imports: any module's names
-            continue
-        if not (isinstance(source, ast.Call)
-                and _last_name(source.func) in ("import_module", "__import__")):
+    for value in sources:
+        part = _module_value(value, aliases)
+        if part is None:
             return None
-        arg = source.args[0] if source.args else None
-        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-            parts.append(re.escape(arg.value))
-        elif isinstance(arg, ast.JoinedStr):
-            parts.append("".join(re.escape(v.value) if isinstance(v, ast.Constant) else ".*"
-                                 for v in arg.values))
-        else:
-            parts.append(".*")
-    return re.compile("|".join(f"(?:{p})" for p in parts), re.S)
+        parts.append(part)
+    return re.compile("|".join(f"(?:{p})" for p in sorted(set(parts))), re.S)
+
+
+def _use(node: ast.AST, parents: dict[int, ast.AST]) -> str:
+    """How the expression `node` is used, when only part of its value matters ("truth",
+    "keys"; see Site.use), else ""."""
+    parent = parents.get(id(node))
+    if (isinstance(parent, ast.Compare) and len(parent.ops) == 1
+            and isinstance(parent.ops[0], (ast.In, ast.NotIn)) and parent.comparators[0] is node):
+        return "keys"
+    return "truth" if _truth_only(node, parents) else ""
+
+
+def _truth_only(node: ast.AST, parents: dict[int, ast.AST]) -> bool:
+    """`node` is evaluated only for its truth: an if / while / ternary / assert test, a
+    comprehension filter, the operand of `not` or of `bool(...)`, or an and / or operand of
+    an expression that is itself used only for its truth (`x and y` alone returns y)."""
+    parent = parents.get(id(node))
+    if isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)):
+        return parent.test is node
+    if isinstance(parent, ast.comprehension):
+        return any(c is node for c in parent.ifs)
+    if isinstance(parent, ast.UnaryOp):
+        return isinstance(parent.op, ast.Not)
+    if isinstance(parent, ast.Call):
+        return (isinstance(parent.func, ast.Name) and parent.func.id == "bool"
+                and len(parent.args) == 1 and parent.args[0] is node and not parent.keywords)
+    if isinstance(parent, ast.BoolOp):
+        return _truth_only(parent, parents)
+    return False
+
+
+def _module_value(value: ast.AST, aliases: dict[str, str]) -> str | None:
+    """A regex for the module names `value` can evaluate to, or None (maybe not a module)."""
+    if isinstance(value, ast.Name):
+        # a module also holds the names it imports (`getattr(exp, "Concat")` reads a class
+        # defined in sqlglot.expressions.string): any module's globals (r9)
+        return ".*" if value.id in aliases else None
+    if not (isinstance(value, ast.Call) and isinstance(value.func, (ast.Name, ast.Attribute))):
+        return None
+    callee = _last_name(value.func)
+    if callee not in ("import_module", "__import__"):
+        return None
+    if callee == "__import__":
+        # `__import__("a.b")` returns the top package "a" unless fromlist is non-empty;
+        # only the fromlist form is the named module itself
+        fromlist = next((k.value for k in value.keywords if k.arg == "fromlist"),
+                        value.args[3] if len(value.args) > 3 else None)
+        if not (isinstance(fromlist, (ast.List, ast.Tuple)) and fromlist.elts):
+            return ".*"
+    arg = value.args[0] if value.args else None
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return re.escape(arg.value)
+    if isinstance(arg, ast.JoinedStr):
+        return "".join(re.escape(v.value) if isinstance(v, ast.Constant) else ".*"
+                       for v in arg.values)
+    return ".*"
+
+
+def _local_values(func: ast.AST, var: str) -> list[ast.AST] | None:
+    """The values a local of `func` is bound to, when every binding is a plain single-target
+    assignment in `func`'s own code (not a parameter, global / nonlocal, loop, with, walrus,
+    import, del, except or match target, nor rebound by a nested scope)."""
+    args = func.args
+    if var in {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs} | {
+            a.arg for a in (args.vararg, args.kwarg) if a}:
+        return None
+    values, stores = [], 0
+    own = {id(n) for n in _own_nodes(func)}
+    # `var: T` alone only annotates: it binds nothing
+    declared = {id(n.target) for n in ast.walk(func)
+                if isinstance(n, ast.AnnAssign) and n.value is None}
+    for n in ast.walk(func):
+        if id(n) in declared:
+            continue
+        if isinstance(n, (ast.Global, ast.Nonlocal)) and var in n.names:
+            return None
+        if isinstance(n, ast.Name) and n.id == var and not isinstance(n.ctx, ast.Load):
+            stores += 1
+            if id(n) not in own:
+                return None
+        elif isinstance(n, ast.ExceptHandler) and n.name == var:
+            return None
+        elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name == var:
+            return None
+        elif isinstance(n, ast.alias) and (n.asname or n.name).split(".")[0] == var:
+            return None
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == var:
+            return None
+        if id(n) in own and isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(
+                n.targets[0], ast.Name) and n.targets[0].id == var:
+            values.append(n.value)
+        elif id(n) in own and isinstance(n, ast.AnnAssign) and isinstance(
+                n.target, ast.Name) and n.target.id == var and n.value is not None:
+            values.append(n.value)
+    if stores != len(values):
+        return None  # some binding is not a plain assignment
+    return values
+
+
+def _module_aliases(tree: ast.Module, modules: set[str] | frozenset[str]) -> dict[str, str]:
+    """Top-level names bound once, by an import statement, to a module in `modules`."""
+    found: dict[str, str] = {}
+    for st in tree.body:
+        if isinstance(st, ast.Import):
+            for a in st.names:
+                if a.asname:
+                    found[a.asname] = a.name
+        elif isinstance(st, ast.ImportFrom) and st.level == 0 and st.module:
+            for a in st.names:
+                found[a.asname or a.name] = f"{st.module}.{a.name}"
+    found = {k: v for k, v in found.items() if v in modules}
+    if not found:
+        return found
+    bound: Counter = Counter()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load):
+            bound[n.id] += 1
+        elif isinstance(n, ast.alias):
+            bound[(n.asname or n.name).split(".")[0]] += 1
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound[n.name] += 1
+        elif isinstance(n, ast.arg):  # a parameter of that name shadows it (r9)
+            bound[n.arg] += 2
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            bound.update({x: 2 for x in n.names})
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            bound[n.name] += 1
+        elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name:
+            bound[n.name] += 1
+    return {k: v for k, v in found.items() if bound[k] == 1}
 
 
 def _defs(tree: ast.Module):
