@@ -49,6 +49,10 @@ def main() -> None:
             # Nearly the price of ALL: take ALL, which cannot miss.
             numbers, workers = everything, all_workers
             reason = f"ALL (selection ~ALL cost) {reason}"
+        if os.environ.get("BR_DIAG_DROP_SLOW"):
+            # DIAGNOSTIC ONLY (practice board experiment): drop tests >= 3 s to measure their share.
+            numbers = {n for n in numbers if ms_of[n] < 3000}
+            workers = pack.pack(numbers, ms_of)
         cost = pack.cost_ms(workers, ms_of) / 1000
         print(f"[{commit}] {len(numbers)} tests, {len(workers)} workers, {cost:.1f}s :: {reason}",
               file=sys.stderr)

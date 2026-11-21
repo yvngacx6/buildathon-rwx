@@ -30,4 +30,5 @@ RUN python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig
  && python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl \
  && chmod -R a+rX /app /opt/sqlglot
 # -S: no site module (the selector needs only the standard library).
+ENV BR_DIAG_DROP_SLOW=1
 CMD ["python", "-S", "-m", "selector"]
