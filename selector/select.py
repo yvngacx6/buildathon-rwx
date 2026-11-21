@@ -560,10 +560,15 @@ class Selector:
         if not users:
             if r.kind == "module" or not r.classes:
                 got |= self._importer_users(path, old_tree, new_tree)
-            else:
+            elif r.kind != "function":
                 # A class the classes map does not record (enums, namespaces): other modules
                 # read it through the class object (`ErrorLevel.RAISE`, `DType.BPCHAR.value`)
                 # without running a line of this file or making one.
+                # Not for a method body (an unrun def): it changes only what a call computes,
+                # and a call runs the def's own lines (coverage) or happens at import
+                # (_function_at_import), whoever names the class. Matching by bare name would
+                # also pull in every unrelated class of that name (executor `Table` → every
+                # test naming exp.Table: ~ALL).
                 got |= self._mention_runners({name for chain in r.classes for name in chain})
             users = self.maps.module_users(module, classify.top_level_classes(old_tree))
         got |= users
