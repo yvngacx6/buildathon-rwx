@@ -9,8 +9,9 @@ demand: main flips it in 2/2 runs at a 0.05-CPU quota, and `moon-17` flips it in
 order and digests gave identical decisions in every run. Fixed on `moon-17`: wall clocks no
 longer decide anything. Each child is capped by its own CPU (ITIMER_PROF / RLIMIT_CPU), and the
 wall timeout only catches a child that blocks. A capped child that overruns still keeps
-everything. **Seconds impact: 0 on a quiet machine (same output, same CPU). On a stalled host
-each fixed flip is worth +5 s (op07 +5.2 s, ktz3 +4.9 s).** On the final (5 reruns on an idle
+everything. **Seconds impact: 0 on a quiet machine (same output, same CPU). Under throttling or a stall,
+each fixed flip is worth 5–18 s (op07 5.2 s, ktz3 4.9 s, tggb 18.3 s). On EC2, base flipped
+tggb in 2/2 throttled practice_like runs; fix flipped nothing in 0 of 28 runs.** On the final (5 reruns on an idle
 machine, median taken) the expected gain is small, but nothing timing-based is left to decide
 an outcome except at pathological margins.
 
@@ -98,17 +99,26 @@ wall time stretches 3–5×.
 |---|---|---|---|---|
 | sample | 5 | 5 (+4 with the blob retry) | **1 distinct** across all of them | 115.1 every run |
 | private41 | 5 | 5 | **1 distinct** | 388.9 every run |
-| adversarial2 | 5 | 5 | ADV | |
-| practice_like | 5 | 5 | PRAC | |
+| adversarial2 | 5 | 5 (+3 retry) | **1 distinct** | 937.4 every run |
+| practice_like | 5: **tggb flips in both throttled runs (2 and 4)** | 5 (+3 retry): 0 flips | base 2 distinct, fix 1 | base 989.6 / **1007.9** / 989.6 / **1007.9** / 989.6; fix 989.6 every run |
 | op07 alone, `--cpus 0.1` | 3 | 3 | same (child needs 0.85 s of CPU, ≈8.5 s wall, under the 9.4 s guard) | |
 | op07 alone, `--cpus 0.05` | **2/2 flip**: `no answer`, 127 tests, 7.6 s | **0/2 flip**: dropped 123, 2.4 s | | |
 
+* **tggb (practice_like) is a third wall-clock flip, and it happens at ordinary throttling.**
+  subtest verifies 6 TPC queries, 3.7 s of child CPU against cap 6.0 s. Base's wall deadline
+  is 2·6+2 = 14 s. With the container's CPU shared by 6 busy loops, the child had used 3.2–3.7 s
+  of CPU when it was killed, which turned test_execute_tpcds back on: +18.3 s. The fix's guard
+  (54 s) let it finish in both throttled runs. That is −18.3 s per occurrence, and the 3.7 s of
+  CPU spent on a killed verification is no longer wasted.
+  It is also the **tightest CPU margin** we found (0.62 of the cap). It is self-consistent only
+  while the build machine, which measures `cpu_exec`, is as fast as the run machine.
 * In the real image, 66ks gives `dropped 46 (blobs 2531/2543)` in all 10 sample runs; the 12
   failing blobs also fail there. So 66ks is stable in the image too.
 * **CPU impact of the fix: none measurable.** Parent `cpu` on private41 is 3.45–3.75 s (base)
   against 3.46–3.75 s (fix); total container user time is 12.45–12.59 s against 12.38–12.68 s
   on idle runs. `late` = 0 and `retry` = 0 on every commit.
-* **Seconds impact: 0 s on every labeled set when the host is quiet.** On a starved host each
+* **Seconds impact: 0 s on every labeled set when the host is quiet** (all idle runs are
+  identical between base and fix). On a starved host each
   avoided flip saves ≈5 s (op07 +5.2 s, ktz3 +4.9 s), plus the 300 s risk of a run that
   overruns (now bounded by the global budget).
 
