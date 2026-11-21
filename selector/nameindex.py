@@ -19,7 +19,6 @@ import sys
 import zlib
 from pathlib import Path
 
-from . import state
 from .names import HARMLESS_BASES, Fallback, Index, Site
 
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "index" / "names.pkl"
@@ -243,6 +242,8 @@ def main(argv: list[str]) -> None:
     out.write_bytes(pickle.dumps(data, pickle.HIGHEST_PROTOCOL))
     print(f"name index: {len(data['occ'])} names, {out.stat().st_size // 1024} KiB -> {out}")
     # The old-source import-state snapshot (selector/state.py) lives next to it.
+    from . import state
+
     snap = out.with_name("state.pkl")
     if state.build(sqlglot.resolve(), snap.resolve()):
         print(f"state snapshot: {snap.stat().st_size // 1024} KiB -> {snap}")

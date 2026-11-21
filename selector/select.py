@@ -67,7 +67,8 @@ import os
 import re
 from pathlib import Path, PurePosixPath
 
-from . import classify, diff, nameindex, names, pack, state
+from . import classify, diff, nameindex, names, pack
+from . import maps as maps_module
 from .maps import ImportTimeMap, Maps
 
 # Class and module bodies of these files shape nearly every test (map gives ~1550 of 1620).
@@ -86,8 +87,9 @@ CONFIG_FILES = {"pyproject.toml", "setup.cfg"}
 ALWAYS_ALL = {"pytest.ini", "tox.ini", "conftest.py", "setup.py"}
 ALL_FRACTION = 0.85  # selection cost ≥ this × ALL cost → just run ALL
 SLOW_SECONDS = 5.0  # tests at least this slow get the statement-level rule in function bodies
-# An import-state diff costs ~1.2 s of container CPU (EC2, pinned image). Run it only when the
-# wide set costs at least this much more than the cheapest selection it could give.
+# An import-state diff cost ~1.2 s of container CPU when this gate was set (now ~0.8 s on a
+# loaded EC2 box, r3-cpu). Run it only when the wide set costs at least this much more than
+# the cheapest selection it could give.
 STATE_MIN_GAIN = 2.0
 # Class hierarchies the classes map records (maps/MANIFEST.json notes): a test that made an
 # instance of one of these classes (or used it as a dialect) is credited to it and its bases.
@@ -108,7 +110,8 @@ class Selector:
     def __init__(self, tests: list[dict], sqlglot: Path, maps: Path) -> None:
         self.tests = tests
         self.sqlglot = sqlglot
-        self.maps = Maps(maps, tests)
+        compiled = Path(os.environ.get("BR_MAPS_COMPILED", maps_module.COMPILED))
+        self.maps = Maps(maps, tests, compiled)
         self._all = {t["number"] for t in tests}
         self._by_file: dict[str, set[int]] = {}
         self._id_of: dict[int, str] = {}
@@ -120,6 +123,10 @@ class Selector:
         self._slow = {n for n, s in self._secs.items() if s >= SLOW_SECONDS}
         self._untraced: set[int] | None = None
         self._sources: dict[str, str] | None = None
+        self._some_sources: dict[str, str | None] = {}  # `_source` before `_all_sources`
+        self._classes_of: dict[str, list[str]] = {}
+        self._old_trees: dict[str, tuple[ast.Module, list[str] | None]] = {}
+        self._scopes: dict[str, classify.Scopes] = {}
         self._name_index: nameindex.NameIndex | None = None
         self._files: list[diff.FilePatch] = []  # the current commit's files
         self._state: dict | None | bool = False  # its import-state diff (False: not yet run)
@@ -273,15 +280,15 @@ class Selector:
             new_text = diff.apply(old_text, fp)
         except (diff.PatchError, UnicodeDecodeError) as exc:
             raise AllTests(f"{path}: hunk does not apply ({type(exc).__name__})") from None
+        same = classify.SameAst(old_text, new_text)
         try:
-            old_tree = ast.parse(old_bytes)
+            old_tree = self._old_tree(path, old_bytes)
             new_tree = ast.parse(new_text.encode("utf-8"))
-            compile(new_tree, path, "exec")
+            _check_compiles(path, old_tree, new_tree, same)
         except (SyntaxError, ValueError) as exc:  # the module no longer imports
             raise AllTests(f"{path}: {type(exc).__name__}") from None
-        classify.strip_docstrings(old_tree)
         classify.strip_docstrings(new_tree)
-        if ast.dump(old_tree) == ast.dump(new_tree):
+        if same(old_tree, new_tree):
             return set(), "same syntax tree (ignoring comments and docstrings)"
         lost = _bindings(old_tree) - _bindings(new_tree)
         if lost:
@@ -289,7 +296,8 @@ class Selector:
             # (ImportError at collection, AttributeError at call) – far beyond its own tests.
             raise AllTests(f"{path}: binding removed ({', '.join(sorted(lost)[:3])})")
         removed, added = diff.changed_lines(fp)
-        found = classify.regions(old_tree, new_tree, removed, added)
+        found = classify.regions(old_tree, new_tree, removed, added, same,
+                                 self._old_scopes(path))
         if not found:
             return set(), "no behaviour-changing region"
         if path.startswith("tests/"):
@@ -539,6 +547,8 @@ class Selector:
                     except diff.PatchError:
                         self._state = None
                         return None
+            from . import state  # imported on first use: few commits need it
+
             snapshot = Path(os.environ.get("BR_STATE", state.DEFAULT_PATH))
             self._state = state.diff(self.sqlglot, snapshot, patched)
         return self._state  # type: ignore[return-value]
@@ -743,7 +753,7 @@ class Selector:
         got: set[int] = set()
         if not names:
             return got
-        for s in classify.Scopes(old_tree).scopes:
+        for s in self._old_scopes(path).scopes:
             if s.kind != "def":
                 continue
             body = s.node.body
@@ -765,9 +775,11 @@ class Selector:
     def _import_dependents(self, path: str) -> set[int]:
         """Tests that fail if module `path` cannot be imported: dependents of every module
         whose import (per the import-time map) runs the module's top-level statements."""
-        tree = ast.parse(self._all_sources()[path])
+        source = self._source(path)
+        if source is None:
+            raise KeyError(path)
         got: set[int] = set()
-        for stmt in tree.body:
+        for stmt in ast.parse(source).body:
             modules = self.maps.import_time.modules(path, stmt.lineno, stmt.lineno)
             if any(m == "tests" or m.startswith("tests.") for m in modules):
                 # A test module fails to import: a collection error, which by default
@@ -785,9 +797,8 @@ class Selector:
             if path.startswith("tests/"):
                 hit = set(self._by_file.get(path, set())) | self.maps.test_imports.get(path)
             else:
-                source = self._all_sources().get(path)
-                classes = classify.top_level_classes(ast.parse(source)) if source else []
-                hit = set(self.maps.whole_file(path)) | self.maps.module_users(module, classes)
+                hit = set(self.maps.whole_file(path)) | self.maps.module_users(
+                    module, self._top_level_classes(path))
             self._dependents[module] = hit
         return hit
 
@@ -843,7 +854,7 @@ class Selector:
                 if breaks is not None and breaks.search(self._all_sources()[other]):
                     got |= self._import_dependents(other)
                 users = self.maps.whole_file(other) | self.maps.module_users(
-                    _module_of(other), classify.top_level_classes(ast.parse(self._all_sources()[other])))
+                    _module_of(other), self._top_level_classes(other))
                 if not users:
                     raise AllTests(f"{path}: names imported by {other}, which has no known users")
                 got |= users
@@ -854,12 +865,16 @@ class Selector:
         """Files that import module `path` and mention one of `names`."""
         module = _module_of(path)
         parent, _, leaf = module.rpartition(".")
-        refers = re.compile(rf"\b{re.escape(module)}\b|from\s+{re.escape(parent)}\s+import\b[^\n]*\b{leaf}\b"
-                            rf"|from\s+\.+{leaf}\s+import")
+        # `module`, `from parent import … leaf`, `from .leaf import`; each one only searched
+        # for in texts that contain its literal part (a regex scan of every file is slow)
+        refers = [(module, re.compile(rf"\b{re.escape(module)}\b")),
+                  (parent, re.compile(rf"from\s+{re.escape(parent)}\s+import\b[^\n]*\b{leaf}\b")),
+                  (f".{leaf}", re.compile(rf"from\s+\.+{leaf}\s+import"))]
         mentions = re.compile(r"\b(" + "|".join(map(re.escape, sorted(names))) + r")\b") if names else None
         out = []
         for other, text in self._all_sources().items():
-            if other == path or not refers.search(text):
+            if other == path or not any(part in text and pattern.search(text)
+                                        for part, pattern in refers):
                 continue
             if f"{module} import *" in text or f".{leaf} import *" in text:
                 raise AllTests(f"{path}: star-imported by {other}")
@@ -868,6 +883,40 @@ class Selector:
         return out
 
     # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _source(self, path: str) -> str | None:
+        """`self._all_sources().get(path)`, reading only that file."""
+        if self._sources is not None:
+            return self._sources.get(path)
+        if path not in self._some_sources:
+            file = self.sqlglot / path
+            self._some_sources[path] = (file.read_text(errors="replace")
+                                        if path.startswith(("sqlglot/", "tests/"))
+                                        and path.endswith(".py") and file.is_file() else None)
+        return self._some_sources[path]
+
+    def _top_level_classes(self, path: str) -> list[str]:
+        """Top-level classes of a pinned source file (none if it is not one)."""
+        if path not in self._classes_of:
+            source = self._source(path)
+            self._classes_of[path] = (classify.top_level_classes(ast.parse(source))
+                                      if source else [])
+        return self._classes_of[path]
+
+    def _old_tree(self, path: str, old_bytes: bytes) -> ast.Module:
+        """The pinned file's syntax tree, docstrings stripped (parsed once per run: nothing
+        changes the trees after `strip_docstrings`)."""
+        if path not in self._old_trees:
+            tree = classify.strip_docstrings(ast.parse(old_bytes))
+            lines = None if b"\r" in old_bytes else old_bytes.decode("utf-8").split("\n")
+            self._old_trees[path] = tree, lines
+        return self._old_trees[path][0]
+
+    def _old_scopes(self, path: str) -> classify.Scopes:
+        """`Scopes` of a file `_old_tree` parsed (built once per run)."""
+        if path not in self._scopes:
+            self._scopes[path] = classify.Scopes(*self._old_trees[path])
+        return self._scopes[path]
 
     def _all_sources(self) -> dict[str, str]:
         if self._sources is None:
@@ -881,6 +930,66 @@ class Selector:
     def _old_text(self, path: str) -> str:
         source = self.sqlglot / path
         return source.read_text() if source.is_file() else ""
+
+
+def _check_compiles(path: str, old_tree: ast.Module, new_tree: ast.Module,
+                    same: classify.SameAst) -> None:
+    """Raise what `compile(new_tree, path, "exec")` raises, without compiling again the
+    top-level statements whose text is the old file's (the old file compiles).
+
+    A compile error stays inside one top-level statement but for two module-wide rules:
+    `from __future__` imports must lead the file (and change how the rest compiles), and
+    module-level `global` / `nonlocal`. So when the leading docstring and future imports
+    are the old ones, no other future import exists, and the module scope has no global /
+    nonlocal, only the leading statements and the new top-level statements are compiled.
+    Otherwise (or without both texts, see SameAst) the whole module is."""
+    lead = _leading_futures(new_tree.body)
+    if same.old is not None and _same_lead(old_tree, new_tree, lead, same):
+        old = {classify.text_key(s, same.old) for s in old_tree.body}
+        new = [s for s in new_tree.body[lead:] if classify.text_key(s, same.new) not in old]
+        new_tree = ast.Module(body=new_tree.body[:lead] + new, type_ignores=new_tree.type_ignores)
+    compile(new_tree, path, "exec")
+
+
+def _same_lead(old_tree: ast.Module, new_tree: ast.Module, lead: int,
+               same: classify.SameAst) -> bool:
+    """The first `lead` statements (docstring, future imports) have the old text, the old
+    file has no more future imports, and the new module scope has no other future import
+    and no global / nonlocal."""
+    scope = list(_module_scope(new_tree.body))
+    return (sum(map(_is_future, scope)) == lead - _has_docstring(new_tree.body)
+            and not any(isinstance(s, (ast.Global, ast.Nonlocal)) for s in scope)
+            and len(old_tree.body) >= lead
+            and not (len(old_tree.body) > lead and _is_future(old_tree.body[lead]))
+            and [classify.text_key(s, same.old) for s in old_tree.body[:lead]]
+            == [classify.text_key(s, same.new) for s in new_tree.body[:lead]])
+
+
+def _module_scope(body: list[ast.stmt]):
+    """Statements that run in the module's own scope (not inside a def or class body)."""
+    for stmt in body:
+        yield stmt
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for name in classify.NESTED_STMTS:
+            for child in getattr(stmt, name, None) or ():
+                yield from _module_scope([child] if isinstance(child, ast.stmt) else child.body)
+
+
+def _is_future(stmt: ast.stmt) -> bool:
+    return isinstance(stmt, ast.ImportFrom) and stmt.module == "__future__"
+
+
+def _has_docstring(body: list[ast.stmt]) -> bool:
+    return bool(body) and classify.is_docstring(body[0])
+
+
+def _leading_futures(body: list[ast.stmt]) -> int:
+    """Length of the leading docstring + `from __future__` imports."""
+    n = int(_has_docstring(body))
+    while n < len(body) and _is_future(body[n]):
+        n += 1
+    return n
 
 
 def _module_of(path: str) -> str:

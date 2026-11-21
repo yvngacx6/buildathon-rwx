@@ -8,6 +8,7 @@ Environment overrides (for local evaluation):
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
@@ -20,6 +21,9 @@ from .select import ALL_FRACTION, Selector
 
 def main() -> None:
     _hashseed_for_diffexec()
+    # A short run that builds large syntax trees: the cycle collector would rescan them over
+    # and over and find nothing (trees free by reference count). Off saves ~20 % of CPU.
+    gc.disable()
     started = time.process_time()
     data = Path(os.environ.get("BR_DATA", "/data"))
     sqlglot = Path(os.environ.get("BR_SQLGLOT", "/opt/sqlglot"))
@@ -40,10 +44,11 @@ def main() -> None:
             numbers, reason = selector.select(patch_file.read_text(errors="replace"))
         except Exception as exc:  # never crash: any surprise means run everything
             numbers, reason = selector.all_numbers(), f"ALL (error: {type(exc).__name__}: {exc})"
-        workers = pack.pack(numbers, ms_of)
+        workers = all_workers if numbers == everything else pack.pack(numbers, ms_of)
         if numbers != everything and pack.cost_ms(workers, ms_of) >= ALL_FRACTION * all_cost:
             # Nearly the price of ALL: take ALL, which cannot miss.
-            numbers, workers, reason = everything, all_workers, f"ALL (selection ~ALL cost) {reason}"
+            numbers, workers = everything, all_workers
+            reason = f"ALL (selection ~ALL cost) {reason}"
         cost = pack.cost_ms(workers, ms_of) / 1000
         print(f"[{commit}] {len(numbers)} tests, {len(workers)} workers, {cost:.1f}s :: {reason}",
               file=sys.stderr)
@@ -64,7 +69,7 @@ def _hashseed_for_diffexec() -> None:
         return
     try:
         sys.stdout.flush()
-        os.execve(sys.executable, [sys.executable, "-m", "selector"],
+        os.execve(sys.executable, list(sys.orig_argv),  # keeps interpreter flags (-S)
                   dict(os.environ, PYTHONHASHSEED="0"))
     except OSError:
         pass  # replays fall back to a child process

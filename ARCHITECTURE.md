@@ -32,9 +32,9 @@ Every rule is about code structure; no rule names an edit kind as harmless or ma
 | `selector/classify.py` | Place each changed line in the old (removed) or new (added) syntax tree → regions. Drops regions whose scope's AST is unchanged (comments, docstrings). Metaclass methods and `__init_subclass__` count as class body. For an in-place function edit, also gives the old-file spans of the touched statements (`touched_statements`). |
 | `selector/select.py` | Region / file → test numbers (the PLAN §3 table). |
 | `selector/names.py` | I08: narrow class-attribute / module-constant edits to tests that ran a line reading the changed name. Static scan of the pinned source at run time; falls back on reads at import / class creation / in memoized code, dynamic attribute access that could name it, non-literal new values, and definition-time calls handed the class. |
-| `selector/state.py` | I22: what a patch changes in import-time state. Build: snapshot (digest of every module global and class attribute after importing all of sqlglot, 16 fresh imports to find order-only noise) next to the name index. Run: a subprocess imports the patched package and diffs; `select._by_state` selects run-time readers of each changed value (Site.flow follows locals / store-only constructor params) among tests that can hold the owner class. ≈1.2 s container CPU per diff, so only run when the wide set can shrink by ≥ 2 s. |
+| `selector/state.py` | I22: what a patch changes in import-time state. Build: snapshot (digest of every module global and class attribute after importing all of sqlglot, 16 fresh imports to find order-only noise) next to the name index. Run: a subprocess imports the patched package and diffs; `select._by_state` selects run-time readers of each changed value (Site.flow follows locals / store-only constructor params) among tests that can hold the owner class. ≈0.8 s container CPU per diff (r3-cpu; ≈1.2 s when the gate was set), so only run when the wide set can shrink by ≥ 2 s. |
 | `selector/nameindex.py` | Build-time step (`python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl`, in the Dockerfile) that stores the `names.py` scan as tables; run time loads it lazily (only class/module edits) and checks a source fingerprint, else builds in memory. For local eval run the same command with your `BR_SQLGLOT` and `index/names.pkl` (gitignored). |
-| `selector/maps.py` | Lazy gz map loading (maps/SCHEMA.md), id → number via the run's tests.json. |
+| `selector/maps.py` | Lazy map loading (maps/SCHEMA.md), id → number via the run's tests.json. Build step `python -m selector.maps build maps index/maps` (Dockerfile; for local eval run the same, `index/` is gitignored) compiles the .json.gz maps to marshal files, line-keyed maps split per source file, so a run reads only the shards a commit touches. Same keys and lists; missing or stale (CRC of the .json.gz) → reads the .json.gz. |
 | `selector/pack.py` | Choose worker count and split tests (scorer cost model). |
 | `mapbuild/import_time.py` | Build `maps/import_time.json.gz`: per line, the modules whose import runs it (fresh interpreter per module, sys.monitoring). |
 | `eval/adversarial.py` | Write the adversarial private patch set (import-time code, removed names, hunkless diffs, …). Patches and labels stay out of git. |
@@ -69,6 +69,17 @@ without ---/+++ (pure renames, empty files added / deleted) are kept as hunkless
 tests that no map knows join every non-empty selection. Without the imports map, every
 "import bound" above is ALL.
 
+Run-time CPU (r3-cpu; the scorer charges every CPU second of the container, the build is
+free). The image build does everything that depends only on the pinned source and the maps:
+bytecode for the standard library (the base image ships none), the selector and sqlglot;
+compiled map shards; the name index and state snapshot. At run time the work on a .py file
+follows the edit, not the file: statements whose source text is identical (same lines and
+columns, decorators included) count as equal without `ast.dump` (`classify.SameAst`), and
+only new top-level statements are recompiled (`select._check_compiles`, which falls back to
+the whole module when `__future__` imports or module-level `global` could matter); the scope
+walk skips expressions without a `lambda` line; each pinned file is parsed and scoped once
+per run. Cyclic GC is off in the selector (trees free by reference count). The state-diff
+subprocess is unchanged in what it computes (same digests; only fast paths for exact types).
 ## Differential execution (I12): `maps/diffexec.zip`
 
 For a commit whose `.py` edits are all inside function bodies, the tests the lines map selects
@@ -109,3 +120,4 @@ sha256 are in `maps/MANIFEST.json` → `"diffexec"`.
 | r2-slowtests | 2026-11-20 | Slow tests (≥ 5 s) in function bodies need a touched statement (private264: 3453.9 → 3269.2) | 185.0 |
 | r2-importclosure | 2026-11-20 | I22: import bound (traced per-test import closure) instead of ALL, run-time-only modules | 183.9 (private264 3263.9 → 2923.7) |
 | r2-classcreate | 2026-11-20 | I22: import-state diff follows class-creation consumers to derived values; readers among owner-class holders | 179.9 |
+| r3-cpu | 2026-11-21 | Run-time CPU only, identical output: stdlib/selector/sqlglot bytecode, compiled map shards, AST work proportional to the edit (text-identical statements skip dumps / recompiling), old files parsed once per run | 179.9 (container CPU 3.5 → 1.4 s, loaded EC2) |
