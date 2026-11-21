@@ -340,7 +340,7 @@ class Masked(Snapshot):
     which runs its lines (the lines map has the callers), or by introspection (checked by
     the selector). Per entry, `found`: (location, digest of the function – code always,
     defaults, closure cells, nested functions masked in turn –, digest of what signature
-    introspection sees: argument names and kinds, annotations); `spans`: location → last
+    introspection sees: name, docstring, argument names and kinds, annotations); `spans`: location → last
     line; `foreign`: a function from outside the package was reached."""
 
     def __init__(self, package: str, root: str) -> None:
@@ -369,7 +369,8 @@ class Masked(Snapshot):
         full = _h("fn", v.__qualname__, self._code(code), f(v.__defaults__),
                   f(v.__kwdefaults__), cells)
         nargs = code.co_argcount + code.co_kwonlyargcount
-        sig = _h(code.co_varnames[:nargs + 2], code.co_argcount, code.co_posonlyargcount,
+        sig = _h(v.__name__, v.__qualname__, f(v.__doc__),
+                 code.co_varnames[:nargs + 2], code.co_argcount, code.co_posonlyargcount,
                  code.co_kwonlyargcount, code.co_flags & 0x0C,
                  f(dict(getattr(v, "__annotations__", None) or {})))
         self.found.append((loc, full, sig))
