@@ -29,3 +29,21 @@ Status: DRAFT (results being filled in). Branch `moon-04`.
   alone 1,866 CPU-s (sum of worker `pickle_s`), 2.45 M calls recorded, 1.6 GB of recordings;
   wall 525 s, critical path = tests/test_executor.py and tests/test_optimizer.py, ~520 s each
   in ONE process.
+
+## Rules: (b) release asset on our repo, (c) our own PyPI package
+
+README "Rules": "Your build may download only from public package registries: PyPI, npm,
+Docker Hub, GitHub releases at a fixed tag, and sqlglot's own repository at the pinned commit.
+**Nothing from an address your team controls.** The final rebuilds every image after the
+cutoff, so anything else could change a submission after the deadline."
+
+- A release on `yvngacx6/buildathon-rwx` is an address our team controls. The fixed-tag
+  allowance is for third-party tools. Our own release assets can be deleted and re-uploaded
+  under the same tag after the cutoff, which is exactly what the rule exists to prevent.
+- A PyPI project we own is also an address we control: we can yank it, or upload a new
+  version or file name. The rule's second sentence names the intent, not the host.
+- Downside: disqualification, or a judge reading it as smuggling data past the 20 MB limit.
+  Upside: under 1 s on practice (below). **Verdict: do not use (b) or (c).**
+- (a)/(d) are clearly allowed. README: "It may clone sqlglot at the pinned commit, install it
+  and run its tests to make coverage or import maps." A diffexec store recorded in the build
+  is the same kind of artefact as the committed one, made from the pinned commit only.
