@@ -8,7 +8,7 @@
   - Almost all of it comes from TPC fixture edits, about 2% of commits, each worth −18 to −21 s.
   - Variance is high: a given 40-commit set holds 0, 1 or 2 such commits.
 - **Final:** about −12 s expected over ~60 commits.
-- **Misses:** 0 on every labeled fixture commit (73 across 6 sets) and on {PROBES} real mutation probes.
+- **Misses:** 0 on every labeled fixture commit (73 across 6 sets) and on 4 real mutation probes so far (32 more running on rwx-big).
 - **CPU:** ≈ 5 ms per fixture commit on the laptop. A parse check, when needed, adds ≈ 0.3 s.
 - **Effort:** about 1.5 h to port into `selector/select.py::_select_file`. The prototype is in `research/moonshots/14-fixtures/`.
 
@@ -132,7 +132,22 @@ Per commit on the TPC commits (old → new, oracle):
 
 `probe.py` edits the fixture, predicts the kept set, runs **all** readers with pytest -n 6, records every failed report (including subtests and setUpClass errors) with a pytest plugin, and checks failing ⊆ kept.
 
-{PROBE_TABLE}
+Finished (0 misses):
+
+| Probe | Kept / readers | Failing |
+|---|---|---|
+| tpc-h expected-only (alias renamed) | 2 / 61 | test_optimized_tpch, test_tpch (both kept) |
+| tpc-h input edit that still parses (`interval '91'`) | 2 / 61 (execute_tpch dropped by the parse check) | optimized_tpch, test_tpch; **execute_tpch passed**, so the parse check holds |
+| tpc-h input `l_linestatus,,` (sqlglot accepts it) | 2 / 61 | none (keeping was conservative) |
+| random: tpc-h.sql:1262 +'0' | 2 / 61 | optimized_tpch, test_tpch |
+| simplify title edit (laptop) | 0 / 1 | none |
+
+Still running on rwx-big at hand-off (`~/work/m14/probes3.out`, `rprobes3.out`):
+
+- **Hand-written:** pair shift `;`, `#` with no colon, `--` comment, blank lines, tpc-ds expected-only, tpc-ds non-exec input (parses / parse error), execute true→false, tpc-ds title, leading-space `--`, annotate `--`.
+- **Random:** 20 random token insertions in tpc-h/tpc-ds.
+
+**Gate before merging: 0 MISS lines in those two files.**
 
 ## Plan
 

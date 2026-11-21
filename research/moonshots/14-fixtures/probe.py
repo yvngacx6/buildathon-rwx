@@ -3,10 +3,10 @@ run ALL readers for real, check failing ⊆ kept."""
 import gzip, json, os, re, subprocess, sys
 M = os.path.dirname(os.path.abspath(__file__))
 os.environ['BR_SQLGLOT'] = os.environ.get('PROBE_SQ', M + '/sq')
-W = '/home/aditya/Desktop/hackathons/buildathon-rwx/.claude/worktrees/agent-ac002a98cc72f28ef'
+W = os.environ.get('PROBE_W', '/home/aditya/Desktop/hackathons/buildathon-rwx/.claude/worktrees/agent-ac002a98cc72f28ef')
 sys.path.insert(0, M)
 import fxrule
-PY = '/home/aditya/rwx-research-robust/venv/bin/python'
+PY = sys.executable
 SQ = fxrule.SQLGLOT
 rd = json.load(gzip.open(W + '/maps/reads.json.gz'))
 readers_of = {p: [rd['tests'][i] for i in v] for p, v in rd['map'].items()}
@@ -48,7 +48,7 @@ def run_readers(tests):
     if os.path.exists(rec):
         os.remove(rec)
     env = dict(os.environ, SKIP_INTEGRATION='0', FAILREC=rec, PYTHONPATH=M + '/plug')
-    r = subprocess.run([PY, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', '-p', 'failrec', '-n', '6', *tests],
+    r = subprocess.run([PY, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', '-p', 'failrec', '-n', os.environ.get('PROBE_N', '6'), *tests],
                        cwd=SQ, capture_output=True, text=True, env=env)
     out = r.stdout + r.stderr
     failed = set(open(rec).read().split()) if os.path.exists(rec) else set()
@@ -95,7 +95,11 @@ for name, path, fn in PROBES:
     kept, notes = fxrule.decide(path, ob, nb, rs, CONS, True)
     p.write_bytes(nb)
     try:
-        failed, tail = run_readers(rs)
+        run = rs
+        if os.environ.get('PROBE_LITE') and len(rs) > 10:
+            # every pair consumer + one setUpClass-only canary (all 57 load-only tests share it)
+            run = [t for t in rs if re.search(r'tpc|test_tables$', t)]
+        failed, tail = run_readers(run)
     finally:
         p.write_bytes(ob)
     miss = failed - set(kept)
