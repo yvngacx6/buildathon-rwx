@@ -637,8 +637,13 @@ class Selector:
                 # A lambda's first line is where it is created (class-body dicts run it at
                 # import); only its later lines are body that can run at import.
                 first, last = r.span
+                # slow callers a run-time pruner (diffexec / subtest / slowverify) may drop –
+                # unless the import-time runs leave this commit `_mixed_py`: count them in what
+                # the import-state diff can save
+                slack = (got & self._slow & prunable - fixed
+                         if not self._mixed_py and self.diffexec is not None else set())
                 at_import, same_state = self._function_at_import(path, first + r.is_lambda, last,
-                                                                 chosen | got)
+                                                                 chosen | got, slack)
                 if not got and same_state == "readers":
                     # Never ran under a test; what its runs at import built differently is
                     # read only by the tests in at_import.
@@ -660,7 +665,14 @@ class Selector:
                 if at_import:
                     kinds.append(f"(runs at import: +{len(at_import - got)}"
                                  + (", readers of changed import state)" if same_state else ")"))
-                    self._mixed_py = True
+                    if same_state != "readers":
+                        # the import-time runs may have built anything the run-time pruners
+                        # cannot see
+                        self._mixed_py = True
+                    # "readers": every value the import-time runs built differently is in the
+                    # import-state diff, and every test that can read one is in at_import
+                    # (kept, never pruned); what the other tests can still see of the edit is
+                    # its run-time calls, which the run-time pruners verify as usual
                     fixed |= at_import
                 elif same_state is True and got:
                     kinds.append("(runs at import: import state unchanged)")
@@ -1373,7 +1385,8 @@ class Selector:
         return got
 
     def _function_at_import(self, path: str, first: int, last: int,
-                            have: set[int] | None = None) -> tuple[set[int], bool]:
+                            have: set[int] | None = None,
+                            slack: set[int] = frozenset()) -> tuple[set[int], bool]:
         """Tests that depend on function lines path:first..last having run while modules
         were imported (`_import_time`: ALL for `import sqlglot`, else the dependents of each
         such module) – unless the import-state diff (selector/state.py) shows that importing
@@ -1383,7 +1396,9 @@ class Selector:
         tests that run it later can see the edit (the lines map has them). Only for modules
         under sqlglot/ (the diff imports those) and test modules whose own import-time code
         runs no sqlglot code (`_explained_root`); the diff costs ~1.2 s CPU, so only when the
-        dependents add at least STATE_MIN_GAIN to `have` (what the commit selects already).
+        dependents add at least STATE_MIN_GAIN to `have` (what the commit selects already)
+        less `slack`: slow tests in `have` the run-time pruners may drop, which they may
+        only try when the import-time runs are shown not to matter (`_mixed_py`, r19).
 
         Otherwise, when the patched package imports, the tests that can observe the changed
         import-time state (`_import_state_users`) if cheaper than the dependents.
@@ -1398,16 +1413,18 @@ class Selector:
         except AllTests as exc:
             wide, error = None, exc
         have = have or set()
-        if ((wide is None or self._cost(wide | have) - self._cost(have) >= STATE_MIN_GAIN)
+        base = self._cost(have - slack)
+        if ((wide is None or self._cost(wide | have) - base >= STATE_MIN_GAIN)
                 and all((m.split(".")[0] == "sqlglot" and m != "sqlglot.__main__")  # state.SKIP_MODULES
                         or self._explained_root(m, path, first, last) for m in modules)):
             found = self._state_diff()
             if found is not None and not found["changed"]:
                 return set(), True
-        if wide is None or self._cost(wide | have) - self._cost(have) >= STATE_MIN_GAIN:
+        if wide is None or self._cost(wide | have) - base >= STATE_MIN_GAIN:
             try:
                 got, _ = self._import_state_users(path, first, last, modules)
-                if wide is None or self._seconds(got) < self._seconds(wide):
+                if (wide is None or self._seconds(got) < self._seconds(wide)
+                        or (slack and not got & slack)):
                     return got, "readers"
             except names.Fallback:
                 pass
