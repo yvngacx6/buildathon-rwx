@@ -186,6 +186,46 @@ def exec_windows(expr, schema, used, cov_factory=None, swap_until=None):
     return covs, d_opt, digest_table(res)
 
 
+# ── build-machine calibration ────────────────────────────────────────────────────
+#
+# The image build may run on a busy box: CPU seconds measured there are inflated (shared cores,
+# hyper-threads, caches), which made the budget refuse verifications it can afford (a store
+# built at load ~20 had every query 2.4x too expensive). Each timed run is bracketed by a fixed
+# pure-Python workload measured the same way, and the stored CPU is expressed in reference
+# seconds: cpu * CALIB_REF / calib. CALIB_REF is the workload's CPU on the machine the budget
+# constants were tuned on (laptop, idle); BR_SUBTEST_NOCALIB=1 stores raw seconds.
+
+CALIB_REF = 0.0  # set below from the reference measurement
+
+
+def _calib_work() -> int:
+    acc = 0
+    d: dict = {}
+    for i in range(20000):
+        k = ("k", i % 97)
+        d[k] = d.get(k, 0) + i
+        s = f"col{i % 31}".upper()
+        acc += len(s) + (i & 7)
+        lst = [i, s, k]
+        acc += len(lst[1:])
+    return acc + len(d)
+
+
+def _calib() -> float:
+    best = float("inf")
+    for _ in range(5):
+        t = time.process_time()
+        _calib_work()
+        best = min(best, time.process_time() - t)
+    return best
+
+
+def _norm(cpu: float, c0: float, c1: float) -> float:
+    if os.environ.get("BR_SUBTEST_NOCALIB") == "1" or not CALIB_REF:
+        return cpu
+    return cpu * CALIB_REF / max(1e-6, (c0 + c1) / 2)
+
+
 # ── build ─────────────────────────────────────────────────────────────────────
 
 def _load_fixture_tables(root: Path, suite: str, schema: dict) -> dict:
@@ -342,6 +382,7 @@ def build(root: Path, out: Path) -> None:
                         return covs, d_opt, dres
 
                     def stage_timed():
+                        c0 = _calib()
                         t0 = time.process_time()
                         e4 = pickle.loads(pexpr)
                         import sqlglot.executor as E
@@ -350,7 +391,7 @@ def build(root: Path, out: Path) -> None:
                         oe.sql(pretty=True)
                         d2 = strict_digest(oe)
                         cpu_stage = time.process_time() - t0
-                        return d2, cpu_stage
+                        return d2, _norm(cpu_stage, c0, _calib())
                     covs, d_opt, dres = _in_fork(windows)
                     d2, cpu_stage = _in_fork(stage_timed)
                     phases["win"] = covs
@@ -372,12 +413,14 @@ def build(root: Path, out: Path) -> None:
                 return cov.stop(), duck, opt
 
             def timed(q=q):
+                c0 = _calib()
                 t0 = time.process_time()
                 a = run_query(q, schemas[suite], tables[suite], False)
                 t1 = time.process_time()
                 b = run_query(q, schemas[suite], tables[suite], True) if suite == "tpch" else None
                 t2 = time.process_time()
-                return a, b, t1 - t0, t2 - t1
+                c1 = _calib()
+                return a, b, _norm(t1 - t0, c0, c1), _norm(t2 - t1, c0, c1), (c0 + c1) / 2
 
             try:
                 phases, outs = _in_fork(traced)
@@ -385,18 +428,19 @@ def build(root: Path, out: Path) -> None:
                     phases["opt"], duck, outs["opt"] = _in_fork(traced_opt)
                     if duck != outs["duck"]:
                         raise RuntimeError("duckdb sql differs between runs")
-                a, b, cpu_exec, cpu_opt = _in_fork(timed)
+                a, b, cpu_exec, cpu_opt, calib = _in_fork(timed)
                 # the untraced run must give the same outputs (else: not deterministic → never used)
                 stable = (a[0] == outs.get("exec")) and (
                     a[1] == (outs["duck"] if q["execute"] else None))
                 if b is not None:
                     stable = stable and b[1] == outs["duck"] and b[2] == outs["opt"]
             except RuntimeError:  # e.g. RecursionError at the worker's limit: never used
-                phases, outs, cpu_exec, cpu_opt, stable = {}, {}, 0.0, 0.0, False
-            q.update(phases=phases, outs=outs, cpu_exec=cpu_exec, cpu_opt=cpu_opt, stable=stable)
+                phases, outs, cpu_exec, cpu_opt, stable, calib = {}, {}, 0.0, 0.0, False, 0.0
+            q.update(phases=phases, outs=outs, cpu_exec=cpu_exec, cpu_opt=cpu_opt, stable=stable,
+                     calib=calib)
             queries.append(q)
             print(f"{suite} {len(queries)} exec={q['execute']} cpu={cpu_exec:.2f}/{cpu_opt:.2f}"
-                  f" stable={stable}", file=sys.stderr)
+                  f" stable={stable} calib={calib * 1000:.1f}ms", file=sys.stderr)
         meta["suites"][suite] = queries
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".tmp")
@@ -436,6 +480,185 @@ def _hit(lines_by_file: dict, spans: dict) -> bool:
                 if ln >= first:
                     return True
     return False
+
+
+# ── stage guard: no checkpoint shortcut for code that may write shared state ─────────────
+#
+# The checkpoint compares the optimized tree, not global state. A changed function (old or new
+# version, nested defs included) that can write state outside its own call — module / class
+# attributes, cached instances, objects reached through imports or closures — makes the query
+# go the whole way (full re-run). Allowed write targets: names created in the function from a
+# fresh container / literal, and query-local objects passed in (parameters other than self /
+# cls; `self` only in classes of sqlglot/optimizer/, which are built per optimize call).
+
+_MUTATORS = {"append", "extend", "insert", "pop", "popitem", "remove", "clear", "update",
+             "setdefault", "add", "discard", "sort", "reverse", "__setitem__", "__delitem__",
+             "__setattr__", "__delattr__", "difference_update", "intersection_update",
+             "symmetric_difference_update", "appendleft", "extendleft", "popleft", "rotate",
+             "move_to_end", "cache_clear", "set", "replace"}
+_FRESH_CALLS = {"dict", "list", "set", "tuple", "frozenset", "defaultdict", "deque",
+                "OrderedDict", "Counter", "copy", "deepcopy"}
+
+
+def _defs(tree):
+    """{(qualname, occurrence): def node} for every function / lambda in a module."""
+    out, seen = {}, {}
+
+    def visit(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                name = prefix + (child.name if not isinstance(child, ast.Lambda) else "<lambda>")
+                k = seen.get(name, 0)
+                seen[name] = k + 1
+                out[(name, k)] = child
+                visit(child, name + ".<locals>.")
+            elif isinstance(child, ast.ClassDef):
+                visit(child, prefix + child.name + ".")
+            else:
+                visit(child, prefix)
+
+    visit(tree, "")
+    return out
+
+
+def _root(node):
+    while isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
+        node = node.value
+    return node
+
+
+def _writes_shared(fn, in_optimizer: bool) -> str | None:
+    """Why `fn` may write state outside its own call, or None."""
+    args = fn.args
+    params = [a.arg for a in args.posonlyargs + args.args + args.kwonlyargs]
+    params += [a.arg for a in (args.vararg, args.kwarg) if a is not None]
+    first = params[0] if params else None
+    bound: dict[str, bool] = {}  # local name → every binding is a fresh object
+    nodes = list(ast.walk(fn))
+
+    def fresh(v):
+        if isinstance(v, (ast.Dict, ast.List, ast.Set, ast.Tuple, ast.Constant, ast.ListComp,
+                          ast.DictComp, ast.SetComp, ast.GeneratorExp, ast.JoinedStr)):
+            return True
+        if isinstance(v, ast.Call):
+            f = v.func
+            name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else ""
+            return name in _FRESH_CALLS
+        return False
+
+    for n in nodes:
+        if isinstance(n, (ast.Global, ast.Nonlocal)):
+            return "global / nonlocal"
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            for a in n.names:
+                bound[(a.asname or a.name).split(".")[0]] = False  # module objects are shared
+        elif isinstance(n, ast.Assign):
+            for t in n.targets:
+                for x in ast.walk(t):
+                    if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
+                        bound[x.id] = bound.get(x.id, True) and isinstance(t, ast.Name) and fresh(n.value)
+        elif isinstance(n, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            t = n.target
+            if isinstance(t, ast.Name):
+                bound[t.id] = bound.get(t.id, True) and n.value is not None and fresh(n.value) \
+                    and not isinstance(n, ast.AugAssign)
+        elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension, ast.With, ast.AsyncWith,
+                            ast.ExceptHandler)):
+            tgts = []
+            if isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+                tgts = [n.target]
+            elif isinstance(n, (ast.With, ast.AsyncWith)):
+                tgts = [i.optional_vars for i in n.items if i.optional_vars is not None]
+            elif n.name:
+                bound[n.name] = False
+            for t in tgts:
+                for x in ast.walk(t):
+                    if isinstance(x, ast.Name):
+                        bound[x.id] = False  # loop / with targets may alias anything
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n is not fn:
+            bound[n.name] = True
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                a = n.args
+                for p in a.posonlyargs + a.args + a.kwonlyargs:
+                    bound.setdefault(p.arg, False)
+        elif isinstance(n, ast.Lambda) and n is not fn:
+            for p in n.args.args:
+                bound.setdefault(p.arg, False)
+
+    def target_ok(t) -> str | None:
+        if isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                why = target_ok(e)
+                if why:
+                    return why
+            return None
+        if isinstance(t, ast.Starred):
+            return target_ok(t.value)
+        if isinstance(t, ast.Name):
+            return None
+        r = _root(t)
+        if not isinstance(r, ast.Name):
+            return "store through an expression"
+        name = r.id
+        if name in params:
+            if name in ("self", "cls") or (name == first and fn is not None and name == "cls"):
+                return None if (name == "self" and in_optimizer) else f"store on {name}"
+            return None  # a query-local object passed in
+        if bound.get(name):
+            return None
+        return f"store on non-local {name}"
+
+    for n in nodes:
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                why = target_ok(t)
+                if why:
+                    return why
+        elif isinstance(n, (ast.AugAssign, ast.AnnAssign)):
+            if n.value is not None or isinstance(n, ast.AugAssign):
+                why = target_ok(n.target)
+                if why:
+                    return why
+        elif isinstance(n, ast.Delete):
+            for t in n.targets:
+                why = target_ok(t)
+                if why:
+                    return why
+        elif isinstance(n, (ast.For, ast.AsyncFor)):
+            why = target_ok(n.target)
+            if why:
+                return why
+        elif isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Name) and f.id in ("setattr", "delattr", "exec", "eval",
+                                                    "globals", "vars", "__import__"):
+                return f"calls {f.id}"
+            if isinstance(f, ast.Attribute) and f.attr in _MUTATORS:
+                why = target_ok(ast.Attribute(value=f.value, attr=f.attr, ctx=ast.Store()))
+                if why:
+                    return f"{f.attr}(): {why}"
+    return None
+
+
+def stage_guard(root: str, jobs) -> str | None:
+    """None when every changed function (old and new version) of the jobs passes
+    _writes_shared, else the reason (→ no checkpoint shortcut for this commit)."""
+    for path, new_text, _ in jobs:
+        with open(os.path.join(root, path), encoding="utf-8") as fh:
+            old_text = fh.read()
+        old_defs, new_defs = _defs(ast.parse(old_text)), _defs(ast.parse(new_text))
+        in_opt = path.startswith("sqlglot/optimizer/")
+        for k in set(old_defs) | set(new_defs):
+            o, n = old_defs.get(k), new_defs.get(k)
+            if o is not None and n is not None and ast.dump(o) == ast.dump(n):
+                continue
+            for fn in (o, n):
+                if fn is None:
+                    continue
+                why = _writes_shared(fn, in_opt)
+                if why:
+                    return f"{k[0]}: {why}"
+    return None
 
 
 class SubTest:
@@ -489,7 +712,8 @@ class SubTest:
                         return None
                     x = (suite, i, kind == "optimized", "full", False, False, False)
                     win = ph.get("win")
-                    if STAGE and kind == "execute" and q["execute"] and win and q["outs"].get("d_opt"):
+                    if (STAGE and getattr(self, "stage_ok", False) and kind == "execute"
+                            and q["execute"] and win and q["outs"].get("d_opt")):
                         wl = {}
                         for w in win.values():
                             for f, ls in w.items():
@@ -559,6 +783,14 @@ class SubTest:
         cands = candidates & set(self.numbers)
         if not cands or not spans:
             return set(), ""
+        self.stage_ok, self.stage_why = False, "off"
+        if STAGE:
+            try:
+                why = stage_guard(str(self.sel.sqlglot), jobs)
+            except Exception as e:  # noqa: BLE001
+                why = type(e).__name__
+            self.stage_ok = why is None
+            self.stage_why = why
         try:
             got = self.plan(spans, cands)
         except Exception as e:  # noqa: BLE001
@@ -578,7 +810,7 @@ class SubTest:
                 chosen, est = trial, est + c
                 todo.extend(qs)
         if not chosen:
-            return set(), f"subtest: keep (est {cpu:.1f}s CPU for {sum(map(len, per.values()))} queries)"
+            return set(), f"subtest: keep (est {cpu:.1f}s CPU for {sum(map(len, per.values()))} queries{"" if getattr(self, "stage_ok", True) else "; no stage: " + str(self.stage_why)})"
         if not todo:
             return chosen, f"subtest: {sorted(chosen)} dropped (no query runs a touched statement)"
         try:
