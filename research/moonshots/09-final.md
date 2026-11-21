@@ -9,10 +9,10 @@
   - Coverage plus an import fallback still misses **15 %**.
   - A leader at 126 s has 0 practice misses, so it is tighter than both models.
   - If leaders fall back to ALL on detectable structural kinds, they pay about what we do on
-    new kinds (11.0 vs 11.7 s per commit), and the gap stays.
+    new kinds (11.0 vs 10.8 s per commit), and the gap stays.
 - **Decides the final, in order:** (1) never exceed 4.5 min (no global guard today; a killed run
   prints nothing); (2) no misses on unseen kinds; (3) cut practice-like *code* cost (our excess:
-  588 s private code, 213 s practice_like); (4) submit the final early (ties only).
+  380 s private code, 132 s practice_like); (4) submit the final early (ties only).
 - **Odds:** #1 ~10 %, top 5 ~25 %. Config fix −37 s per final config commit (~0 risk); wall guard
   removes a DQ tail at zero cost. Neither closes the ~100 s gap; only practice-like moonshots can.
 
@@ -30,22 +30,22 @@ Calibration on the sample:
 | us (EC2) | 115 s | 0 |
 
 Leaders at about 3.2 s per commit run at roughly oracle rate. So they are precise and also handle def-time edits.
-private264 per kind (laptop, main 4826380; s; m = misses; sim via `09-tools/ours.py`):
+private264 per kind (laptop, main 4826380 with the run-time index; = S13's 2427.1; s; m = misses; `09-tools/ours.py`):
 
 | kind | n | ours | oracle | excess | N1 cost/miss | N2 cost/miss |
 |---|---|---|---|---|---|---|
-| rename | 9 | 266.4 | 52.0 | 214.3 | 10.2 / 2 | 180.3 / 0 |
-| dictentry | 9 | 154.9 | 17.8 | 137.1 | 0.0 / **7** | 198.5 / 0 |
+| rename | 9 | 226.9 | 52.0 | 174.9 | 10.2 / 2 | 180.3 / 0 |
+| dictentry | 9 | 114.2 | 17.8 | 96.3 | 0.0 / **7** | 198.5 / 0 |
 | config | 6 | 110.5 | 0.0 | **110.5** | 0 / 0 | 0 / 0 |
-| string | 9 | 104.6 | 20.9 | 83.7 | 65.6 / 1 | 88.0 / 0 |
+| string | 9 | 88.5 | 20.9 | 67.6 | 65.6 / 1 | 88.0 / 0 |
 | syntaxerr | 6 | 159.4 | 90.2 | 69.2 | 29.9 / **4** | 78.9 / 1 |
 | deletefile | 7 | 126.4 | 67.7 | 58.7 | 9.6 / **4** | 67.7 / 0 |
 | helper (test_dialect.py, helpers.py) | 10 | 121.0 | 81.0 | 40.1 | 137.2 / **6** | 137.2 / **6** |
 | importerr | 6 | 165.2 | 129.6 | 35.6 | 0.0 / **6** | 129.6 / 0 |
 | testedit + executor + fixturemeta | 29 | 111.0 | 91.6 | 19.4 | 0 m | 0 m |
 | newfile, docstring, whitespace, comment | 42 | 0 | 0 | 0 | 0 m | 0 m |
-| **code** (practice-like) | 89 | 1081.1 | 493.2 | **588.0** | 565.9 / 21 | 1120.5 / 4 |
-| **total** | 264 | 2759.3 | 1209.1 | 1550.2 | 1496.6 / **51** | 3604.4 / **11** |
+| **code** (practice-like) | 89 | 873.0 | 493.2 | **379.9** | 565.9 / 21 | 1120.5 / 4 |
+| **total** (incl. multi 179.6 / fixture 151.5) | 264 | 2427.1 | 1209.1 | 1218.0 | 1496.6 / **51** | 3604.4 / **11** |
 
 Miss sources: **helper** = edits to `tests/dialects/test_dialect.py` (`Validator`) reach every
 dialect test file ("run that file" misses 6/10); **dictentry** = module tables run only at import;
@@ -66,8 +66,8 @@ Plausible final board, assuming 60 commits = 45 practice-like + 15 new-kind in t
 |---|---|---|---|
 | leader, robust (ALL on rename/delete/syntax/importerr, oracle-like otherwise) | 45 × 3.2 = 144 | 15 × 11.0 = 165 | **~309 s** |
 | leader, aggressive (oracle-like everywhere) | 144 | 15 × 4.9 = 74 | **~218 s**; ≥ 518 s with one miss |
-| us (main) | 45 × 4.85 = 218 | 15 × 11.7 = 176 | **~394 s** |
-| us + config fix + −40 s/40 practice moonshot | ~173 | ~166 | ~339 s |
+| us (main) | 45 × 4.85 = 218 | 15 × 10.8 = 162 | **~380 s** |
+| us + config fix + −40 s/40 practice moonshot | ~173 | ~152 | ~325 s |
 
 Caveats: the kind mix and private264 are our own generator; our 0/446 is on mutants we wrote, so it
 overstates our safety on truly unseen kinds. **Takeaway:** spend moonshot effort on practice-like code commits. On new kinds we already roughly match a robust leader.
@@ -95,13 +95,13 @@ overstates our safety on truly unseen kinds. **Takeaway:** spend moonshot effort
 - **Measured.** Every budget was halved (≈ a 2× slower machine: `BR_DIFFEXEC_COMMIT_S=7.5
   _BATCH_S=50 _SHARE=0.425 BR_SUBTEST_S=6 BR_SLOWVERIFY_S=2 BR_GENMEM_S=3`) and doubled
   (≈ a 2× faster machine). Stdout was **byte-identical** against two default runs on sample,
-  practice_like, adversarial2 and private264 (md5 28be4a9d / efd708e5 / 4a2b9e5b / 9d9f3f94). No commit sits near a budget edge, so the 5 re-runs give the same selections, and the
-  score varies only by CPU noise (about 5–8 s of CPU in total; ±0.5 s).
-- Build-time CPU (subtest's per-query `cpu_exec`/`cpu_opt`) feeds the run-time caps and gates.
-  The final rebuild fixes them for all 5 runs, and an overrun only keeps tests. No action needed.
-- **Don't retune `SCORER_SLOWDOWN` for an idle machine.** Selections don't move under 2× budget
-  changes, so the gain would be about 0 and we couldn't validate it. Our CPU is small (4.9 s per
-  40 on the board, about 7 s per 60), so an idle machine helps CPU-heavy teams more than us.
+  practice_like, adversarial2 and private264 (md5 28be4a9d / efd708e5 / 4a2b9e5b / 9d9f3f94),
+  incl. 7 subtest verifications and 10 genmem drops. No commit sits near a budget edge, so the 5
+  re-runs agree and the score varies only by CPU noise (±0.5 s). Not covered: subtest's per-query
+  caps (3× build-time `cpu_exec` + 0.8 s, unscaled by env); fixed by the one final build for all
+  5 runs, and an overrun only keeps tests (cost, never a miss).
+- **Don't retune `SCORER_SLOWDOWN` for an idle machine** (selections don't move; ~0 gain). Our CPU
+  is small (4.9 s / 40 → ~7 s / 60); an idle machine helps CPU-heavy teams more than us.
 
 ## 4. Wall time: 4.5 min for ~60 commits
 - No global deadline: only diffexec has a batch cap (100 CPU-s); subtest 6 s, slowverify 2 s,
@@ -109,7 +109,8 @@ overstates our safety on truly unseen kinds. **Takeaway:** spend moonshot effort
   ceiling plus hung children → nothing bounds 60 commits under 270 s. Stdout is written once,
   after the loop, so a kill = no output = invalid run.
 - **Measured** with `09-tools/percommit.py`: per-commit wall including children, on a laptop with
-  load average 15–36, which inflates wall. Scorer ≈ ×2–2.5:
+  load average 15–36, which inflates wall. Calibration: sample CPU laptop 6.7 s vs EC2 container 4.36 s
+  (E017), scorer ≈ 2× EC2 → **scorer ≈ 1.3× this laptop's CPU**:
 
 | set | n | mean wall | p95 | max |
 |---|---|---|---|---|
@@ -119,10 +120,11 @@ overstates our safety on truly unseen kinds. **Takeaway:** spend moonshot effort
 | adversarial2 | 65 | 0.78 | 3.32 | 3.90 |
 | private | 264 | 0.63 | 3.05 | **13.53** (k7l7: multi, parser + state diff) |
 
-- **Bootstrap of 60-commit batches** from all 429 commits (laptop): median 39 s, p99 66 s, p99.99 92 s.
+- **Bootstrap of 60-commit batches** on CPU from all 429 commits (laptop): median 29 s, p99 46 s,
+  p99.99 62 s → scorer ≈ 38 / 60 / 81 s.
   On the scorer that is roughly 80 / 150 / **210 s**.
-- **The 60 most expensive commits** sum to 180 s on the laptop, so **360–450 s on the scorer, over the limit.**
-- Typical case safe (real practice is cheaper still: board CPU 4.9 s / 40); the tail is not.
+- **The 60 most expensive commits** sum to 124 CPU-s (180 s wall under load) → **~160 s scorer CPU, ~60 % of 270 s**; on a contended scorer wall > CPU (k7l7: 13.5 s wall vs 7.8 s CPU).
+- Typical case very safe (real practice is cheaper still: board CPU 4.9 s / 40); the tail has only ~1.7× margin, and hung children are unbounded.
 **R1 (must; ~30 lines; no cost on normal runs).** Add a global deadline in `selector/__main__.py`:
 - **Limit:** `4.5 s × n_commits` (180/40 = 270/60), measured from process start. Pass the start
   time through the PYTHONHASHSEED re-exec in an env var.
