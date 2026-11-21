@@ -65,6 +65,9 @@ FILES = {
     "sqlglot/other.py": OTHER,
     "sqlglot/parser.py": BASE,
     "sqlglot/third.py": "from sqlglot.other import SHARED\n",
+    "sqlglot/fourth.py": "VALUE = 1\n",
+    "sqlglot/fifth.py": "from sqlglot.fourth import VALUE\n\n\ndef f():\n    return VALUE\n",
+    "tests/conftest.py": "import pytest\n",
     "tests/test_lib.py": TEST,
     "tests/helpers.py": HELPERS,
     "tests/fixtures/q.sql": FIXTURE,
@@ -81,7 +84,8 @@ ALL = set(range(5))
 
 MAPS = {
     "lines": {"sqlglot/lib.py:10": [C], "sqlglot/lib.py:13": [C], "sqlglot/lib.py:14": [D],
-              "sqlglot/other.py:4": [A], "sqlglot/parser.py:5": [B]},
+              "sqlglot/other.py:4": [A], "sqlglot/parser.py:5": [B],
+              "sqlglot/fifth.py:5": [B]},
     "classes": {"sqlglot.lib.Dialect": [A]},
     "reads": {"tests/fixtures/q.sql": [B]},
     "test_imports": {"tests/helpers.py": [A, B]},
@@ -190,6 +194,17 @@ def test_module_import_change_selects_all(selector):
                               "from sqlglot.lib import Dialect, LIMIT")) == ALL
 
 
+def test_module_constant_follows_importers(selector):
+    # VALUE is imported by fifth.py, whose function test B ran.
+    assert run(selector, edit("sqlglot/fourth.py", "VALUE = 1", "VALUE = 2")) == {B, U}
+
+
+def test_renamed_module_selects_all(selector):
+    text = ("--- a/sqlglot/other.py\n+++ b/sqlglot/moved.py\n@@ -1 +1 @@\n"
+            "-from sqlglot.lib import Dialect\n+from sqlglot.lib import Dialect\n")
+    assert run(selector, text) == ALL
+
+
 def test_base_class_body_selects_all(selector):
     assert run(selector, edit("sqlglot/parser.py", "STRICT = False", "STRICT = True")) == ALL
 
@@ -223,6 +238,16 @@ def test_test_helper_selects_importers(selector):
 def test_fixture_selects_readers_without_ast_filter(selector):
     # A '#' line in a fixture is metadata, not a comment: it must still select readers.
     assert run(selector, edit("tests/fixtures/q.sql", "# meta: x", "# meta: y")) == {B, U}
+
+
+def test_renamed_fixture_selects_old_readers(selector):
+    text = ("--- a/tests/fixtures/q.sql\n+++ b/tests/fixtures/q2.sql\n@@ -1 +1 @@\n"
+            "-# meta: x\n+# meta: x\n")
+    assert run(selector, text) == {B, U}
+
+
+def test_conftest_selects_all(selector):
+    assert run(selector, edit("tests/conftest.py", "import pytest", "import os")) == ALL
 
 
 def test_unread_fixture_selects_nothing(selector):

@@ -8,6 +8,6 @@
     "~/rwx-research-robust/readmap.json"
   ],
   "build_command": "python3 mapbuild/convert_prototype.py sample/tests.json <sqlglot> maps",
-  "notes": "lines = union of two coverage runs (test_function contexts, inline process pool with pickle round-trip); import-time ('') contexts dropped. classes track Dialect/Parser/Generator/Tokenizer/Expression hierarchies only. reads are not widened for setUpClass. test_imports from a static AST scan.",
+  "notes": "lines = union of two coverage runs (test_function contexts, inline process pool with pickle round-trip); import-time ('') contexts dropped. classes track Dialect/Parser/Generator/Tokenizer/Expression hierarchies only. reads made by the first test of a setUpClass class are credited to the whole class. test_imports from a static AST scan.",
   "date": "2026-11-20"
 }

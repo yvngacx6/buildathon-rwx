@@ -104,9 +104,13 @@ class Selector:
     def _select_file(self, fp: diff.FilePatch) -> tuple[set[int], str]:
         path = fp.path
         name = PurePosixPath(path).name
-        if path.startswith("tests/fixtures/"):
+        if path.startswith("tests/fixtures/") or (fp.old_path or "").startswith("tests/fixtures/"):
             # Fixture text is data: a '#' line can be metadata, so never AST-filter it.
-            return set(self.maps.reads.get(path)), "fixture → readers"
+            # A rename or delete breaks the readers of the old path too.
+            readers = set()
+            for p in {fp.old_path, fp.new_path} - {None}:
+                readers |= self.maps.reads.get(p)
+            return readers, "fixture → readers"
         if fp.old_path and fp.new_path and fp.old_path != fp.new_path:
             raise AllTests(f"{path} renamed")
         if name in ALWAYS_ALL:

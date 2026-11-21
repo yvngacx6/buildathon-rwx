@@ -106,13 +106,38 @@ def build_classes(b: Builder) -> dict[str, set[str]]:
     return classes
 
 
-def build_reads(b: Builder) -> dict[str, set[str]]:
+def _setup_classes(sqlglot: Path) -> set[str]:
+    """`tests/x.py::Cls` for every test class that defines setUpClass (static scan)."""
+    out = set()
+    for path in (sqlglot / "tests").rglob("test_*.py"):
+        rel = path.relative_to(sqlglot).as_posix()
+        for node in ast.walk(ast.parse(path.read_bytes())):
+            if isinstance(node, ast.ClassDef) and any(
+                    isinstance(f, ast.FunctionDef) and f.name == "setUpClass" for f in node.body):
+                out.add(f"{rel}::{node.name}")
+    return out
+
+
+def build_reads(b: Builder, sqlglot: Path) -> dict[str, set[str]]:
+    """Files opened per test. The prototype plugin credits reads made in setUpClass to the
+    first test that ran in the class only; SCHEMA.md wants the whole class. So for classes
+    that define setUpClass, files read by the class's first test (pytest runs unittest
+    methods in name order) are credited to every test of the class."""
     reads: dict[str, set[str]] = defaultdict(set)
-    for tid, files in json.loads(READMAP.read_text()).items():
+    raw = json.loads(READMAP.read_text())
+    for tid, files in raw.items():
         tid = b.resolve_id(tid)
         if tid:
             for f in files:
                 reads[f].add(tid)
+    members: dict[str, list[str]] = defaultdict(list)
+    for tid in b.known:
+        members[tid.rsplit("::", 1)[0]].append(tid)
+    for cls in _setup_classes(sqlglot):
+        tests = sorted(members.get(cls, []))
+        if tests:
+            for f in raw.get(tests[0], ()):
+                reads[f] |= set(tests)
     return reads
 
 
@@ -172,7 +197,7 @@ def main() -> None:
     t0 = time.time()
     write_map(out / "lines.json.gz", build_lines(b))
     write_map(out / "classes.json.gz", build_classes(b))
-    write_map(out / "reads.json.gz", build_reads(b))
+    write_map(out / "reads.json.gz", build_reads(b, sqlglot))
     write_map(out / "test_imports.json.gz", build_test_imports(b, sqlglot))
     print(f"  dropped {len(b.dropped)} contexts/ids not in tests.json, e.g. {sorted(b.dropped)[:3]}",
           file=sys.stderr)
@@ -185,7 +210,8 @@ def main() -> None:
         "notes": "lines = union of two coverage runs (test_function contexts, inline process "
                  "pool with pickle round-trip); import-time ('') contexts dropped. classes "
                  "track Dialect/Parser/Generator/Tokenizer/Expression hierarchies only. reads "
-                 "are not widened for setUpClass. test_imports from a static AST scan.",
+                 "made by the first test of a setUpClass class are credited to the whole class. "
+                 "test_imports from a static AST scan.",
         "date": time.strftime("%Y-%m-%d"),
     }
     (out / "MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
