@@ -19,8 +19,7 @@
 ## 1. How leaders likely fare on new kinds
 `09-tools/naive.py` models two leader-style selectors on our labeled sets, using our pinned maps:
 - **N1:** test-phase line coverage of the changed lines, plus fixture readers, plus a test file's own tests.
-- **N2:** N1, plus "a line no test covers at test time (def, class body, module level) → all tests
-  that load the module".
+- **N2:** N1, plus "line no test covers at test time (def, class body, module) → tests loading the module".
 Calibration on the sample:
 
 | selector | cost | misses |
