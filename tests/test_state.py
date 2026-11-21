@@ -341,3 +341,15 @@ def test_alias_that_also_changes_the_own_value_is_all(selector):
 def test_mutation_of_own_copy_is_not_all(selector):
     got, why = run_file(selector, "sqlglot/child.py", CHILD, 'TABLE.pop("a")', 'TABLE.pop("b")')
     assert "outside the patched modules" not in why
+
+
+@pytest.mark.parametrize("out", [None, {"import_error": None}])
+def test_foreign_state_without_a_diff_is_all(selector, monkeypatch, out):
+    # The alias edit, but the import-state diff fails (timeout, crash, missing snapshot, an
+    # import error in no known package file): nothing rules the global effect out → ALL,
+    # never a silent pass.
+    monkeypatch.setattr(state, "diff", lambda *a, **k: out)
+    got, why = run_file(selector, "sqlglot/child2.py", CHILD2, 'TABLE = {**Base.TABLE, "c": 3}',
+                        "TABLE = Base.TABLE")
+    assert got == set(range(len(T))), why
+    assert "import-state diff unavailable" in why

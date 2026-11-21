@@ -1058,13 +1058,18 @@ class Selector:
         classes and not a copy of one of their changed values (equal to it both before and
         after the edit: a re-export, `X = other.X.copy()`) → GlobalEffect (ALL). The patched
         package does not import: ALL if the failing file is not a patched one (the edit broke
-        another module), else the module's own bound still holds."""
+        another module), else the module's own bound still holds. No diff at all (no snapshot,
+        timeout, crash, a patch that does not apply, an import error in no known package
+        file) → nothing rules a global effect out → ALL."""
         found = self._state_diff()
         if found is None:
             broken = self._state_error
             if broken and broken not in {fp.path for fp in self._files}:
                 # the edit makes another module fail to import (it copied a key we removed)
                 raise GlobalEffect(f"{path}: breaks the import of {broken}")
+            if not broken:
+                raise GlobalEffect(f"{path}: import-state diff unavailable, a change outside "
+                                   "the patched modules cannot be ruled out")
             return
         if "digests" not in found:
             return
