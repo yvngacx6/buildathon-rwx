@@ -12,13 +12,20 @@ orig = sel._site_reads
 log = []
 def wrapped(index, site, attr, depth=0, same=frozenset()):
     out = orig(index, site, attr, depth, same)
-    log.append((depth, attr, site.what, site.flow and site.flow[0], site.use, site.recv, sorted(same), [(b, len(g)) for b, g in out]))
+    log.append((depth, attr, site.what, site.flow and site.flow[0], site.use, sorted(same), [(b, g) for b, g in out]))
     return out
 sel._site_reads = wrapped
 for c in sys.argv[2:]:
     log.clear()
     ns, why = sel.select((data / "commits" / f"{c}.patch").read_text())
     print("=====", c, len(ns), "failing", len(ans.get(c, {}).get("failing", [])), why[:300])
+    seen = {}
     for row in log:
-        if any(n for _, n in row[-1]):
-            print("  ", row)
+        if row[3] == "attr":
+            continue
+        got = set().union(*[g for _, g in row[-1]]) & ns if row[-1] else set()
+        if got:
+            k = row[:3]
+            seen.setdefault(k, set()).update(got)
+    for k, g in seen.items():
+        print("  ", k, len(g), round(sel._seconds(g), 1))
