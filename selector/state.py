@@ -405,6 +405,10 @@ def projections(snap: Snapshot, keys) -> dict[str, tuple[bool | None, str | None
 
 
 def _main(argv: list[str]) -> None:
+    # The limit is CPU (SIGXCPU → the caller gets None), not wall time: a stalled or swapping
+    # host must not change the answer (moon-17); the caller's wall timeout only guards a block.
+    import resource
+    resource.setrlimit(resource.RLIMIT_CPU, (60, 61))
     cmd, root = argv[0], argv[1]
     if cmd == "snap":  # snap <root> <out>
         snap = take(root, {}, track=True)
@@ -562,15 +566,9 @@ _RUN = (f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent.pa
         "from selector.state import _main; _main(sys.argv[1:])")
 
 
-def _cpu_cap() -> None:
-    """The child's limit is CPU (60 s, SIGXCPU → None), not wall time: a stalled or swapping
-    host must not change the answer (moon-17). The 180 s wall timeout only guards a block."""
-    import resource
-    resource.setrlimit(resource.RLIMIT_CPU, (60, 61))
-
-
 def _run(args: list[str], stdin: str | None) -> str | None:
     import subprocess  # here: the interpreter that `_run` starts does not need it
+    from .diffexec import wall_guard
 
     env = {"PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get(
         "PATH", "/usr/bin:/bin")}
@@ -578,8 +576,8 @@ def _run(args: list[str], stdin: str | None) -> str | None:
         env["PYTHONPYCACHEPREFIX"] = os.environ["BR_STATE_PYCACHE"]
     try:
         proc = subprocess.run([sys.executable, "-P", "-s", "-S", "-c", _RUN, *args],
-                              input=stdin, capture_output=True, text=True, env=env, timeout=180,
-                              cwd="/", preexec_fn=_cpu_cap)
+                              input=stdin, capture_output=True, text=True, env=env,
+                              timeout=wall_guard(45, cap=180), cwd="/")
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:

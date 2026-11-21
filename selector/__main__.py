@@ -18,6 +18,8 @@ from pathlib import Path
 from . import pack
 from .select import ALL_FRACTION, Selector
 
+WALL_PER_COMMIT_S = float(os.environ.get("BR_WALL_PER_COMMIT_S", "3.5"))
+
 
 def main() -> None:
     _hashseed_for_diffexec()
@@ -38,7 +40,12 @@ def main() -> None:
     all_cost = pack.cost_ms(all_workers, ms_of)
 
     lines = []
-    for patch_file in sorted((data / "commits").glob("*.patch")):
+    patches = sorted((data / "commits").glob("*.patch"))
+    # Wall budget for the children's block guards (moon-17): the scorer allows 3 min per 40
+    # commits (4.5 s each); leave a margin for the commits after a stall.
+    from . import diffexec
+    diffexec.WALL_END = time.monotonic() + max(60.0, WALL_PER_COMMIT_S * len(patches))
+    for patch_file in patches:
         commit = patch_file.stem
         try:
             numbers, reason = selector.select(patch_file.read_text(errors="replace"))

@@ -38,12 +38,21 @@ BATCH_BUDGET_S = float(os.environ.get("BR_DIFFEXEC_BATCH_S", "100"))
 BENEFIT_SHARE = float(os.environ.get("BR_DIFFEXEC_SHARE", "0.85"))
 
 
-def wall_guard(budget: float) -> float:
+# Monotonic time by which the whole run should be done (set by __main__; None = no limit).
+WALL_END: float | None = None
+
+
+def wall_guard(budget: float, cap: float | None = None) -> float:
     """Wall-clock limit for a verification child whose CPU is capped by `budget` (moon-17).
 
     Only a guard against a child that blocks: the child's own CPU caps decide overruns, so a
-    busy or throttled host (CPU-starved child) must not change the answer."""
-    return 4 * budget + 30
+    busy or throttled host (CPU-starved child) must not change the answer. Bounded by what is
+    left of the run's wall budget (WALL_END), so a stalled host cannot push the run past the
+    scorer's time limit: past it, children are cut short and their tests kept."""
+    guard = 4 * budget + 30 if cap is None else cap
+    if WALL_END is not None:
+        guard = min(guard, max(0.5, WALL_END - time.monotonic()))
+    return guard
 
 
 class DiffExec:
