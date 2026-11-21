@@ -600,7 +600,12 @@ class Selector:
                      | set(self.maps.test_imports.get(site.path)))]
         if site.when == "def" and site.memo:
             raise names.Fallback(f"{attr} read in code cached across tests ({site.what})")
-        bucket = "loose" if site.dynamic else "held"
+        # A computed-name lookup (getattr(x, v)) reads a class attribute through an object of
+        # the class or through the class object itself: the same two ways a static `x.NAME`
+        # read does, so it is restricted like one. Namespace listings (vars, __dict__, dir)
+        # and test code stay unrestricted.
+        bucket = "loose" if site.dynamic and not (
+            site.lookup and not site.path.startswith("tests/")) else "held"
         flow = site.flow if site.when == "run" and not site.dynamic and depth < 3 else None
         if flow is not None and flow[0] == "local":
             got: set[int] = set()
