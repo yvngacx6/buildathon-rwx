@@ -83,6 +83,10 @@ FILES = {
     "tests/fixtures/unread.sql": FIXTURE,
     "pyproject.toml": '[project]\nname = "x"\n\n[tool.pytest.ini_options]\naddopts = "-q"\n',
     "README.md": "hello\n",
+    "setup.py": "from setuptools import setup\n\nsetup(name=\"x\")\n",
+    "MANIFEST.in": "include LICENSE\n",
+    ".gitmodules": "[submodule \"x\"]\n",
+    ".gitpod.yml": "tasks: []\n",
 }
 
 T = ["tests/test_lib.py::TestLib::test_a", "tests/test_lib.py::TestLib::test_b",
@@ -99,7 +103,7 @@ MAPS = {
               "sqlglot/slow_lambda.py:3": [D], "sqlglot/slow_lambda.py:4": [C],
               "sqlglot/slow_cache.py:5": [C, D], "sqlglot/slow_cache.py:6": [C], "sqlglot/slow_cache.py:7": [C, D]},
     "classes": {"sqlglot.lib.Dialect": [A]},
-    "reads": {"tests/fixtures/q.sql": [B]},
+    "reads": {"tests/fixtures/q.sql": [B], ".gitpod.yml": [C]},
     "test_imports": {"tests/helpers.py": [A, B]},
 }
 
@@ -602,3 +606,41 @@ def test_deleting_a_one_line_lambda_entry_changes_the_table():
     new = old.replace('        "A": lambda self: 1,\n', "")
     got = classify.regions(ast.parse(old), ast.parse(new), [3], [])
     assert {r.kind for r in got} == {"function", "class"}, got
+
+
+# ── R3: repository metadata, root setup.py ──────────────────────────────────
+
+def test_repo_metadata_without_reader_selects_nothing(selector):
+    assert run(selector, edit("MANIFEST.in", "LICENSE", "LICENSE README.md")) == set()
+    assert run(selector, patch("MANIFEST.in", FILES["MANIFEST.in"], None)) == set()
+    assert run(selector, patch(".gitmodules", FILES[".gitmodules"], None)) == set()
+
+
+def test_repo_metadata_with_a_reader_selects_its_readers(selector):
+    assert run(selector, edit(".gitpod.yml", "[]", "[1]")) == {C, U}  # U: untraced
+
+
+def test_root_setup_py_comment_selects_nothing(selector):
+    assert run(selector, edit("setup.py", "\n\nsetup(", "\n\n# build\nsetup(")) == set()
+
+
+def test_root_setup_py_code_change_or_delete_selects_all(selector):
+    assert run(selector, edit("setup.py", 'name="x"', 'name="y"')) == ALL
+    assert run(selector, patch("setup.py", FILES["setup.py"], None)) == ALL
+    assert run(selector, edit("setup.py", "setup(name", "setup((name")) == ALL  # syntax error
+
+
+def test_pyproject_pytest_section_still_selects_all(selector):
+    assert run(selector, edit("pyproject.toml", '"-q"', '"-x"')) == ALL
+
+
+# ── R1: run-time verification off (time budget) ─────────────────────────────
+
+def test_degrade_makes_commits_that_need_the_state_diff_all(selector):
+    text = edit("sqlglot/tenth.py", "return 1", "return 2")
+    selector._state = False
+    selector.degrade()
+    assert selector.diffexec is selector.subtest is selector.slowverify is selector.genmem is None
+    assert run(selector, text) == ALL
+    # edits that need no run-time verification are unchanged
+    assert run(selector, edit("sqlglot/lib.py", "LIMIT = 10\n", "LIMIT = 10  # cap\n")) == set()

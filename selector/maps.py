@@ -23,6 +23,7 @@ from array import array
 from pathlib import Path
 
 MAP_FILES = ("lines", "classes", "classes_run", "reads", "test_imports", "import_time", "imports")
+REQUIRED = ("lines", "classes", "reads", "test_imports", "import_time")
 SHARDED = ("lines", "import_time")  # keys "<path>:<line>": one compiled file per path
 ISOLATION_FAILURE = "<isolation-failure>"  # imports map: tests whose record may be incomplete
 COMPILED = Path(__file__).resolve().parent.parent / "index" / "maps"
@@ -181,7 +182,12 @@ class Maps:
     """All maps for one run, plus derived lookups the selector needs."""
 
     def __init__(self, directory: Path, tests: list[dict], compiled: Path | None = None) -> None:
-        """`compiled`: the folder `compile_maps` wrote, if any."""
+        """`compiled`: the folder `compile_maps` wrote, if any. A missing core map would
+        read as empty (no test uses anything → nothing selected): refuse to start instead
+        (__main__ then answers ALL for every commit)."""
+        missing = [n for n in REQUIRED if not (directory / f"{n}.json.gz").is_file()]
+        if missing:
+            raise FileNotFoundError(f"maps missing in {directory}: {', '.join(missing)}")
         number_of = {t["id"]: t["number"] for t in tests}
         self._number_of = number_of
 
