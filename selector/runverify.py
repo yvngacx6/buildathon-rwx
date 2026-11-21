@@ -701,7 +701,7 @@ class RunVerify:
         if not failed and passed != numbers:
             return numbers, f"runverify: keep (incomplete, {cpu:.2f}s)"
         rest = numbers - passed
-        return rest, (f"runverify: {len(passed)} passed, {len(failed)} failed, {len(rest)} kept "
+        return rest, (f"runverify: {len(passed)} passed, {len(failed)} failed {failed[:3]}, {len(rest)} kept "
                       f"(est {est:.2f}s, child {cpu:.2f}s)")
 
 
