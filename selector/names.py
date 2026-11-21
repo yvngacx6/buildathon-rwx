@@ -257,6 +257,8 @@ class Site:
     copy: tuple[tuple[str, ...], tuple[str, ...]] | None = None  # (owner chain, targets)
     what: str = ""
     dynamic: bool = False  # getattr(x, v) / vars(x) / …: may read any name, of any object
+    memo: bool = False  # "def" site whose result is cached across tests (not just at import)
+    typecheck: bool = False  # the class argument of isinstance / issubclass (not handed on)
 
 
 @dataclass
@@ -265,6 +267,7 @@ class _Ctx:
     chain: tuple[str, ...]
     deftime: bool
     func: ast.AST | None = None
+    memo: bool = False  # inside code whose result is cached across tests
 
 
 class Index:
@@ -274,6 +277,7 @@ class Index:
         self.sources = sources
         self._trees: dict[str, ast.Module] = {}
         self._deftime: set[int] | None = None  # id() of defs that run at import / are memoized
+        self._memo_defs: set[int] = set()  # id() of defs whose result is cached across tests
         self._memo_stmts: set[int] = set()  # id() of statements whose value is cached
         self._classes: dict[str, list[tuple[str, ast.ClassDef, tuple[str, ...]]]] | None = None
         self._dynamic: list[tuple] | None = None
@@ -302,12 +306,13 @@ class Index:
             if isinstance(node, ast.stmt):
                 stmt = node
                 if id(node) in memo:  # its value is cached across tests
-                    ctx = _Ctx(ctx.kind, ctx.chain, True, ctx.func)
+                    ctx = _Ctx(ctx.kind, ctx.chain, True, ctx.func, True)
             yield node, ctx, stmt
             # Scopes change the context of their bodies; decorators, default arguments and
             # base classes run in the enclosing context.
             if isinstance(node, funcs):
-                inner = _Ctx("def", ctx.chain + (node.name,), id(node) in deftime, node)
+                inner = _Ctx("def", ctx.chain + (node.name,), id(node) in deftime, node,
+                             ctx.memo or id(node) in self._memo_defs)
                 stack.extend((b, inner, b) for b in reversed(node.body))
                 stack.extend((d, ctx, stmt) for d in node.decorator_list)
                 stack.extend((d, ctx, stmt) for d in node.args.defaults + node.args.kw_defaults
@@ -317,7 +322,7 @@ class Index:
                 stack.extend((d, ctx, stmt) for d in node.args.defaults + node.args.kw_defaults
                              if d is not None)
             elif isinstance(node, ast.ClassDef):
-                inner = _Ctx("class", ctx.chain + (node.name,), True, None)
+                inner = _Ctx("class", ctx.chain + (node.name,), True, None, ctx.memo)
                 stack.extend((b, inner, b) for b in reversed(node.body))
                 stack.extend((d, ctx, stmt) for d in node.decorator_list + node.bases
                              + [k.value for k in node.keywords])
@@ -336,31 +341,41 @@ class Index:
             for node, _, in_class in _defs(self.tree(path)):
                 (methods if in_class else functions).setdefault(node.name, []).append(node)
         seeds: list[ast.AST] = []
+        memo_seeds: list[ast.AST] = []  # results cached across tests
         for path in self._lib_paths():
             module_names = _module_names(self.tree(path))
             for node, in_meta, _ in _defs(self.tree(path)):
                 decos = {_last_name(d) for d in node.decorator_list}
+                if decos & CACHE_DECORATORS:
+                    memo_seeds.append(node)
+                    continue
                 if ((in_meta and node.name in METACLASS_CREATION_METHODS)
-                        or node.name in DEFINITION_TIME_METHODS or decos & CACHE_DECORATORS):
+                        or node.name in DEFINITION_TIME_METHODS):
                     seeds.append(node)
                     continue
                 memo = self._memo(node, module_names)
                 if memo is True:
-                    seeds.append(node)
+                    memo_seeds.append(node)
                 else:
                     for kind, name in memo:
-                        seeds.extend((functions if kind == "function" else methods).get(name, ()))
+                        memo_seeds.extend(
+                            (functions if kind == "function" else methods).get(name, ()))
         self._functions = functions
-        done: set[int] = set()
-        while seeds:  # what definition-time code calls also runs at definition time
-            f = seeds.pop()
-            if id(f) in done:
-                continue
-            done.add(id(f))
-            for kind, name in _calls(f, _own_nodes(f)):
-                seeds.extend((functions if kind == "function" else methods).get(name, ()))
-        self._deftime = done
-        return done
+
+        def closure(todo: list[ast.AST]) -> set[int]:
+            done: set[int] = set()
+            while todo:  # what definition-time code calls also runs at definition time
+                f = todo.pop()
+                if id(f) in done:
+                    continue
+                done.add(id(f))
+                for kind, name in _calls(f, _own_nodes(f)):
+                    todo.extend((functions if kind == "function" else methods).get(name, ()))
+            return done
+
+        self._memo_defs = closure(list(memo_seeds))
+        self._deftime = closure(seeds) | self._memo_defs
+        return self._deftime
 
     def _memo(self, f: ast.AST, module_names: set[str]) -> set[tuple[str, str]] | bool:
         """Callees whose result `f` stores in module-level state (so later tests reuse it
@@ -452,7 +467,12 @@ class Index:
         class_refs: dict[str, set[str]] = {}
         calls: list[tuple] = []
         for path in sorted(self.sources):
+            checked: set[int] = set()  # isinstance(x, C) / issubclass(x, (C, D)): C, D
             for node in ast.walk(self.tree(path)):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id in ("isinstance", "issubclass") and len(node.args) == 2):
+                    arg = node.args[1]
+                    checked |= {id(e) for e in (arg.elts if isinstance(arg, ast.Tuple) else [arg])}
                 if isinstance(node, ast.ImportFrom):
                     for a in node.names:
                         if a.name == "*":
@@ -474,8 +494,10 @@ class Index:
                         continue
                     else:
                         kind = "name"
-                    occ.setdefault(key, []).append(
-                        (path, kind, ctx.kind, ctx.chain, self._site(path, node, ctx, stmt)))
+                    site = self._site(path, node, ctx, stmt)
+                    if id(node) in checked:
+                        site = dataclasses.replace(site, typecheck=True)
+                    occ.setdefault(key, []).append((path, kind, ctx.kind, ctx.chain, site))
             for ref, holder, _ in facts["class_refs"]:
                 class_refs.setdefault(ref, set()).add(holder)
             for call, slots in facts["deftime_calls"]:
@@ -535,7 +557,7 @@ class Index:
             targets = _targets(stmt)
             if targets and _copied(stmt.value, node):
                 copy = (ctx.chain, targets)
-        return Site(path, (first, last), "def", copy=copy, what=what)
+        return Site(path, (first, last), "def", copy=copy, what=what, memo=ctx.memo)
 
     def _dynamic_sites(self):
         """Reads whose attribute name is computed: getattr(x, v), vars(x), dir(x), x.__dict__."""

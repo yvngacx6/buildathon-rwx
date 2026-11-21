@@ -49,7 +49,7 @@ import os
 import re
 from pathlib import Path, PurePosixPath
 
-from . import classify, diff, nameindex, names
+from . import classify, diff, nameindex, names, state
 from .maps import ImportTimeMap, Maps
 
 # Class and module bodies of these files shape nearly every test (map gives ~1550 of 1620).
@@ -68,6 +68,15 @@ CONFIG_FILES = {"pyproject.toml", "setup.cfg"}
 ALWAYS_ALL = {"pytest.ini", "tox.ini", "conftest.py", "setup.py"}
 ALL_FRACTION = 0.85  # selection cost ≥ this × ALL cost → just run ALL
 SLOW_SECONDS = 5.0  # tests at least this slow get the statement-level rule in function bodies
+# Class hierarchies the classes map records (maps/MANIFEST.json notes): a test that made an
+# instance of one of these classes (or used it as a dialect) is credited to it and its bases.
+TRACKED_ROOTS = {
+    "sqlglot.dialects.dialect:Dialect",
+    "sqlglot.parser:Parser",
+    "sqlglot.generator:Generator",
+    "sqlglot.tokens:_TokenizerBase",
+    "sqlglot.expressions.core:Expr",
+}
 
 
 class AllTests(Exception):
@@ -91,6 +100,8 @@ class Selector:
         self._untraced: set[int] | None = None
         self._sources: dict[str, str] | None = None
         self._name_index: nameindex.NameIndex | None = None
+        self._files: list[diff.FilePatch] = []  # the current commit's files
+        self._state: dict | None | bool = False  # its import-state diff (False: not yet run)
         self.notes: list[str] = []  # why a definition-time region was (not) narrowed
         self._dependents: dict[str, set[int]] = {}
 
@@ -104,6 +115,7 @@ class Selector:
         files = diff.parse(patch_text)
         if not files:
             return self.all_numbers(), "ALL (no files parsed)"
+        self._files, self._state = files, False
         chosen: set[int] = set()
         reasons = []
         try:
@@ -302,6 +314,15 @@ class Selector:
                 return got
             except names.Fallback as exc:
                 self.notes.append(f"{'.'.join(r.chain) or module}: no narrowing ({exc})")
+                try:
+                    got, why = self._by_state(path, r, wide)
+                    if wide is not None and self._seconds(got) >= self._seconds(wide):
+                        raise names.Fallback(f"{why}, but no cheaper")
+                    self.notes.append(f"{'.'.join(r.chain) or module}: {why}")
+                    return got
+                except names.Fallback as exc2:
+                    self.notes.append(f"{'.'.join(r.chain) or module}: no state narrowing "
+                                      f"({exc2})")
         if wide_error is not None:
             raise wide_error
         return wide
@@ -390,6 +411,149 @@ class Selector:
             readers &= touch
         shown = ", ".join(sorted(change.names)) or "lambda bodies"
         return readers | in_tests | direct, f"names {shown} → {n_sites} reader sites"
+
+    # ── import-time state (selector/state.py) ──────────────────────────────────
+
+    def _state_diff(self) -> dict | None:
+        """What the commit changes in the state sqlglot builds at import (once per commit)."""
+        if self._state is False:
+            patched = {}
+            for fp in self._files:
+                if fp.path.startswith("sqlglot/") and fp.path.endswith(".py") and fp.old_path:
+                    try:
+                        patched[fp.path] = diff.apply(self._old_text(fp.path), fp)
+                    except diff.PatchError:
+                        self._state = None
+                        return None
+            snapshot = Path(os.environ.get("BR_STATE", state.DEFAULT_PATH))
+            self._state = state.diff(self.sqlglot, snapshot, patched)
+        return self._state  # type: ignore[return-value]
+
+    def _by_state(self, path: str, r: classify.Region,
+                  wide: set[int] | None) -> tuple[set[int], str]:
+        """Tests that can observe what the edit changes in import-time state (idea I16).
+
+        Class-creation consumers (metaclass `__new__`, `__init_subclass__`, calls handed the
+        class at import, call-valued table entries) are followed by running them:
+        `state.diff` imports the old and the patched package and lists every module global
+        and class attribute whose value differs: the edited ones and all values derived
+        from them. For each changed value, its readers (name sites, names.py):
+
+          * run-time reads of a class attribute → tests that ran the line AND can hold the
+            class: users of the class / its subclasses / its outer classes (classes map,
+            which credits bases), or tests that ran a line naming the class;
+          * … unless objects of the class are built at import, the hierarchy is not in the
+            classes map, or the read is dynamic → tests that ran the line ∩ the users of
+            the owner class / its file (as in `_by_names`);
+          * run-time reads of a module global → tests that ran the line;
+          * reads at import → their products are themselves in the diff (the line map still
+            adds any test that ran the line later);
+          * reads in code whose result is cached across tests → Fallback;
+          * reads in test code → as in `_by_names`.
+        """
+        found = self._state_diff()
+        if found is None:
+            raise names.Fallback("import-state diff unavailable")
+        changed = [k.split(" ", 2) for k in found["changed"]]
+        own_module = _module_of(path)
+        own = (f"{own_module}:{'.'.join(r.chain)}" if r.kind == "class" else own_module)
+        if not any(kind == ("C" if r.kind == "class" else "M") and owner == own
+                   for kind, owner, _ in changed):
+            # the edit must show up: else the snapshot is blind to it
+            raise names.Fallback(f"no import-time change seen in {own}")
+        index = self._index()
+        info, with_instances = found["info"], set(found["instances"])
+        touch = set(wide) if wide is not None else set()
+        free: set[int] = set()  # readers of module globals
+        loose: set[int] = set()  # class-attribute readers restricted only by `touch`
+        held: set[int] = set()  # class-attribute readers among tests that can hold the class
+        in_tests: set[int] = set()
+        n_sites = 0
+        owners: dict[str, tuple] = {}
+        for kind, owner, attr in changed:
+            if attr.startswith("__") and attr.endswith("__"):
+                raise names.Fallback(f"{owner}.{attr} is a special name")
+            if kind == "M":
+                owner_path = self._module_path(owner)
+                if owner_path is None:
+                    raise names.Fallback(f"module {owner} not found")
+                chain: tuple[str, ...] = ()
+                users = None
+            else:
+                if owner not in owners:
+                    owners[owner] = self._class_owner(owner, info, with_instances, index)
+                owner_path, chain, users = owners[owner]
+                touch |= self.maps.whole_file(owner_path) | self._class_users(
+                    _module_of(owner_path), [chain])
+            for site in index.sites(attr, owner_path, chain, True):
+                n_sites += 1
+                if site.path.startswith("tests/") and not site.dynamic:
+                    if site.when == "run":
+                        in_tests |= self.maps.span(site.path, *site.lines)
+                    else:  # test-module import code: every test of that file depends on it
+                        in_tests |= self._by_file.get(site.path, set()) | set(
+                            self.maps.test_imports.get(site.path))
+                    continue
+                if site.when == "def" and site.memo:
+                    raise names.Fallback(f"{attr} read in code cached across tests ({site.what})")
+                got = self.maps.span(site.path, *site.lines)
+                if kind == "M":
+                    free |= got
+                elif users is None or site.dynamic:
+                    loose |= got
+                else:
+                    held |= got & users
+        # Class-attribute reads stay within the users of the owner classes and their files
+        # (the bound `_by_names` relies on); `held` narrows that further.
+        got = free | ((loose | held) & touch) | in_tests
+        if not got:
+            raise names.Fallback("no test ran a line reading a changed value")
+        shown = sorted({f"{o.rsplit(':', 1)[-1]}.{a}" for _, o, a in changed})
+        more = f" +{len(shown) - 6}" if len(shown) > 6 else ""
+        return got, (f"state: {', '.join(shown[:6])}{more} → {n_sites} reader sites "
+                     f"(globals {len(free)}, unrestricted {len(loose & touch)}, "
+                     f"held {len(held)}, tests {len(in_tests)})")
+
+    def _module_path(self, module: str) -> str | None:
+        base = module.replace(".", "/")
+        for rel in (f"{base}.py", f"{base}/__init__.py"):
+            if (self.sqlglot / rel).is_file():
+                return rel
+        return None
+
+    def _class_owner(self, key: str, info: dict, with_instances: set[str],
+                     index: nameindex.NameIndex) -> tuple[str, tuple[str, ...], set[int] | None]:
+        """(source path, class chain, tests that can hold the class; None: do not restrict)
+        for a changed class. A class made by `type(...)` at import (a dialect's default
+        Tokenizer) stands for its nearest ancestor defined in the source."""
+        meta = info.get(key)
+        if not meta:
+            raise names.Fallback(f"no class info for {key}")
+        mro = [k for k in meta["mro"] if k]
+        real = key if meta["real"] else next((k for k in mro if not k.endswith("#")), "")
+        module, _, qual = real.partition(":")
+        path = self._module_path(module) if module.startswith("sqlglot") else None
+        if path is None or not qual or "<" in qual:
+            raise names.Fallback(f"{key}: no class in the source")
+        chain = tuple(qual.split("."))
+        family = index.check_class(path, chain)  # Fallback: bases / decorators outside view
+        if {key, real} & with_instances:
+            return path, chain, None  # objects built at import: a test need not make one
+        if not ({key, real, *mro} & TRACKED_ROOTS):
+            return path, chain, None  # the classes map does not record this hierarchy
+        users: set[int] = set()
+        for p, ch in family:  # the class, its subclasses and their outer classes
+            users |= self._class_users(_module_of(p), [ch])
+            if len(ch) == 1:  # class attributes that hold it (`Parser = MySQLParser`)
+                for hp, hch in index.holders(ch[0]):
+                    users |= self._class_users(_module_of(hp), [hch])
+            for site in index.mentions(ch[0]):  # lines that name the class (or its outer)
+                if site.typecheck:
+                    continue  # isinstance(x, C) does not hand C on
+                users |= self.maps.span(site.path, *site.lines)
+                if site.path.startswith("tests/") and site.when == "def":
+                    users |= self._by_file.get(site.path, set())
+        return path, chain, users
 
     def _seconds(self, numbers: set[int]) -> float:
         return sum(self._secs.get(n, 0.0) for n in numbers)
