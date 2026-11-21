@@ -763,7 +763,9 @@ class SubTest:
                 os._exit(code)
         os.close(wfd)
         import select as _select
-        deadline = time.monotonic() + budget * 2 + 2
+        # the CPU itimers bound the child; the wall deadline only guards a stuck child. r26:
+        # budget * 2 + 2 cut verifications short on a loaded machine (wall >> CPU) → keep
+        deadline = time.monotonic() + budget * 6 + 10
         chunks = []
         with os.fdopen(rfd, "rb") as fh:
             while True:
