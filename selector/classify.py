@@ -33,7 +33,7 @@ class Region:
     signature: bool = False  # function: a decorator / def line changed
     classes: tuple[tuple[str, ...], ...] = ()  # enclosing class chains, innermost last
     via_def: tuple[str, ...] = ()  # class: the definition-time def that put us here
-    is_lambda: bool = False  # function: a lambda, whose first line is also its definition
+    is_lambda: bool = False  # function: span starts on a `lambda` line (also runs at creation)
 
 
 @dataclass
@@ -148,10 +148,13 @@ def _function_region(s: _Scope, line_in_scope: int | None) -> Region:
         enclosing = s.chain[:-1]
         return Region("class", enclosing, classes=s.classes, via_def=s.chain)
     if s.kind == "lambda":
-        return Region("function", s.chain, lambda_call_lines(s.node), False, s.classes)
+        span = lambda_call_lines(s.node)
+        # is_lambda: the span starts on the `lambda` line, which also runs at creation.
+        return Region("function", s.chain, span, False, s.classes,
+                      is_lambda=span[0] == s.node.lineno)
     first = s.body_start if s.kind == "def" else s.start
     sig = s.kind == "def" and line_in_scope is not None and line_in_scope < s.body_start
-    return Region("function", s.chain, (first, s.end), sig, s.classes, is_lambda=s.kind == "lambda")
+    return Region("function", s.chain, (first, s.end), sig, s.classes)
 
 
 def _region_for_old_line(old: Scopes, line: int) -> Region:
