@@ -37,8 +37,10 @@ class Unrecordable(Exception):
 
 
 # ── elided containers (inputs too big to snapshot) ─────────────────────────────────────────
-# When a call's input is over the size cap, `dumps_in(..., elide=K)` writes every list / dict /
-# set (exact type) with more than K items as an `Elided` stand-in that only knows its length.
+# When a call's input is over the size cap, `dumps_in(..., elide=K, elide_tuple=KT)` writes every
+# list / dict / set (exact type) with more than K items, and every tuple with more than KT
+# items, as an `Elided` stand-in that only knows its length. (A stand-in tuple that was a dict
+# key or set member is hashed while loading: that input fails to load and is not ok.)
 # A stand-in answers len() and bool() like the real container did at the call. ANY other use
 # (item access, iteration, comparison, hashing, attribute lookup incl. __class__, arithmetic,
 # builtins called on it such as type()/id()/isinstance() (replay watches CALL events), pickling
@@ -293,12 +295,15 @@ class _ElidingInPickler(InPickler):
     offer exact lists / dicts / sets to reducer_override). The same container always gets the
     same id, and loads_in() returns one stand-in per id, so aliasing survives."""
 
+    elide_tuple = None  # tuples with more items than this are elided too
+
     def persistent_id(self, obj):
         t = type(obj)
-        if t in _ELIDE_TYPES and len(obj) > self.elide:
+        if (t in _ELIDE_TYPES and len(obj) > self.elide) or (
+                t is tuple and self.elide_tuple is not None and len(obj) > self.elide_tuple):
             hit = self.elided.get(id(obj))
             if hit is None:
-                hit = self.elided[id(obj)] = (obj, (_ELIDE_TYPES[t], len(obj), len(self.elided)))
+                hit = self.elided[id(obj)] = (obj, (t.__name__, len(obj), len(self.elided)))
             return ("elided",) + hit[1]
         return None
 
@@ -369,6 +374,10 @@ class FastCmpPickler(pickle.Pickler):
         t = type(obj)
         if t is str:
             return obj.encode("utf-8", "surrogatepass")
+        if self.elided and t is not Elided:
+            hit = self.elided.get(id(obj))
+            if hit is not None and hit[0] is obj:
+                return ("e",) + hit[1]
         if t is tuple:
             return ("t",) + obj
         if t is frozenset:
@@ -377,10 +386,6 @@ class FastCmpPickler(pickle.Pickler):
             return ("b", bytearray(obj))
         if t is Elided:
             return ("e",) + elided_key(obj)
-        if self.elided:
-            hit = self.elided.get(id(obj))
-            if hit is not None and hit[0] is obj:
-                return ("e",) + hit[1]
         return None
 
     def reducer_override(self, obj):
@@ -411,7 +416,7 @@ class _CappedBuffer(io.BytesIO):
 
 
 def dumps_in(value, cap: float = float("inf"), elide: int | None = None,
-             elided: dict | None = None) -> bytes:
+             elided: dict | None = None, elide_tuple: int | None = None) -> bytes:
     """Pickle a call's input. Raises TooBig as soon as it is known to be over `cap` bytes.
     With `elide`, list / dict / set with more than `elide` items are written as stand-ins and
     listed in `elided` (id -> (obj, key)); the caller keeps that dict for the effect digest."""
@@ -421,6 +426,7 @@ def dumps_in(value, cap: float = float("inf"), elide: int | None = None,
     else:
         p = _ElidingInPickler(buf, protocol=5)
         p.elide, p.elided = elide, (elided if elided is not None else {})
+        p.elide_tuple = elide_tuple
     p.dump(value)
     data = buf.getvalue()
     if len(data) > cap:

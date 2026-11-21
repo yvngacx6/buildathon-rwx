@@ -109,7 +109,13 @@ def _watch_calls(on: bool) -> None:
         _MON.set_events(_MON_TOOL, 0)
 
 
-def phase_name(p) -> str:
+_KINDS = ("SETUP", "CALL", "TEARDOWN")
+
+
+def phase_name(p, tests=()) -> str:
+    """"IMPORT" / "OTHER", or "<kind>|<test id>" (store: int test number * 3 + kind)."""
+    if isinstance(p, int):
+        return f"{_KINDS[p % 3]}|{tests[p // 3]}"
     return p if isinstance(p, str) else f"{p[0]}|{p[1]}"
 
 
@@ -139,7 +145,8 @@ def run_request(req: dict) -> dict:
 
     out = {"bail": None, "codes": {}, "stats": {}}
     store = zipfile.ZipFile(req["store"])
-    index = pickle.loads(store.read("index.pkl"))["functions"]
+    meta = pickle.loads(store.read("index.pkl"))
+    index, tests = meta["functions"], meta.get("tests", ())
 
     plan = []  # (key str, store entry, old code, new code, module name)
     swaps = []  # (old code, new code)
@@ -281,6 +288,7 @@ def run_request(req: dict) -> dict:
                 set_mode(True)
                 with _cpu_limit(min(max(0.0, deadline - time.process_time()), 10 * cpu_old + 0.2) + 0.01):
                     d_new, side_new, cpu_new = run(new_code, module, data)
+                d_old, d_new = d_old[:len(recorded)], d_new[:len(recorded)]
                 ok = (d_old == recorded == d_new and side_old == side_new
                       and cpu_new <= 5 * cpu_old + 0.05)
                 if DEBUG and not ok:
@@ -303,7 +311,7 @@ def run_request(req: dict) -> dict:
                 v = "incomplete"
             else:
                 v = "ok" if all(verdict[i] for i in idxs) else "bad"
-            info["phases"][phase_name(phase)] = v
+            info["phases"][phase_name(phase, tests)] = v
     out["stats"] = {"blobs": n_blobs, "ok": n_ok, "cpu_s": round(time.process_time() - t_start, 3)}
     return out
 

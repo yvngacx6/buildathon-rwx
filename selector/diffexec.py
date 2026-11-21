@@ -171,13 +171,14 @@ class DiffExec:
             with zipfile.ZipFile(self.store) as zf:
                 meta = pickle.loads(zf.read("index.pkl"))
             self._idx = meta["functions"]
+            self._tests = meta.get("tests", ())
             self._failed = set(meta.get("failed", ()))
         return self._idx
 
     def _possible(self, jobs) -> set[int] | None:
         """Candidates that the replay could drop at best: for every changed function, the test
         has a recorded phase, all its phases and its classmates' SETUP phases are complete, and
-        all calls outside tests are complete (u/<n>.pkl). Only a gate before the replay."""
+        all calls outside tests are complete (c/<n>.pkl "uses"). Only a gate before the replay."""
         import pickle
         import zipfile
         self._index()
@@ -191,11 +192,13 @@ class DiffExec:
         with zipfile.ZipFile(self.store) as zf:
             names = set(zf.namelist())
             for dead, n in entries:
-                if dead or f"u/{n}.pkl" not in names:
+                if dead or f"c/{n}.pkl" not in names:
                     return None  # old store layout or dead (precheck covers dead)
-                uses = pickle.loads(zf.read(f"u/{n}.pkl"))
+                uses = pickle.loads(zf.read(f"c/{n}.pkl"))["uses"]
                 bad, seen = set(), set()
                 for ph, v in uses.items():
+                    if isinstance(ph, int):
+                        ph = (("SETUP", "CALL", "TEARDOWN")[ph % 3], self._tests[ph // 3])
                     if not isinstance(ph, tuple):
                         if v is None:
                             return set()

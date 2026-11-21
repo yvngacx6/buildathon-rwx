@@ -39,6 +39,8 @@ INPUT_CAP = int(float(os.environ.get("DIFFEXEC_INPUT_CAP", "16e3")))  # one call
 # An input over INPUT_CAP is pickled again with every list / dict / set of more than ELIDE_K
 # items replaced by a length-only stand-in (serial.Elided). Still over: phase incomplete.
 ELIDE_K = int(os.environ.get("DIFFEXEC_ELIDE_K", "32"))
+_ETK = os.environ.get("DIFFEXEC_ELIDE_TUPLE_K", "")  # elide long tuples too (default: off)
+ELIDE_TUPLE_K = int(_ETK) if _ETK else None
 # Safety only (worker-dependent): pickling seconds per function per worker. Default: off.
 TIME_CAP = float(os.environ.get("DIFFEXEC_TIME_CAP", "inf"))
 # The effect digest (pure-Python pickler, ~85 % of recording time) is taken for the first
@@ -156,7 +158,7 @@ def _start(code, offset):
             rec.big = True
             elided = {}
             try:
-                data = serial.dumps_in((vals, cells), INPUT_CAP, ELIDE_K, elided)
+                data = serial.dumps_in((vals, cells), INPUT_CAP, ELIDE_K, elided, ELIDE_TUPLE_K)
             except serial.TooBig:
                 data = None
     except BaseException:
@@ -325,10 +327,13 @@ def pytest_sessionfinish(session):
     mon.set_events(TOOL, 0)
     for code in recs:
         mon.set_local_events(TOOL, code, 0)
-    out = {}
-    for rec in recs.values():
-        out[rec.key] = {"dead": rec.dead, "calls": rec.calls, "secs": rec.secs, "nbytes": rec.nbytes,
-                        "blobs": rec.blobs, "uses": rec.uses}
+    # A pickle stream (build.py reads it function by function, so merging stays small):
+    # header {"stats", "failed", "format": 2}, then one (key, record) per function, then None.
     wid = os.environ.get("DIFFEXEC_TAG") or os.environ.get("PYTEST_XDIST_WORKER", "main")
     with open(os.path.join(OUT, f"rec_{wid}.pkl"), "wb") as fh:
-        pickle.dump({"recs": out, "stats": stats, "failed": sorted(failed_tests)}, fh, protocol=5)
+        pickle.dump({"stats": stats, "failed": sorted(failed_tests), "format": 2}, fh, protocol=5)
+        for rec in recs.values():
+            pickle.dump((rec.key, {"dead": rec.dead, "calls": rec.calls, "secs": rec.secs,
+                                   "nbytes": rec.nbytes, "blobs": rec.blobs, "uses": rec.uses}),
+                        fh, protocol=5)
+        pickle.dump(None, fh, protocol=5)

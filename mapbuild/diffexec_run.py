@@ -67,9 +67,11 @@ def main() -> None:
     if any(not r[2] for r in counted):
         sys.exit(f"FATAL: census failed for {[r[0] for r in counted if not r[2]]}")
     import pickle
+    sys.path.insert(0, str(repo))
+    from diffexec.build import _records
     calls: dict = {}
     for p in census.glob("rec_*.pkl"):
-        for key, r in pickle.loads(p.read_bytes())["recs"].items():
+        for key, r in _records(str(p))[1]:
             calls[key] = calls.get(key, 0) + r["calls"]
     cap = int(os.environ.get("DIFFEXEC_CALL_CAP", "50000"))
     skip = {k for k, n in calls.items() if n > cap}
@@ -113,8 +115,12 @@ def main() -> None:
         "build_command": "mapbuild/diffexec_build.sh",
         "granularity": "one pytest process per test file; caps applied after merging",
         "caps": {"calls_per_function": int(os.environ.get("DIFFEXEC_CALL_CAP", "50000")),
-                 "distinct_input_bytes_per_function": int(float(os.environ.get("DIFFEXEC_BYTE_CAP", "300e3"))),
-                 "bytes_per_input": int(float(os.environ.get("DIFFEXEC_INPUT_CAP", "16e3")))},
+                 "bytes_per_input": int(float(os.environ.get("DIFFEXEC_INPUT_CAP", "16e3"))),
+                 "elide_containers_over_items": int(os.environ.get("DIFFEXEC_ELIDE_K", "32")),
+                 "recorded_input_bytes_per_function_per_file": int(float(os.environ.get("DIFFEXEC_REC_BYTE_CAP", "2e6"))),
+                 "store_budget": float(os.environ.get("DIFFEXEC_STORE_BUDGET", "13.5e6")),
+                 "stakes_power": float(os.environ.get("DIFFEXEC_STAKES_POWER", "1.5")),
+                 "expensive_test_s": float(os.environ.get("DIFFEXEC_EXPENSIVE_S", "0.5"))},
         "test_files": len(files),
         "jobs": a.j,
         "record_wall_seconds": round(record_wall),
