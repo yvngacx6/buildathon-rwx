@@ -333,7 +333,7 @@ def run_request(req: dict) -> dict:
         side = (handler.got, [(w.category.__name__, str(w.message)) for w in warned], stdout.getvalue())
         return digest, side, cpu
 
-    n_blobs = n_ok = 0
+    n_blobs = n_ok = n_late = n_bytes = 0
     for key, entry, old_code, new_code, module, subst in plan:
         info = {"state": "ok", "phases": {}}
         out["codes"][key] = info
@@ -354,7 +354,9 @@ def run_request(req: dict) -> dict:
         overtime = False
         for data, recorded, status in rec["blobs"]:
             n_blobs += 1
+            n_bytes += len(data)
             if overtime or status != "ok" or recorded is None or time.process_time() > deadline:
+                n_late += status == "ok" and recorded is not None
                 verdict.append(False)
                 continue
             try:
@@ -388,7 +390,7 @@ def run_request(req: dict) -> dict:
             else:
                 v = "ok" if all(verdict[i] for i in idxs) else "bad"
             info["phases"][phase_name(phase, tests)] = v
-    out["stats"] = {"blobs": n_blobs, "ok": n_ok, "cpu_s": round(time.process_time() - t_start, 3)}
+    out["stats"] = {"blobs": n_blobs, "ok": n_ok, "late": n_late, "bytes": n_bytes, "cpu_s": round(time.process_time() - t_start, 3)}
     return out
 
 

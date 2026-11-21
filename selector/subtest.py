@@ -388,7 +388,8 @@ class SubTest:
                 os._exit(code)
         os.close(wfd)
         import select as _select
-        deadline = time.monotonic() + budget * 2 + 2
+        from .diffexec import wall_guard
+        deadline = time.monotonic() + wall_guard(budget)
         chunks = []
         with os.fdopen(rfd, "rb") as fh:
             while True:
@@ -441,13 +442,14 @@ class SubTest:
         if not todo:
             return chosen, f"subtest: {sorted(chosen)} dropped (no query runs a touched statement)"
         try:
-            ok = self.verify(jobs, todo, min(BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0))
+            cap = min(BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0)
+            ok = self.verify(jobs, todo, cap)
         except Exception as e:  # noqa: BLE001
             return set(), f"subtest: keep ({type(e).__name__})"
         if not ok:
-            return set(), f"subtest: keep (verification of {len(todo)} queries failed, {self.last_child:.2f}s)"
+            return set(), f"subtest: keep (verification of {len(todo)} queries failed, {self.last_child:.2f}s, est {est:.2f}, cap {cap:.2f})"
         return chosen, (f"subtest: {sorted(chosen)} dropped ({len(todo)} queries re-run,"
-                        f" {self.last_child:.2f}s)")
+                        f" {self.last_child:.2f}s, est {est:.2f}, cap {cap:.2f})")
 
     def _cpu(self, x):
         suite, i, opt = x

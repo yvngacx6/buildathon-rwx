@@ -273,7 +273,7 @@ def run_child(root: str, patched: dict[str, str], everything: bool,
         proc = subprocess.run([sys.executable, "-P", "-s", "-S", "-c", _RUN, root,
                                "1" if everything else "0", str(budget)],
                               input=json.dumps(patched), capture_output=True, text=True,
-                              env=env, timeout=budget * 2 + 5, cwd="/")
+                              env=env, timeout=4 * budget + 30, cwd="/")
     except (OSError, subprocess.SubprocessError):
         return None, 0.0
     finally:
