@@ -14,8 +14,8 @@ Test ids are pytest node ids exactly as in `tests.json` `"id"` (for example
 | File | Key | Value: tests that … |
 |---|---|---|
 | `lines.json.gz` | `"<repo path>:<line>"`, e.g. `"sqlglot/parser.py:812"` | executed that line **while the test ran** (from the start of its setup: `setUpClass`, `setUp`, body, teardown; process-pool work traced inline with pickle round-trip), **outside any module-body execution**. Lines that ran only because a module was imported (at startup, at collection, or lazily inside the test) are left out: use `import_time` and `classes` for those |
-| `lines_phase.json.gz` | same | like `lines`, but also keeps lines run by imports that happened during the test (lazy dialect loads). Reference only |
-| `lines_full.json.gz` | same | everything the test's own interpreter executed, including `import sqlglot` and collection. Reference only |
+| `lines_phase.json.gz` | same | like `lines`, but also keeps lines run by imports that happened during the test (lazy dialect loads). Reference only: **not shipped** (repo size limit); `mapbuild/build.sh` writes it, nothing at build or run time reads it |
+| `lines_full.json.gz` | same | everything the test's own interpreter executed, including `import sqlglot` and collection. Reference only: **not shipped**, as `lines_phase` |
 | `classes.json.gz` | `"<module>.<Qualname>"`, e.g. `"sqlglot.dialects.tsql.TSQL"` | instantiated that class or a subclass of it (MRO), or used it as a dialect |
 | `classes_run.json.gz` | same as `classes` | like `classes`, minus objects made while a sqlglot/ module body executed (import-time templates / tables; the state snapshot's `holders` lists the entries that hold those). Built by `mapbuild/classes_run.py` from the same traces |
 | `reads.json.gz` | `"<repo path>"`, e.g. `"tests/fixtures/optimizer/simplify.sql"` | opened that file for reading |

@@ -84,5 +84,12 @@
   "tests_failed_while_recorded": 1,
   "bytes": 13102711,
   "sha256": "bb6d6d09ee865a16a8017523cab086319b23d63543620d3dacce72de7eec5021"
+ },
+ "not_shipped": {
+  "files": [
+   "lines_phase.json.gz",
+   "lines_full.json.gz"
+  ],
+  "why": "reference-only maps, removed from the repo for the 20 MB limit (r8-diffexec2); mapbuild/build.sh rebuilds them; keys/bytes/sha256 above describe the removed files"
  }
 }
