@@ -315,7 +315,7 @@ class Selector:
         if lost:
             # A removed/renamed module- or class-level name breaks its importers and callers
             # (ImportError at collection, AttributeError at call): `_removed_bindings`.
-            gone, gone_why = self._removed_bindings(path, old_tree, lost)
+            gone, gone_why = self._removed_bindings(path, old_tree, new_tree, lost)
         removed, added = diff.changed_lines(fp)
         found = classify.regions(old_tree, new_tree, removed, added, same,
                                  self._old_scopes(path))
@@ -342,7 +342,7 @@ class Selector:
             return self._library(path, old_tree, new_tree, found, new_text)
         raise AllTests(f"{path}: .py outside sqlglot/ and tests/")
 
-    def _removed_bindings(self, path: str, old_tree: ast.Module,
+    def _removed_bindings(self, path: str, old_tree: ast.Module, new_tree: ast.Module,
                           lost: set[str]) -> tuple[set[int], str]:
         """Module- or class-level defs / assignments the patch removes or renames (idea I26).
 
@@ -361,10 +361,16 @@ class Selector:
             readers of each changed value in the import-state diff (`_state_readers`).
         Raises AllTests (→ import bound) for removed classes and imports (registries and
         re-exports the name scan cannot follow), special names, names the state snapshot
-        does not see, reads in code cached across tests, and an unavailable diff."""
+        does not see, reads in code cached across tests, an unavailable diff, and other
+        edits of the file's class / module bodies the diff cannot see (a class head: the
+        snapshot does not compare bases; a statement other than def / class / assignment:
+        its effects may lie outside sqlglot's state)."""
         why = f"{path}: binding removed ({', '.join(sorted(lost)[:3])})"
         if not path.startswith("sqlglot/"):
             raise AllTests(why)
+        unseen = _unseen_body_change(old_tree, new_tree)
+        if unseen:
+            raise AllTests(f"{why}: {unseen}")
         kinds = _binding_kinds(old_tree)
         module = _module_of(path)
         index = self._index()
@@ -1360,6 +1366,38 @@ def _bindings(tree: ast.Module) -> set[str]:
     """Names bound at module level and in class bodies (nested classes included), as
     dotted paths: `func`, `Class`, `Class.attr`, `Class.method`. Function bodies are skipped."""
     return set(_binding_kinds(tree))
+
+
+def _unseen_body_change(old_tree: ast.Module, new_tree: ast.Module) -> str | None:
+    """A module- or class-body edit the import-state diff cannot show: a changed class head
+    (bases, keywords, decorators), or a changed statement that is not a def, a class or an
+    assignment. None if there is none."""
+    plain = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign,
+             ast.AugAssign)
+
+    def classes(tree: ast.Module) -> dict[tuple[str, ...], ast.ClassDef]:
+        out: dict[tuple[str, ...], ast.ClassDef] = {}
+        todo: list[tuple[list[ast.stmt], tuple[str, ...]]] = [(tree.body, ())]
+        while todo:
+            body, chain = todo.pop()
+            for node in body:
+                if isinstance(node, ast.ClassDef):
+                    out[chain + (node.name,)] = node
+                    todo.append((node.body, chain + (node.name,)))
+        return out
+
+    def others(body: list[ast.stmt]) -> list[str]:
+        return [ast.dump(s) for s in body if not isinstance(s, plain)]
+
+    old, new = classes(old_tree), classes(new_tree)
+    for chain in old.keys() & new.keys():
+        if classify._class_head(old[chain]) != classify._class_head(new[chain]):
+            return f"class {'.'.join(chain)}: bases / keywords / decorators changed"
+        if others(old[chain].body) != others(new[chain].body):
+            return f"class {'.'.join(chain)}: a statement other than def / class / assignment changed"
+    if others(old_tree.body) != others(new_tree.body):
+        return "a module-level statement other than def / class / assignment changed"
+    return None
 
 
 def _from_module(path: str, node: ast.ImportFrom) -> str:

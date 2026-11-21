@@ -223,3 +223,15 @@ def test_removed_name_read_in_cached_code_falls_back(selector):
     got, why = run(selector, "    CACHED = 2\n", "")
     assert "cached across tests" in why
     assert got >= set(TSQL_USERS)
+
+
+def test_removal_with_a_changed_class_head_is_not_narrowed(selector):
+    # The snapshot does not compare bases: Other's attributes now shadow for TSQL objects.
+    old = DIALECT
+    new = old.replace("def keywords(self):", "def keywords2(self):", 1).replace(
+        "class TSQL(Dialect):", "class TSQL(Dialect, Other):", 1)
+    text = "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
+                                        f"a/{D}", f"b/{D}"))
+    got, why = selector.select(text)
+    assert "bases / keywords / decorators changed" in why, why
+    assert got == selector.all_numbers()
