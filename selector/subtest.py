@@ -66,10 +66,13 @@ def digest_table(table) -> str:
     return h.hexdigest()
 
 
-def run_query(q: dict, schema: dict, tables: dict, opt: bool):
-    """Outputs of one query: (exec digest | None, duck sql | None, opt duck sql | None)."""
+def run_query(q: dict, schema: dict, tables: dict, opt: bool, mode: str = "full"):
+    """Outputs of one query: (exec digest | None, duck sql | None, opt duck sql | None).
+
+    mode "ck" (r26): run execute() only up to its Plan(...) call and return the digest of the
+    optimized tree Plan would get (tree_digest) in place of the result digest."""
     from sqlglot import find_tables, parse_one, transpile
-    from sqlglot.executor import execute
+    import sqlglot.executor as executor
 
     out_exec = out_duck = out_opt = None
     if not opt:
@@ -78,14 +81,104 @@ def run_query(q: dict, schema: dict, tables: dict, opt: bool):
         expr = pickle.loads(pickle.dumps(parse_one(q["sql"])))
     if q["execute"] and not opt:
         used = {t.name: tables[t.name] for t in find_tables(expr)}
-        res = execute(expr, schema=schema, tables=used)
-        res = pickle.loads(pickle.dumps(res))
-        out_exec = digest_table(res)
+        if mode == "ck":
+            real = executor.Plan
+            executor.Plan = _stop_at_plan
+            try:
+                executor.execute(expr, schema=schema, tables=used)
+                raise RuntimeError("execute did not reach Plan")
+            except _AtPlan as stop:
+                out_exec = stop.digest
+            finally:
+                executor.Plan = real
+        else:
+            res = executor.execute(expr, schema=schema, tables=used)
+            res = pickle.loads(pickle.dumps(res))
+            out_exec = digest_table(res)
         out_duck = transpile(q["sql"], write="duckdb")[0]
     if opt:
         out_duck = transpile(q["sql"], write="duckdb")[0]
         out_opt = transpile(q["optimized"], write="duckdb")[0]
     return out_exec, out_duck, out_opt
+
+
+# ── r26: the optimized-tree checkpoint ────────────────────────────────────────
+# execute() = ensure_tables, ensure_schema, optimize (+ an eager expression.sql(pretty=True)
+# for a debug log), then Plan(expression) and PythonExecutor(...).execute(plan): ~85% of the
+# CPU. When no touched statement runs from the Plan call on (coverage phase "xrun", recorded
+# at build) and the tree handed to Plan is identical to the pinned one, the rest of the query
+# runs the pinned code on the pinned input: its result is the pinned result.
+
+class _AtPlan(BaseException):
+    def __init__(self, digest):
+        self.digest = digest
+
+
+def _stop_at_plan(expression):
+    raise _AtPlan(tree_digest(expression))
+
+
+class Unknown(Exception):
+    pass
+
+
+_SIMPLE = (type(None), bool, int, float, str, bytes)
+
+
+def tree_digest(root) -> str:
+    """Structural digest of an expression tree, without running any sqlglot code (no
+    __hash__ / __eq__ / sql() / pickle): node classes, args in order, list structure,
+    comments, _type, _meta, arg_key / index, the parent link, whether the hash is cached,
+    shared nodes, any instance __dict__. Anything else → Unknown."""
+    import enum
+    from sqlglot.expressions import Expr
+    h = hashlib.blake2b(digest_size=16)
+    upd = h.update
+    seen: dict[int, int] = {}
+    stack = [root]
+    END = object()
+    while stack:
+        x = stack.pop()
+        if x is END:
+            upd(b")")
+            continue
+        t = type(x)
+        if t in _SIMPLE:
+            upd(f"{t.__name__}:{x!r}\x00".encode())
+        elif t is list or t is tuple:
+            upd(f"{t.__name__}{len(x)}(".encode())
+            stack.append(END)
+            stack.extend(reversed(x))
+        elif t is dict:
+            upd(f"dict{len(x)}(".encode())
+            stack.append(END)
+            for k, v in reversed(list(x.items())):
+                if type(k) is not str:
+                    raise Unknown("dict key")
+                stack.append(v)
+                stack.append(k)
+        elif isinstance(x, Expr):
+            i = seen.get(id(x))
+            if i is not None:
+                upd(f"ref{i}\x00".encode())
+                continue
+            seen[id(x)] = len(seen)
+            p = getattr(x, "parent", None)
+            pi = "N" if p is None else seen.get(id(p), -1)
+            upd(f"E{t.__module__}.{t.__qualname__}|p{pi}|h{getattr(x, '_hash', None) is None}(".encode())
+            stack.append(END)
+            stack.append(getattr(x, "__dict__", None))
+            stack.append(getattr(x, "_meta", None))
+            stack.append(getattr(x, "_type", None))
+            stack.append(getattr(x, "comments", None))
+            stack.append(getattr(x, "index", None))
+            stack.append(getattr(x, "arg_key", None))
+            stack.append(x.args)
+        elif isinstance(x, enum.Enum):
+            upd(f"enum{t.__module__}.{t.__qualname__}.{x.name}\x00".encode())
+        else:
+            raise Unknown(t.__qualname__)
+    return h.hexdigest()
 
 
 # ── build ─────────────────────────────────────────────────────────────────────
@@ -221,13 +314,35 @@ def build(root: Path, out: Path) -> None:
                 phases["parse"] = cov.stop()
                 outs = {}
                 if q["execute"]:
-                    cov = _Cov(prefix)
-                    cov.start()
+                    import sqlglot.executor as executor
+                    real = executor.Plan
+                    box = {}
+
+                    def at_plan(expression):
+                        # r26: the checkpoint; coverage before Plan ("xopt") / from it ("xrun")
+                        box["xopt"] = box["cov"].stop()
+                        try:
+                            box["ck"] = tree_digest(expression)
+                        except Unknown:
+                            box["ck"] = None
+                        box["cov"] = _Cov(prefix)
+                        box["cov"].start()
+                        return real(expression)
+
+                    executor.Plan = at_plan
+                    box["cov"] = _Cov(prefix)
+                    box["cov"].start()
                     used = {t.name: tables[suite][t.name] for t in find_tables(e2)}
                     res = execute(e2, schema=schemas[suite], tables=used)
                     res = pickle.loads(pickle.dumps(res))
-                    phases["exec"] = cov.stop()
+                    phases["xrun"] = box["cov"].stop()
+                    executor.Plan = real
+                    phases["xopt"] = box["xopt"]
+                    phases["exec"] = {
+                        f: sorted(set(phases["xopt"].get(f, ())) | set(phases["xrun"].get(f, ())))
+                        for f in set(phases["xopt"]) | set(phases["xrun"])}
                     outs["exec"] = digest_table(res)
+                    outs["ck"] = box["ck"]
                 cov = _Cov(prefix)
                 cov.start()
                 outs["duck"] = transpile(q["sql"], write="duckdb")[0]
@@ -251,6 +366,14 @@ def build(root: Path, out: Path) -> None:
                 t2 = time.process_time()
                 return a, b, t1 - t0, t2 - t1
 
+            def timed_ck(q=q):
+                t0 = time.process_time()
+                try:
+                    c = run_query(q, schemas[suite], tables[suite], False, "ck")
+                except Unknown:
+                    c = None
+                return c, time.process_time() - t0
+
             try:
                 phases, outs = _in_fork(traced)
                 if suite == "tpch":
@@ -263,9 +386,17 @@ def build(root: Path, out: Path) -> None:
                     a[1] == (outs["duck"] if q["execute"] else None))
                 if b is not None:
                     stable = stable and b[1] == outs["duck"] and b[2] == outs["opt"]
+                # r26 checkpoint: usable only if its tree digest is reproducible in a fresh
+                # process (else the query always runs in full)
+                cpu_ck = None
+                if q["execute"] and outs.get("ck"):
+                    c, cpu_ck = _in_fork(timed_ck)
+                    if c is None or c[0] != outs["ck"] or c[1] != outs["duck"]:
+                        outs["ck"], cpu_ck = None, None
             except RuntimeError:  # e.g. RecursionError at the worker's limit: never used
-                phases, outs, cpu_exec, cpu_opt, stable = {}, {}, 0.0, 0.0, False
-            q.update(phases=phases, outs=outs, cpu_exec=cpu_exec, cpu_opt=cpu_opt, stable=stable)
+                phases, outs, cpu_exec, cpu_opt, stable, cpu_ck = {}, {}, 0.0, 0.0, False, None
+            q.update(phases=phases, outs=outs, cpu_exec=cpu_exec, cpu_opt=cpu_opt, stable=stable,
+                     cpu_ck=cpu_ck)
             queries.append(q)
             print(f"{suite} {len(queries)} exec={q['execute']} cpu={cpu_exec:.2f}/{cpu_opt:.2f}"
                   f" stable={stable}", file=sys.stderr)
@@ -336,8 +467,10 @@ class SubTest:
                 self._meta = {}
         return self._meta
 
-    def plan(self, spans: dict, numbers: set[int]):
-        """→ ({number: [(suite, query index, opt)]}, cpu estimate s) or None (cannot)."""
+    def plan(self, spans: dict, numbers: set[int], ck_ok: bool = False):
+        """→ ({number: [(suite, query index, opt, mode)]}, cpu estimate s) or None (cannot).
+        mode "ck": the query runs no touched statement from execute's Plan call on, so it is
+        verified up to there (run_query mode "ck") when `ck_ok`."""
         meta = self.meta()
         if not meta:
             return None
@@ -357,10 +490,13 @@ class SubTest:
                 else:
                     hit = _hit(ph["opt"], spans)
                 if hit:
-                    if not q["stable"]:
-                        return None
-                    todo.append((suite, i, kind == "optimized"))
-                    cpu += q["cpu_opt"] if kind == "optimized" else q["cpu_exec"]
+                    mode = "full"
+                    if (kind == "execute" and q["execute"] and ck_ok and "xrun" in ph
+                            and q.get("cpu_ck") is not None and q["outs"].get("ck")
+                            and not _hit(ph["xrun"], spans)):
+                        mode = "ck"
+                    todo.append((suite, i, kind == "optimized", mode))
+                    cpu += self._cpu(todo[-1])
             out[n] = todo
         return out, cpu
 
@@ -388,7 +524,9 @@ class SubTest:
                 os._exit(code)
         os.close(wfd)
         import select as _select
-        deadline = time.monotonic() + budget * 2 + 2
+        # CPU caps (itimers) bound the child; the wall deadline only guards a stuck child on a
+        # loaded machine (r26: budget * 2 + 2 cut verifications short under load)
+        deadline = time.monotonic() + budget * 6 + 10
         chunks = []
         with os.fdopen(rfd, "rb") as fh:
             while True:
@@ -419,40 +557,116 @@ class SubTest:
         if not cands or not spans:
             return set(), ""
         try:
-            got = self.plan(spans, cands)
+            got = self.plan(spans, cands, ck_allowed(str(self.sel.sqlglot), jobs, spans))
         except Exception as e:  # noqa: BLE001
             return set(), f"subtest: keep ({type(e).__name__})"
         if got is None:
             return set(), "subtest: keep (set-up touched / unknown / unstable)"
         per, cpu = got
-        # cheapest first: drop the tests whose verification pays off
-        chosen, todo, est = set(), [], 0.0
-        for n in sorted(per, key=lambda n: sum(self._cpu(x) for x in per[n])):
-            qs = [x for x in per[n] if x not in todo]
-            c = sum(self._cpu(x) for x in qs) + (0.3 if qs and not todo else 0.0)  # fork, swap, tables
-            trial = chosen | {n}
-            spend = SCORER_SLOWDOWN * (est + c)
-            gain = benefit_of(trial)
-            if gain > 0 and spend <= min(BUDGET_S, SHARE * gain / 1000):
-                chosen, est = trial, est + c
-                todo.extend(qs)
+        # r26: every subset of the (at most 3) candidates, best net saving: a test alone may
+        # save nothing (tpch next to tpcds) yet pay off together with the others
+        import itertools
+        best = (0.0, set(), [], 0.0)
+        nums = sorted(per)
+        for r in range(1, len(nums) + 1):
+            for subset in itertools.combinations(nums, r):
+                todo = []
+                for n in subset:
+                    todo.extend(x for x in per[n] if x not in todo)
+                est = sum(self._cpu(x) for x in todo) + (0.3 if todo else 0.0)  # fork, swap, tables
+                spend = SCORER_SLOWDOWN * est
+                gain = benefit_of(set(subset))
+                if gain > 0 and spend <= min(BUDGET_S, SHARE * gain / 1000):
+                    net = gain / 1000 - spend
+                    if net > best[0]:
+                        best = (net, set(subset), todo, est)
+        _, chosen, todo, est = best
         if not chosen:
-            return set(), f"subtest: keep (est {cpu:.1f}s CPU for {sum(map(len, per.values()))} queries)"
+            ck = sum(1 for v in per.values() for x in v if x[3] == "ck")
+            return set(), (f"subtest: keep (est {cpu:.1f}s CPU for {sum(map(len, per.values()))}"
+                           f" queries, {ck} checkpointed)")
         if not todo:
             return chosen, f"subtest: {sorted(chosen)} dropped (no query runs a touched statement)"
         try:
             ok = self.verify(jobs, todo, min(BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0))
         except Exception as e:  # noqa: BLE001
             return set(), f"subtest: keep ({type(e).__name__})"
+        nck = sum(1 for x in todo if x[3] == "ck")
         if not ok:
-            return set(), f"subtest: keep (verification of {len(todo)} queries failed, {self.last_child:.2f}s)"
-        return chosen, (f"subtest: {sorted(chosen)} dropped ({len(todo)} queries re-run,"
-                        f" {self.last_child:.2f}s)")
+            return set(), (f"subtest: keep (verification of {len(todo)} queries ({nck} checkpointed)"
+                           f" failed, {self.last_child:.2f}s)")
+        return chosen, (f"subtest: {sorted(chosen)} dropped ({len(todo)} queries re-run, {nck}"
+                        f" checkpointed, {self.last_child:.2f}s)")
 
     def _cpu(self, x):
-        suite, i, opt = x
+        suite, i, opt, mode = x
         q = self.meta()["suites"][suite][i]
-        return q["cpu_opt"] if opt else q["cpu_exec"]
+        if opt:
+            return q["cpu_opt"]
+        return q["cpu_ck"] if mode == "ck" else q["cpu_exec"]
+
+
+def ck_allowed(root: str, jobs, spans) -> bool:
+    """The checkpoint compares only the tree handed to Plan. Not when the patch can reach the
+    run phase another way: the executor package / planner (ensure_tables builds the executor's
+    tables before optimize), or a changed function that writes state it does not own
+    (global / nonlocal, attribute or item stores on a name that is not local)."""
+    for path in list(spans) + [j[0] for j in jobs]:
+        if path.startswith("sqlglot/executor/") or path == "sqlglot/planner.py":
+            return False
+    for path, new_text, _ in jobs:
+        try:
+            with open(os.path.join(root, path), encoding="utf-8") as fh:
+                old_text = fh.read()
+            if not _local_writes_only(old_text, new_text):
+                return False
+        except (OSError, SyntaxError, ValueError):
+            return False
+    return True
+
+
+def _functions(text: str) -> dict:
+    out = {}
+
+    def visit(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                key = f"{prefix}{child.name}"
+                if not isinstance(child, ast.ClassDef):
+                    out.setdefault(key, []).append(child)
+                visit(child, key + ".")
+            else:
+                visit(child, prefix)
+    visit(ast.parse(text), "")
+    return out
+
+
+def _local_writes_only(old_text: str, new_text: str) -> bool:
+    """Each changed (or new) function of the new text: no global / nonlocal, no attribute /
+    subscript store or delete whose base name is not a parameter or local of it."""
+    old = {k: [ast.dump(f) for f in v] for k, v in _functions(old_text).items()}
+    for key, fns in _functions(new_text).items():
+        for j, fn in enumerate(fns):
+            if j < len(old.get(key, ())) and old[key][j] == ast.dump(fn):
+                continue
+            nodes = list(ast.walk(fn))
+            local = set()
+            for n in nodes:
+                if isinstance(n, (ast.Global, ast.Nonlocal)):
+                    return False
+                if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                    local.add(n.id)
+                elif isinstance(n, ast.arg):
+                    local.add(n.arg)
+            for n in nodes:
+                if isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(
+                        n.ctx, (ast.Store, ast.Del)):
+                    base = n.value
+                    while isinstance(base, (ast.Attribute, ast.Subscript)):
+                        base = base.value
+                    if not (isinstance(base, ast.Name) and base.id in local):
+                        return False
+    return True
 
 
 def _swap(root: str, jobs) -> str | None:
@@ -536,11 +750,12 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
     import contextlib
     tables: dict = {}
     with zipfile.ZipFile(store) as zf:
-        for suite, i, opt in todo:
+        for suite, i, opt, mode in todo:
             q = meta["suites"][suite][i]
             # each query (with its table loading): at most 3x its pinned CPU + 0.8 s, else the
             # child ends (→ keep)
-            signal.setitimer(signal.ITIMER_PROF, 3 * (q["cpu_opt"] if opt else q["cpu_exec"]) + 0.8)
+            pinned_cpu = q["cpu_opt"] if opt else (q["cpu_ck"] if mode == "ck" else q["cpu_exec"])
+            signal.setitimer(signal.ITIMER_PROF, 3 * pinned_cpu + 0.8)
             tabs = {}
             if q["execute"] and not opt:
                 from sqlglot import find_tables, parse_one
@@ -552,10 +767,10 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
                     tabs[t.name] = tables[key]
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 try:
-                    got = run_query(q, meta["schemas"][suite], tabs, opt)
-                except Exception:  # noqa: BLE001
+                    got = run_query(q, meta["schemas"][suite], tabs, opt, mode)
+                except Exception:  # noqa: BLE001  (Unknown included)
                     return False
-            want = (q["outs"].get("exec") if not opt else None,
+            want = (q["outs"].get("ck" if mode == "ck" else "exec") if not opt else None,
                     (q["outs"]["duck"] if (q["execute"] or opt) else None),
                     q["outs"].get("opt") if opt else None)
             if got != want:
