@@ -67,6 +67,8 @@ FILES = {
     "sqlglot/third.py": "from sqlglot.other import SHARED\n",
     "sqlglot/fourth.py": "VALUE = 1\n",
     "sqlglot/fifth.py": "from sqlglot.fourth import VALUE\n\n\ndef f():\n    return VALUE\n",
+    "sqlglot/seventh.py": ("_CACHE = {}\n\n\ndef get(key):\n    if key not in _CACHE:\n"
+                           "        _CACHE[key] = key * 2\n    return _CACHE[key]\n"),
     "sqlglot/sixth.py": "class P:\n    F = {\n        \"a\": lambda x: (\n            x + 1\n        ),\n    }\n",
     "tests/conftest.py": "import pytest\n",
     "tests/test_lib.py": TEST,
@@ -86,7 +88,8 @@ ALL = set(range(5))
 MAPS = {
     "lines": {"sqlglot/lib.py:10": [C], "sqlglot/lib.py:13": [C], "sqlglot/lib.py:14": [D],
               "sqlglot/other.py:4": [A], "sqlglot/parser.py:5": [B],
-              "sqlglot/fifth.py:5": [B], "sqlglot/sixth.py:3": [D], "sqlglot/sixth.py:4": [C]},
+              "sqlglot/fifth.py:5": [B], "sqlglot/sixth.py:3": [D], "sqlglot/sixth.py:4": [C],
+              "sqlglot/seventh.py:5": [C, D], "sqlglot/seventh.py:6": [C], "sqlglot/seventh.py:7": [C, D]},
     "classes": {"sqlglot.lib.Dialect": [A]},
     "reads": {"tests/fixtures/q.sql": [B]},
     "test_imports": {"tests/helpers.py": [A, B]},
@@ -190,6 +193,13 @@ def test_slow_test_kept_for_a_lambda_region(tmp_path):
     # A lambda in a class-level dict has no enclosing def body: whole-lambda rule.
     selector = make_selector(tmp_path, slow=(D,))
     assert run(selector, edit("sqlglot/sixth.py", "x + 1", "x + 2")) == {C, D, U}
+
+
+def test_slow_test_kept_when_the_function_fills_a_module_cache(tmp_path):
+    # The map credits the cache fill (line 6) to whichever test ran first in the process;
+    # D, which only read the cache in the mapping run, may be the first one in the real run.
+    selector = make_selector(tmp_path, slow=(D,))
+    assert run(selector, edit("sqlglot/seventh.py", "key * 2", "key * 3")) == {C, D, U}
 
 
 def test_signature_change_adds_class_users(selector):

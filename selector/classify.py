@@ -233,7 +233,10 @@ def touched_statements(region: Region, old: Scopes, new: Scopes) -> tuple[tuple[
       * statements were added, removed, split or merged (a body changed length);
       * a nested def / class header changed (it runs whenever the outer body reaches it);
       * a touched statement binds different names, has a global / nonlocal, or adds or
-        removes a yield (each of these changes code outside the touched statement).
+        removes a yield (each of these changes code outside the touched statement);
+      * the def writes state that outlives one call (_writes_shared_state): then a
+        statement run by an earlier test in the same process (a cache fill) can change
+        what a later test sees, and the map credits it only to whichever test ran first.
     """
     if region.kind != "function" or region.signature or region.via_def:
         return None
@@ -242,7 +245,7 @@ def touched_statements(region: Region, old: Scopes, new: Scopes) -> tuple[tuple[
     if len(olds) != 1 or len(news) != 1 or region.span != (olds[0].body_start, olds[0].end):
         return None
     o, n = olds[0].node, news[0].node
-    if _header(o) != _header(n):
+    if _header(o) != _header(n) or _writes_shared_state(o) or _writes_shared_state(n):
         return None
     spans: list[tuple[int, int]] = []
     if not _diff_bodies(o.body, n.body, spans) or not spans:
@@ -309,6 +312,33 @@ def _bindings(node: ast.AST, depth: int = 0) -> list[tuple[int, str]]:
     for child in ast.iter_child_nodes(node):
         out += _bindings(child, inner)
     return sorted(out)
+
+
+def _writes_shared_state(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Does the def store into module- or class-level objects (caches, registries)?
+
+    True for `global` / `nonlocal`, and for an item or attribute store / delete whose root
+    object is not a local of the def (a module-level name, a call result) or is the `cls`
+    of a classmethod. Stores rooted at other parameters (`self.x = ...`, `node.args[k] = ...`)
+    count as per-call state: the object comes from the caller.
+    """
+    params = {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}
+    params |= {a.arg for a in (fn.args.vararg, fn.args.kwarg) if a}
+    if any(isinstance(d, ast.Name) and d.id == "classmethod" for d in fn.decorator_list):
+        first = (fn.args.posonlyargs + fn.args.args)[:1]
+        params -= {a.arg for a in first}
+    local = params | {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)
+                      and isinstance(n.ctx, ast.Store)}
+    for node in ast.walk(fn):
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            return True
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and not isinstance(node.ctx, ast.Load):
+            root = node.value
+            while isinstance(root, (ast.Attribute, ast.Subscript)):
+                root = root.value
+            if not (isinstance(root, ast.Name) and root.id in local):
+                return True
+    return False
 
 
 def _yields(node: ast.AST) -> bool:
