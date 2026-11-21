@@ -78,6 +78,10 @@ OVERHEAD = float(os.environ.get("BR_VERIFY_OVERHEAD", "0.12"))  # fork + import 
 PER_FILE = float(os.environ.get("BR_VERIFY_PER_FILE", "0.025"))  # import + collect a test module
 PER_SECOND = float(os.environ.get("BR_VERIFY_PER_SECOND", "1.4"))  # CPU per recorded test second
 SERVER_START = 0.25  # python + pytest import, paid once per batch if anything is verified
+# The batch runs only if its expected gain clears the server start by this much: the model is
+# rough (r5-verify, E012: single-test runs cost 0.20-0.27 s, not 0.15), so a batch of one or two
+# marginal runs is more often a loss than a gain.
+MIN_BATCH_GAIN = float(os.environ.get("BR_VERIFY_MIN_BATCH", "1.0"))
 P_FAIL = float(os.environ.get("BR_VERIFY_P_FAIL", "0.6"))
 P_FAIL_DATA = float(os.environ.get("BR_VERIFY_P_FAIL_DATA", "0.9"))
 MARGIN = float(os.environ.get("BR_VERIFY_MARGIN", "0.0"))
@@ -85,7 +89,8 @@ MARGIN = float(os.environ.get("BR_VERIFY_MARGIN", "0.0"))
 WALL_BUDGET = float(os.environ.get("BR_VERIFY_WALL", "60"))
 HARD_END = float(os.environ.get("BR_VERIFY_HARD_END", "90"))
 CPU_BUDGET = float(os.environ.get("BR_VERIFY_CPU", "40"))
-KILL_MIN, KILL_FACTOR = 2.0, 3.0  # kill after max(KILL_MIN, KILL_FACTOR x estimate) s
+KILL_MIN = float(os.environ.get("BR_VERIFY_KILL_MIN", "1.0"))
+KILL_FACTOR = float(os.environ.get("BR_VERIFY_KILL_FACTOR", "2.0"))  # kill after max(KILL_MIN, KILL_FACTOR x estimate) s
 
 # Eval only (eval/verify_audit.py): verify every runnable commit whose estimate is at most
 # AUDIT_MAX_EST seconds, ignoring the cost policy, to check fidelity and calibrate the model.
@@ -216,7 +221,7 @@ def refine(plans: list[Plan], tests: list[dict], sqlglot: Path, started: float) 
         todo = [p for p in plans if p.expected > p.estimate + MARGIN]
     if todo and not AUDIT:
         # The server start is paid once; skip it all if the total gain does not cover it.
-        if sum(p.expected - p.estimate for p in todo) <= SERVER_START:
+        if sum(p.expected - p.estimate for p in todo) <= max(SERVER_START, MIN_BATCH_GAIN):
             todo = []
     log(f"{len(plans)} runnable, {len(todo)} worth running")
     if not todo:
