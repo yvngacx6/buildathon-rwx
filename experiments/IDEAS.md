@@ -21,3 +21,4 @@ Source refs: `research/FINDINGS.md`, `research/PLAN.md`, `research/agent-reports
 | I12 | Differential execution: record each function's inputs during the pinned-commit test run; at run time, run old vs new function on those inputs; a test whose recorded calls all give identical results cannot fail | todo | Ambitious. Attacks "edit changes nothing" commits (12/30 in sample) that still select tpcds. |
 | I13 | Bytecode-equivalence filter (compile old/new function; equal co_code+consts → no-op) | todo | Wider than AST filter, still structural. |
 | I14 | Oracle-gap report in eval: per commit, our cost − oracle cost, sorted | todo | Drives every round. |
+| I15 | Native (Rust/Zig) selector for CPU; first: precompute at build + fast formats in Python | parked | Allowed ("any language"). Worth ~1–2 s; matters only for the final 1-s tie rule. Revisit late if CPU > 0.5 s. |
