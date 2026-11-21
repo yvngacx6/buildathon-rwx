@@ -141,6 +141,8 @@ def sites(fname):
                     return
             if isinstance(n, ast.Attribute) and n.attr == fname or isinstance(n, ast.Name) and n.id == fname:
                 yield_.append((p, stmt, 'ref', n, not in_func))
+            if isinstance(n, ast.alias) and n.name.rsplit('.', 1)[-1] == fname and n.asname and n.asname != fname:
+                yield_.append((p, stmt, 'alias', n, not in_func))  # `import f as g`: calls of g unseen
             if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value == fname:
                 yield_.append((p, stmt, 'str', n, not in_func))
             for c in ast.iter_child_nodes(n):

@@ -4,7 +4,7 @@ import json, os, re, shutil, subprocess, sys, glob
 M = '/w/m16/dm'
 SG = '/w/sg'
 res = {}
-for fn in sorted(glob.glob(f'{M}/m*.json'), key=lambda s: int(re.findall(r'm(\d+)', s)[-1])):
+for fn in [x for x in sorted(glob.glob(f'{M}/m*.json'), key=lambda s: int(re.findall(r'm(\d+)', s)[-1])) if int(re.findall(r'm(\d+)', x)[-1]) >= int(os.environ.get('START', '0'))]:
     m = json.load(open(fn))
     tag = os.path.basename(fn)[:-5]
     work = f'/w/sgm'
@@ -14,9 +14,10 @@ for fn in sorted(glob.glob(f'{M}/m*.json'), key=lambda s: int(re.findall(r'm(\d+
     open(f"{work}/{m['path']}", 'w').write(m['new'])
     ids = open(f'{M}/{tag}.ids').read().split()
     p = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', '-p', 'no:randomly',
-                        '-rf', '-o', 'addopts=', '--no-header'] + ids, cwd=work, capture_output=True, text=True,
+                        '-rfE', '-o', 'addopts=', '--no-header'] + ids, cwd=work, capture_output=True, text=True,
                        env=dict(os.environ, PYTHONHASHSEED='0', PYTHONDONTWRITEBYTECODE='1'), timeout=1500)
-    failed = set(re.findall(r'^FAILED (\S+?)(?: - |$)', p.stdout, re.M))
+    open(f'{M}/{tag}.out', 'w').write(p.stdout)
+    failed = set(re.findall(r'^(?:FAILED|SUBFAIL|ERROR) (\S+?)(?: - | \[|$)', p.stdout, re.M))
     failed = {f.split('[')[0] for f in failed}
     tests = json.load(open('/w/repo/sample/tests.json'))['tests']
     num = {t['id']: t['number'] for t in tests}

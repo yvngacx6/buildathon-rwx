@@ -19,8 +19,8 @@
     a default, e.g. `errors.ERROR_MESSAGE_CONTEXT_DEFAULT`.
   - **Offline re-score:** labeled 67.6 s saved over 123 code commits (≈ **13 s/40**), 0 misses (6 applicable).
     Unlabeled P+Q: 282 s saved over 400 code commits (≈ **17 s/40**).
-  - **Mutant soundness check:** default flips run on EC2; results in §4.
-- **Expected gain for R-DEF on the practice board ≈ −10 to −15 s; P(works, no new misses) ≈ 0.75.** The default-edit
+  - **Mutant soundness check:** 14 default-flip mutants, 131 failing tests, **0 outside the rule**, 367 dropped tests passed (§4).
+- **Expected gain for R-DEF on the practice board ≈ −10 to −15 s; P(works, no new misses) ≈ 0.8.** The default-edit
   mutant family recurs: 2 of 34 practice_like, 3 of 89 private, and 11 + 11 of 200 + 200 P/Q code commits.
 
 ## 1. Where the R23 residual goes (labeled, code kind; `an3.py`)
@@ -82,7 +82,30 @@ See `16-tools/mkdefmut.py` and `dmver.py`.
 - **Labels:** run the rule's tests plus the dropped tests (non-slow) on the mutated tree.
 - **Pass condition:** no failure outside the rule.
 
-RESULTS: (pending; filled in below)
+**Results (EC2, pinned image).**
+
+| | count |
+|---|---|
+| mutants | 14 |
+| mutants with failing tests | 5 (131 failing tests) |
+| failures outside the rule | **0** |
+| tests dropped by the rule (run, all passed) | 367 |
+
+| mutant | ran the function | rule keeps | failing | outside rule |
+|---|---|---|---|---|
+| `_parse_select.parse_subquery_alias` | 1155 | 1121 | 123 | 0 |
+| `to_dot.include_dots` | 30 | 16 | 2 | 0 |
+| `clickhouse._parse_function.anonymous` | 99 | 58 | 2 | 0 |
+| `_parse_wrapped.optional` | 319 | 200 | 1 | 0 |
+| `schema._find.raise_on_missing` | 239 | 209 | 3 | 0 |
+| `merge_ctes.leave_tables_isolated` | 96 | 0 | 0 | – |
+| `_parse_withdata.no` | 5 | 0 | 0 | – |
+| `date_delta_to_binary_interval_op.cast` | 17 | 0 | 0 | – |
+
+- Mutants m0 and m1 were parsed with an older failure regex. Their summary lines show no failures at all.
+- **Caveat on the instruction-level numbers (§1).** Hits were attributed in a single process.
+  setUp/setUpClass hits count for the whole class, and hits outside any test count for all tests.
+  Hits through lazy caches can be under-counted, so −6.9 s is an upper bound.
 
 ## 5. Recommendation
 Implement R-DEF in `_library`'s signature branch (~120 lines, reuse `nameindex` sites instead of the
