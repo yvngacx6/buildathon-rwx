@@ -484,159 +484,162 @@ def _hit(lines_by_file: dict, spans: dict) -> bool:
 
 # ── stage guard: no checkpoint shortcut for code that may write shared state ─────────────
 #
-# The checkpoint compares the optimized tree, not global state. A changed function (old or new
-# version, nested defs included) that can write state outside its own call — module / class
-# attributes, cached instances, objects reached through imports or closures — makes the query
-# go the whole way (full re-run). Allowed write targets: names created in the function from a
-# fresh container / literal, and query-local objects passed in (parameters other than self /
-# cls; `self` only in classes of sqlglot/optimizer/, which are built per optimize call).
+# The checkpoint compares the optimized tree, not global state. If a changed function (old or
+# new version; for a nested def, its outermost enclosing def, so closures resolve) can write
+# state that outlives its call, the query goes the whole way (full re-run, as r17):
+#   * `global` / `nonlocal`, setattr / delattr / exec / eval / globals() / vars() / __import__
+#   * a store, del, augmented assignment or mutating method call (append, update, set, ...)
+#     whose base is a non-local object: a module-level name, builtin or import, `cls`, `self`
+#     outside sqlglot/optimizer/ (dialect / generator / parser / schema instances are cached and
+#     reused), or a local name bound to one of those by alias (x = MOD.TABLE, from m import X,
+#     for x in GLOBAL..., with GLOBAL as x)
+# Parameters and names bound from them / from calls of plain functions count as query-local:
+# the objects the optimizer works on are the query's tree and scopes, compared by the digest.
+# Not covered (documented gap, as r17's cross-query reuse): an unchanged callee that writes
+# global state on the changed function's behalf.
 
 _MUTATORS = {"append", "extend", "insert", "pop", "popitem", "remove", "clear", "update",
              "setdefault", "add", "discard", "sort", "reverse", "__setitem__", "__delitem__",
              "__setattr__", "__delattr__", "difference_update", "intersection_update",
              "symmetric_difference_update", "appendleft", "extendleft", "popleft", "rotate",
-             "move_to_end", "cache_clear", "set", "replace"}
-_FRESH_CALLS = {"dict", "list", "set", "tuple", "frozenset", "defaultdict", "deque",
-                "OrderedDict", "Counter", "copy", "deepcopy"}
+             "move_to_end", "cache_clear", "set", "replace", "append_comments", "add_comments",
+             "pop_comments", "set_meta"}
+_BAD_CALLS = {"setattr", "delattr", "exec", "eval", "globals", "vars", "__import__", "locals"}
 
 
 def _defs(tree):
-    """{(qualname, occurrence): def node} for every function / lambda in a module."""
+    """{(qualname, occurrence): (def node, outermost enclosing def node)}."""
     out, seen = {}, {}
 
-    def visit(node, prefix):
+    def visit(node, prefix, outer):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
                 name = prefix + (child.name if not isinstance(child, ast.Lambda) else "<lambda>")
                 k = seen.get(name, 0)
                 seen[name] = k + 1
-                out[(name, k)] = child
-                visit(child, name + ".<locals>.")
+                out[(name, k)] = (child, outer or child)
+                visit(child, name + ".<locals>.", outer or child)
             elif isinstance(child, ast.ClassDef):
-                visit(child, prefix + child.name + ".")
+                visit(child, prefix + child.name + ".", outer)
             else:
-                visit(child, prefix)
+                visit(child, prefix, outer)
 
-    visit(tree, "")
+    visit(tree, "", None)
     return out
 
 
 def _root(node):
-    while isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
-        node = node.value
-    return node
+    """Base name of a.b[c].d(...).e chains (through method calls, not plain-function calls)."""
+    while True:
+        if isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
+            node = node.value
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            node = node.func.value
+        else:
+            return node
 
 
 def _writes_shared(fn, in_optimizer: bool) -> str | None:
-    """Why `fn` may write state outside its own call, or None."""
-    args = fn.args
-    params = [a.arg for a in args.posonlyargs + args.args + args.kwonlyargs]
-    params += [a.arg for a in (args.vararg, args.kwarg) if a is not None]
-    first = params[0] if params else None
-    bound: dict[str, bool] = {}  # local name → every binding is a fresh object
+    """Why `fn` (whole subtree) may write state that outlives its call, or None."""
     nodes = list(ast.walk(fn))
+    params: set[str] = set()
+    for n in nodes:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            a = n.args
+            params.update(p.arg for p in a.posonlyargs + a.args + a.kwonlyargs)
+            params.update(p.arg for p in (a.vararg, a.kwarg) if p is not None)
+    shared_self = "self" if not in_optimizer else None
 
-    def fresh(v):
-        if isinstance(v, (ast.Dict, ast.List, ast.Set, ast.Tuple, ast.Constant, ast.ListComp,
-                          ast.DictComp, ast.SetComp, ast.GeneratorExp, ast.JoinedStr)):
-            return True
-        if isinstance(v, ast.Call):
-            f = v.func
-            name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else ""
-            return name in _FRESH_CALLS
-        return False
+    # local bindings: name → [value expressions] (None: an import, i.e. a shared module object)
+    binds: dict[str, list] = {}
+
+    def bind(target, value):
+        for x in ast.walk(target):
+            if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
+                binds.setdefault(x.id, []).append(value if isinstance(target, ast.Name) else value)
 
     for n in nodes:
         if isinstance(n, (ast.Global, ast.Nonlocal)):
             return "global / nonlocal"
         if isinstance(n, (ast.Import, ast.ImportFrom)):
             for a in n.names:
-                bound[(a.asname or a.name).split(".")[0]] = False  # module objects are shared
+                binds.setdefault((a.asname or a.name).split(".")[0], []).append(None)
         elif isinstance(n, ast.Assign):
             for t in n.targets:
-                for x in ast.walk(t):
-                    if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
-                        bound[x.id] = bound.get(x.id, True) and isinstance(t, ast.Name) and fresh(n.value)
-        elif isinstance(n, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
-            t = n.target
-            if isinstance(t, ast.Name):
-                bound[t.id] = bound.get(t.id, True) and n.value is not None and fresh(n.value) \
-                    and not isinstance(n, ast.AugAssign)
-        elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension, ast.With, ast.AsyncWith,
-                            ast.ExceptHandler)):
-            tgts = []
-            if isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
-                tgts = [n.target]
-            elif isinstance(n, (ast.With, ast.AsyncWith)):
-                tgts = [i.optional_vars for i in n.items if i.optional_vars is not None]
-            elif n.name:
-                bound[n.name] = False
-            for t in tgts:
-                for x in ast.walk(t):
-                    if isinstance(x, ast.Name):
-                        bound[x.id] = False  # loop / with targets may alias anything
+                bind(t, n.value)
+        elif isinstance(n, (ast.AnnAssign, ast.NamedExpr)) and n.value is not None:
+            bind(n.target, n.value)
+        elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+            bind(n.target, n.iter)
+        elif isinstance(n, (ast.With, ast.AsyncWith)):
+            for it in n.items:
+                if it.optional_vars is not None:
+                    bind(it.optional_vars, it.context_expr)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            binds.setdefault(n.name, []).append(ast.Constant(None))
         elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n is not fn:
-            bound[n.name] = True
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                a = n.args
-                for p in a.posonlyargs + a.args + a.kwonlyargs:
-                    bound.setdefault(p.arg, False)
-        elif isinstance(n, ast.Lambda) and n is not fn:
-            for p in n.args.args:
-                bound.setdefault(p.arg, False)
+            binds.setdefault(n.name, []).append(ast.Constant(None))
 
-    def target_ok(t) -> str | None:
+    shared: dict[str, bool] = {}
+
+    def is_shared(name: str, depth: int = 0) -> bool:
+        if name in ("cls",) or name == shared_self:
+            return True
+        if name in params and name not in binds:
+            return False
+        if name not in binds:
+            return True  # module-level name, builtin or closure of the module
+        if name in shared:
+            return shared[name]
+        shared[name] = False  # cycles: assume local until shown otherwise
+        res = False
+        for v in binds[name]:
+            if v is None:
+                res = True  # import
+                break
+            r = _root(v)
+            if isinstance(r, ast.Name) and depth < 20 and r.id != name and is_shared(r.id, depth + 1):
+                res = True
+                break
+        shared[name] = res
+        return res
+
+    def target_shared(t) -> str | None:
         if isinstance(t, (ast.Tuple, ast.List)):
             for e in t.elts:
-                why = target_ok(e)
+                why = target_shared(e)
                 if why:
                     return why
             return None
-        if isinstance(t, ast.Starred):
-            return target_ok(t.value)
         if isinstance(t, ast.Name):
             return None
         r = _root(t)
-        if not isinstance(r, ast.Name):
-            return "store through an expression"
-        name = r.id
-        if name in params:
-            if name in ("self", "cls") or (name == first and fn is not None and name == "cls"):
-                return None if (name == "self" and in_optimizer) else f"store on {name}"
-            return None  # a query-local object passed in
-        if bound.get(name):
-            return None
-        return f"store on non-local {name}"
+        if isinstance(r, ast.Name):
+            return f"writes {r.id}" if is_shared(r.id) else None
+        return "writes through an expression" if not isinstance(r, ast.Call) else None
 
     for n in nodes:
+        targets = []
         if isinstance(n, ast.Assign):
-            for t in n.targets:
-                why = target_ok(t)
-                if why:
-                    return why
-        elif isinstance(n, (ast.AugAssign, ast.AnnAssign)):
-            if n.value is not None or isinstance(n, ast.AugAssign):
-                why = target_ok(n.target)
-                if why:
-                    return why
+            targets = n.targets
+        elif isinstance(n, (ast.AugAssign, ast.AnnAssign)) and (n.value is not None or isinstance(n, ast.AugAssign)):
+            targets = [n.target]
         elif isinstance(n, ast.Delete):
-            for t in n.targets:
-                why = target_ok(t)
-                if why:
-                    return why
+            targets = n.targets
         elif isinstance(n, (ast.For, ast.AsyncFor)):
-            why = target_ok(n.target)
-            if why:
-                return why
+            targets = [n.target]
         elif isinstance(n, ast.Call):
             f = n.func
-            if isinstance(f, ast.Name) and f.id in ("setattr", "delattr", "exec", "eval",
-                                                    "globals", "vars", "__import__"):
+            if isinstance(f, ast.Name) and f.id in _BAD_CALLS:
                 return f"calls {f.id}"
             if isinstance(f, ast.Attribute) and f.attr in _MUTATORS:
-                why = target_ok(ast.Attribute(value=f.value, attr=f.attr, ctx=ast.Store()))
-                if why:
-                    return f"{f.attr}(): {why}"
+                r = _root(f.value)
+                if isinstance(r, ast.Name) and is_shared(r.id):
+                    return f"{f.attr}() on {r.id}"
+        for t in targets:
+            why = target_shared(t)
+            if why:
+                return why
     return None
 
 
@@ -650,12 +653,12 @@ def stage_guard(root: str, jobs) -> str | None:
         in_opt = path.startswith("sqlglot/optimizer/")
         for k in set(old_defs) | set(new_defs):
             o, n = old_defs.get(k), new_defs.get(k)
-            if o is not None and n is not None and ast.dump(o) == ast.dump(n):
+            if o is not None and n is not None and ast.dump(o[0]) == ast.dump(n[0]):
                 continue
-            for fn in (o, n):
-                if fn is None:
+            for d in (o, n):
+                if d is None:
                     continue
-                why = _writes_shared(fn, in_opt)
+                why = _writes_shared(d[1], in_opt)
                 if why:
                     return f"{k[0]}: {why}"
     return None
