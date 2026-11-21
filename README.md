@@ -71,6 +71,10 @@ Push to a public GitHub repository with the `Dockerfile` at its top, then enter 
 
 ## Note for judges: `maps/diffexec.zip`
 
+**Interim build:** the store on this branch was recorded on a laptop (same sqlglot sha, same
+requirements versions, Python 3.13.12), not in the pinned image; see `maps/MANIFEST.json` →
+`diffexec.status`. The replay that decides runs at run time in the pinned image.
+
 This store comes only from running sqlglot's own test suite at the pinned commit in the
 pinned image (`mapbuild/diffexec_build.sh`). For each sqlglot function, it holds the inputs
 the function was called with during each test, plus a digest of each call's effect. It

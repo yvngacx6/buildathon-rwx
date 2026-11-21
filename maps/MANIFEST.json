@@ -48,5 +48,23 @@
   "facts": "1620 tests each run alone, 244 modules, 0 isolation failures; collection: 160 modules (101 by import). No labeled patch used.",
   "environment_note": "The only except ImportError around a repo import is sqlglot/_version (generated, not in the repo), so optional dependencies cannot change the module closures."
  },
- "classes_run": "classes_run.json.gz: mapbuild/classes_run.py from trace_one.py traces (r6, same image/sha; every trace's classes equals classes.json.gz): classes minus objects made while a sqlglot/ module body executes"
+ "classes_run": "classes_run.json.gz: mapbuild/classes_run.py from trace_one.py traces (r6, same image/sha; every trace's classes equals classes.json.gz): classes minus objects made while a sqlglot/ module body executes",
+ "diffexec": {
+  "file": "diffexec.zip",
+  "status": "LAPTOP-RECORDED (interim). Inputs recorded on a laptop (Python 3.13.12 venv with requirements.lock versions, sqlglot @ pinned sha, PYTHONHASHSEED=0, SKIP_INTEGRATION=0, pytest-xdist -n 14 --dist loadfile). The old-vs-new replay itself runs at run time in the pinned image. To be replaced by the pinned-image recording (mapbuild/diffexec_build.sh).",
+  "what": "per sqlglot function: deduplicated call inputs seen while each test ran, with a digest of each call's effect. Built only from the pinned commit's own test run; no labels, patches or mutants.",
+  "sqlglot_sha": "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
+  "caps": {
+   "calls_per_function": 50000,
+   "distinct_input_bytes_per_function": 300000,
+   "bytes_per_input": 16000,
+   "per_worker_record_caps": "16 kB input, 1 MB distinct bytes, 30 s pickling, 50k calls"
+  },
+  "functions": 6678,
+  "functions_recorded": 3483,
+  "record_cpu_seconds": 8369,
+  "record_wall_seconds": 1556,
+  "bytes": 9161782,
+  "sha256": "5e101e664406bb4060401fe97d75058bd7ecfa174b53b6a0afd89d6585094089"
+ }
 }
