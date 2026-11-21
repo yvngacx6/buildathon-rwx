@@ -26,21 +26,21 @@
   "lines.json.gz": 638319,
   "lines_phase.json.gz": 773709,
   "lines_full.json.gz": 1603966,
-  "classes.json.gz": 63293,
+  "classes.json.gz": 64154,
   "reads.json.gz": 17856,
   "test_imports.json.gz": 17999,
   "import_time.json.gz": 89455,
-  "classes_run.json.gz": 67241
+  "classes_run.json.gz": 67657
  },
  "json_sha256": {
   "lines.json.gz": "abf873bd79f3d4f4d7a867f286d68a3727899ff45d215b6ce73f1f1d7aa05abe",
   "lines_phase.json.gz": "c35eb03ad82c60ec80f24adc8fb372065b1b94bec48e34c71ceb24f17ea2d21e",
   "lines_full.json.gz": "f3c1836531b6602c05747c97e33ec2fb5c069c6d1d07495236e53a296c5727e9",
-  "classes.json.gz": "bd8a8b68f81fabd18f149d10b2197ce94c315c63a73ad14485a518455f58068b",
+  "classes.json.gz": "582f2739689d643eec867719478fc4823f9a3489ee04d7c82109f2cd85451c1d",
   "reads.json.gz": "ec9bac97b1345881da4247eecf485f6bbe6b312d5b8996d62e9d4c1e5b90e262",
   "test_imports.json.gz": "60c49d6b4c070cda176471547825565befb8d1970e0db0125da2a81a0c5515a2",
   "import_time.json.gz": "4c208c9b19b0b50ea325b31036563652cd471bfcd44969ee7091d849cd9e1ed0",
-  "classes_run.json.gz": "d278f6814fb3cc9d3ac133b8bdfa1ee968a3d2a85ac7734f55d6709f93f02b0c"
+  "classes_run.json.gz": "ddf32f27db2af5fbc5763cafab12ac4bc8cfd49a7a07f5b05d2119120da09cb6"
  },
  "imports": {
   "build_command": "SKIP_INTEGRATION=0 python mapbuild/import_map.py sample/tests.json <scratch copy of pinned sqlglot> maps -j4 (--recollect redoes only the collection lists)",
@@ -83,6 +83,9 @@
   },
   "tests_failed_while_recorded": 1,
   "bytes": 13102711,
+  "tests_failed_while_recorded_ids": [
+   "tests/test_dialect_imports.py::TestDialectImports::test_dialect_attribute_access_is_cached"
+  ],
   "sha256": "bb6d6d09ee865a16a8017523cab086319b23d63543620d3dacce72de7eec5021"
  },
  "not_shipped": {
@@ -91,5 +94,6 @@
    "lines_full.json.gz"
   ],
   "why": "reference-only maps, removed from the repo for the 20 MB limit (r8-diffexec2); mapbuild/build.sh rebuilds them; keys/bytes/sha256 above describe the removed files"
- }
+ },
+"dialect_reach": "classes.json.gz and classes_run.json.gz then pass through mapbuild/dialect_reach.py <pinned sqlglot> maps (r12): every test recorded for a dialect class is also recorded for each sqlglot class in the MRO of that dialect's tokenizer_class / jsonpath_tokenizer_class / parser_class / generator_class (metaclass-resolved, inherited ones included). Static relation from the pinned source only; adds rows, never removes; idempotent."
 }
