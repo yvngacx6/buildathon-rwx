@@ -57,7 +57,10 @@ def write(merged: dict, store: str) -> dict:
     os.makedirs(os.path.join(store, "c"), exist_ok=True)
     index = {}
     total = 0
+    max_bytes = float(os.environ.get("DIFFEXEC_BUILD_MAX_BYTES", "inf"))  # size budget per function
     for n, (key, m) in enumerate(sorted(merged.items())):
+        if not m["dead"] and sum(len(b[0]) for b in m["blobs"].values()) > max_bytes:
+            m["dead"] = "bytes"
         if m["dead"]:
             index[key] = (m["dead"], None)
             continue
