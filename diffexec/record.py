@@ -22,6 +22,7 @@ import os
 import pickle
 import sys
 import time
+import tracemalloc as _tracemalloc
 
 from diffexec import serial
 
@@ -97,8 +98,14 @@ def _start(code, offset):
         _kill(rec, "calls")
         mon.set_local_events(TOOL, code, 0)
         return mon.DISABLE
-    frame = sys._getframe(1)
     phase = cur["phase"]
+    if _tracemalloc.is_tracing():
+        # A memory-measuring test (test_generator_memory): recording would distort what it
+        # measures and is ~100x slower under tracemalloc. Mark the phase incomplete (its test
+        # can never be dropped) and do not record.
+        rec.uses[phase] = None
+        return None
+    frame = sys._getframe(1)
     busy[0] = True
     t0 = time.perf_counter()
     try:

@@ -33,6 +33,8 @@ def main() -> None:
     ap.add_argument("--work", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("-j", type=int, default=os.cpu_count())
+    ap.add_argument("--resume", action="store_true",
+                    help="keep per-file recordings already in --work (after an interrupted run)")
     a = ap.parse_args()
     repo = Path(a.out).resolve().parent.parent
     work = Path(a.work)
@@ -43,6 +45,8 @@ def main() -> None:
     def run(f: str):
         tag = f.replace("/", "_").removesuffix(".py")
         t0 = time.time()
+        if a.resume and (work / f"rec_{tag}.pkl").is_file():
+            return f, 0, True, 0.0, "resumed"
         proc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "diffexec.record",
                                "-p", "no:cacheprovider", f],
                               cwd=SQLGLOT, env=dict(env, DIFFEXEC_TAG=tag),
