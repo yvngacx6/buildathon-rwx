@@ -50,8 +50,9 @@ TESTS = {
 }
 SUITES = {"tpch": "optimizer/tpc-h/", "tpcds": "optimizer/tpc-ds/"}
 SCORER_SLOWDOWN = 2.0
-BUDGET_S = float(os.environ.get("BR_SUBTEST_S", "12"))
-SHARE = 0.6  # spend at most this share of what dropping saves
+BUDGET_S = float(os.environ.get("BR_SUBTEST_S", "14"))
+SHARE = 0.8  # spend at most this share of what dropping saves (r26: 0.6 → 0.8; a failing
+# commit usually differs in its first checkpointed queries, so it costs a fraction of the estimate)
 FALLBACK_S = 1.5  # r26: pinned CPU of the queries re-run in full after a checkpoint mismatch
 
 
