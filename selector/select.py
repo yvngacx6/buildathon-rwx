@@ -129,7 +129,12 @@ class Selector:
                 readers |= self.maps.reads.get(p)
             return readers, "fixture → readers"
         if fp.old_path and fp.new_path and fp.old_path != fp.new_path:
-            # The old module is gone; nothing at the pinned commit imports the new path.
+            # The old module is gone; nothing at the pinned commit imports the new path –
+            # unless the new path is one pytest or Python picks up by itself.
+            new = fp.new_path
+            if not (new.endswith(".py") and new.startswith(("sqlglot/", "tests/"))
+                    and name_of(new) not in ALWAYS_ALL and name_of(new) != "__init__.py"):
+                raise AllTests(f"{fp.old_path} renamed to {new}")
             return self._import_bound(fp.old_path, f"{fp.old_path} renamed")
         if name in ALWAYS_ALL:
             raise AllTests(f"{path} is test configuration")
@@ -201,7 +206,7 @@ class Selector:
         if ast.dump(old_tree) == ast.dump(new_tree):
             return set(), "same syntax tree (ignoring comments and docstrings)"
         lost = _bindings(old_tree) - _bindings(new_tree)
-        if lost and not self._unreferenced(path, lost, new_text):
+        if lost:
             # A removed/renamed module- or class-level name breaks every importer or caller
             # (ImportError at collection, AttributeError at call) – far beyond its own tests.
             raise AllTests(f"{path}: binding removed ({', '.join(sorted(lost)[:3])})")
@@ -214,24 +219,6 @@ class Selector:
         if path.startswith("sqlglot/"):
             return self._library(path, old_tree, new_tree, found)
         raise AllTests(f"{path}: .py outside sqlglot/ and tests/")
-
-    def _unreferenced(self, path: str, lost: set[str], new_text: str) -> bool:
-        """True when every removed binding is a plain module-level name (not a class member,
-        not a dunder) that nothing can still reach by name: neither the new module text nor
-        any other file under sqlglot/ or tests/ mentions it (as code or as a string). Then
-        the removal itself is invisible and the edit's other regions decide.
-        """
-        if path.startswith("tests/") or name_of(path) == "__init__.py":
-            return False
-        if any("." in n or n.startswith("__") for n in lost):
-            return False
-        mentions = re.compile(r"\b(" + "|".join(map(re.escape, sorted(lost))) + r")\b")
-        if mentions.search(new_text):
-            return False
-        try:
-            return not self._importers(path, lost)
-        except AllTests:  # star-imported
-            return False
 
     # ── tests/*.py ────────────────────────────────────────────────────────────
 

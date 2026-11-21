@@ -336,10 +336,11 @@ def test_removed_binding_selects_tests_that_load_the_module(bounded):
     assert run(bounded, edit("sqlglot/lib.py", "class Dialect:", "class Dialect2:")) == {A, C, D, U}
 
 
-def test_unreferenced_removed_function_uses_normal_rules(bounded):
-    old = FILES["sqlglot/fifth.py"]
-    new = old.replace("def f():", "def g():")  # nothing else names f
-    assert run(bounded, patch("sqlglot/fifth.py", old, new)) == {B, U}
+def test_rename_onto_conftest_or_init_selects_all(bounded):
+    for target in ("tests/conftest.py", "sqlglot/__init__.py", "setup.py", "sqlglot/x.txt"):
+        text = (f"--- a/sqlglot/other.py\n+++ b/{target}\n@@ -1 +1 @@\n"
+                "-from sqlglot.lib import Dialect\n+from sqlglot.lib import Dialect\n")
+        assert run(bounded, text) == ALL, target
 
 
 def test_module_nothing_loads_selects_only_unknown_tests(bounded):

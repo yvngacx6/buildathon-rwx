@@ -13,6 +13,7 @@
   "imports": {
     "build_command": "SKIP_INTEGRATION=0 <venv python> mapbuild/import_map.py sample/tests.json <scratch copy of sqlglot@eb11aec> maps -j12",
     "built": "2026-11-20, laptop (python 3.13.12, sqlglot test deps incl. duckdb/pandas), not the pinned image",
-    "facts": "1620 tests each run alone (187 s at -j12), 244 modules, 0 isolation failures; lines-map whole-file sets and classes-map sets are subsets of it (0 violations). No labeled patch used."
+    "facts": "1620 tests each run alone (187 s at -j12), 244 modules, 0 isolation failures; lines-map whole-file sets and classes-map sets are subsets of it (0 violations). No labeled patch used.",
+    "environment_note": "The only `except ImportError` around a repo import is sqlglot/_version (generated, not in the repo), so other optional dependencies cannot change the module closures."
   }
 }

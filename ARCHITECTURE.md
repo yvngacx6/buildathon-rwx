@@ -39,8 +39,7 @@ Every rule is about code structure; no rule names an edit kind as harmless or ma
 Import bound (r2-importclosure): an edit confined to one module can only reach tests that load
 that module (imports map) or read it as a file (reads map); if the module stops importing,
 exactly those tests error. Used for: new text that does not parse, deleted / renamed .py
-files (old path), removed bindings, and every rule below that would otherwise answer ALL.
-A removed plain module-level name that no other file mentions goes through the normal rules.
+files (old path; a rename onto conftest, __init__ or a non-module stays ALL), removed bindings, and every rule below that would otherwise answer ALL.
 
 Safety nets: hunk does not apply → ALL; does not parse → import bound; definition-time change
 with no known users → import bound; module-level non-assignment change → import bound;
@@ -56,4 +55,4 @@ tests that no map knows join every non-empty selection. Without the imports map,
 | v0 | 2026-11-20 | No-op filter + ALL + optimal packing | 994.1 |
 | v1 | 2026-11-20 | PLAN §3 table on interim prototype maps (function / class / module regions, reads, test imports) | 198.8 |
 | r1-attrnarrow | 2026-11-20 | I08: name-reader narrowing of class / module assignments; lambda call lines | 185.0 |
-| r2-importclosure | 2026-11-20 | I16: import bound (traced per-test import closure) instead of ALL | 185.0 (private264 3453.9 → 2873.9) |
+| r2-importclosure | 2026-11-20 | I16: import bound (traced per-test import closure) instead of ALL | 185.0 (private264 3453.9 → 2887.8) |
