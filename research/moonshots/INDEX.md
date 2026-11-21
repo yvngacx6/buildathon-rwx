@@ -10,7 +10,7 @@ new moonshot angle is started in its slot.
 | 02 | Warm fork-server: near-free test execution | moon-02 | done | ✗ Works (0 disagreements on 98 labeled) but per-test CPU ≈1.3× recorded secs (≈2.6× on scorer); net ≈ 0 s/40. Not built. |
 | 03 | General semantic equivalence (value profiles) | moon-03 | done | ✗ ~1–2 s/40; most edits aren't comparisons/boolops. Warning: pickle-only paths (serde) invisible to non-pickling recorders → relayed to R23. |
 | 04 | Build-time recording beyond the 20 MB repo limit | moon-04 | running | |
-| 05 | Divergence-point re-execution of slow tests | moon-05 | running | |
+| 05 | Divergence-point re-execution of slow tests | moon-05 | done | ✓ TPC stage checkpoints: practice_like −91 s sim (≈−19 s/40 net), 0 misses, 38/38 ground-truth drops pass → R29 (r29-tpcstage) with shared-state guard. |
 | 06 | Generic sub-test decomposition | moon-06 | done | Full mechanism not worth it; zero-CPU special case STMT_SECONDS=0 (statement rule for all tests) 0 misses/440, −9…−14 s/40 → folded into R23. Flagged diffexec nondeterminism on 66ks → moon-17. |
 | 07 | Calibrated risk model (P(first place)) | moon-07 | done | ✗ AUC 0.56 (no better than base rate); keep 0-miss policy. Spin-offs → R22 (import-run slow tests w/ 0 touched lines never fail), moon-12 (record tpcds callees). |
 | 08 | Practice-board experiment design | moon-08 | done | Slot plan adopted in part (ablations; always pick final explicitly after diagnostics). Score-encoded 'telemetry word' REJECTED: it circumvents 'you never see what your program printed' — not used. |
@@ -27,3 +27,4 @@ new moonshot angle is started in its slot.
 | 19 | 'Conservative def-time' + 'state diff' buckets on practice_like (~87 s): sound narrowing | moon-19 | running | |
 | 20 | Tokenizer settings → TokenizerCore(...) read sites ∩ dialect users | moon-20 | running | |
 | 21 | Key-level state diff for class-creation hooks & import-run builders | moon-21 | running | |
+| 22 | Per-optimizer-rule TPC checkpoints (3–5x cheaper re-runs) | moon-22 | running | |
