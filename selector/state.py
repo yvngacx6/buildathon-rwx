@@ -1,4 +1,4 @@
-"""What a patch changes in the state sqlglot builds at import (round 2, idea C / I16).
+"""What a patch changes in the state sqlglot builds at import (round 2, idea C / I22).
 
 Class bodies are often consumed when the class is created: metaclass `__new__`
 (`_Dialect`), `__init_subclass__` (`_TokenizerBase`, `Expr`), import-time calls handed the
@@ -23,15 +23,17 @@ to the name index); the patched one runs in a subprocess at run time (~0.3 s CPU
 build-time bytecode cache). Any import error, timeout or surprise → None (caller falls back).
 
 Run as a script (in a fresh interpreter, so the selector process never imports sqlglot):
-    python -I selector/state.py snap <sqlglot root> <out.pkl>
-    python -I selector/state.py diff <sqlglot root> <old.pkl>   (patched sources as JSON on stdin)
+    PYTHONHASHSEED=0 python -P -s -S selector/state.py snap <sqlglot root> <out.pkl>
+    PYTHONHASHSEED=0 python -P -s -S selector/state.py diff <sqlglot root> <old.pkl>
+        (patched sources as JSON on stdin)
+(-P keeps selector/ off sys.path: its select.py would shadow the stdlib module. Not -I: it
+ignores PYTHONHASHSEED, and digests and set orders need the fixed seed.)
 """
 
 from __future__ import annotations
 
 import enum
 import functools
-import hashlib
 import importlib
 import importlib.abc
 import importlib.machinery
@@ -57,8 +59,11 @@ DEFAULT_PATH = Path(__file__).resolve().parent.parent / "index" / "state.pkl"
 
 
 def _h(*parts: object) -> str:
-    return hashlib.blake2b(repr(parts).encode("utf-8", "backslashreplace"),
-                           digest_size=8).hexdigest()
+    """A 64-bit digest of digests / plain values. Python's own hash: the subprocess always
+    runs with PYTHONHASHSEED=0, so it is the same in every run (and ~2x faster than a
+    cryptographic hash of the repr)."""
+    return format(hash(tuple(tuple(p) if isinstance(p, list) else p for p in parts))
+                  & 0xFFFFFFFFFFFFFFFF, "x")
 
 
 class Snapshot:
@@ -322,6 +327,8 @@ def _main(argv: list[str]) -> None:
         return
     if cmd == "diff":  # diff <root> <old>; stdin: {"path": patched source}
         old = pickle.loads(Path(argv[2]).read_bytes())
+        if old.get("files") != source_files(Path(root)):
+            sys.exit("the snapshot describes other source")
         patched = json.loads(sys.stdin.read())
         snap = take(root, patched)
         print(json.dumps(compare(snap, old, patched)))
@@ -390,8 +397,15 @@ def build(root: Path, out: Path, samples: int = BUILD_SAMPLES) -> bool:
     volatile = varies("unordered")
     base["loose"] = sorted(varies("entries") - volatile)
     base["volatile"] = sorted(volatile)
+    base["files"] = source_files(root)
     out.write_bytes(pickle.dumps(base, pickle.HIGHEST_PROTOCOL))
     return True
+
+
+def source_files(root: Path) -> list[tuple[str, int]]:
+    """Which source a snapshot describes: path and size of every package file."""
+    return sorted((p.relative_to(root).as_posix(), p.stat().st_size)
+                  for p in (root / "sqlglot").rglob("*.py"))
 
 
 def _snap(root: Path, part: Path) -> dict | None:
@@ -421,7 +435,7 @@ def _run(args: list[str], stdin: str | None) -> str | None:
     if os.environ.get("BR_STATE_PYCACHE"):
         env["PYTHONPYCACHEPREFIX"] = os.environ["BR_STATE_PYCACHE"]
     try:
-        proc = subprocess.run([sys.executable, "-I", "-S", os.path.abspath(__file__), *args], input=stdin,
+        proc = subprocess.run([sys.executable, "-P", "-s", "-S", os.path.abspath(__file__), *args], input=stdin,
                               capture_output=True, text=True, env=env, timeout=60,
                               cwd="/")
     except (OSError, subprocess.SubprocessError):

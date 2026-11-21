@@ -15,6 +15,10 @@ here knows which tests any particular edit breaks.
   sqlglot/ class body / module level,    tests that ran a line reading a changed name, ∩ the
     assignments with inert new values    conservative set below; ∪ test-file reads; a changed
                                          lambda body → tests that called it (selector/names.py)
+    … else, values consumed at class     import old and patched package, diff all class /
+      creation / import (metaclass,      module values (selector/state.py); per changed value:
+      __init_subclass__, import calls)   tests that ran a run-time reader, among the tests that
+                                         can hold the owner class (`_by_state`)
   sqlglot/ class body (otherwise)        users of the class chain ∪ tests that ran the file
   sqlglot/ module level (otherwise)      users of the module's classes ∪ tests that ran the file
                                          (ALL if the changed names are used in other modules)
@@ -49,7 +53,7 @@ import os
 import re
 from pathlib import Path, PurePosixPath
 
-from . import classify, diff, nameindex, names, state
+from . import classify, diff, nameindex, names, pack, state
 from .maps import ImportTimeMap, Maps
 
 # Class and module bodies of these files shape nearly every test (map gives ~1550 of 1620).
@@ -68,6 +72,9 @@ CONFIG_FILES = {"pyproject.toml", "setup.cfg"}
 ALWAYS_ALL = {"pytest.ini", "tox.ini", "conftest.py", "setup.py"}
 ALL_FRACTION = 0.85  # selection cost ≥ this × ALL cost → just run ALL
 SLOW_SECONDS = 5.0  # tests at least this slow get the statement-level rule in function bodies
+# An import-state diff costs ~0.4 s of CPU; any non-empty selection costs ≥ 2 s. Below this
+# cost the wide set leaves too little to win.
+STATE_MIN_COST = 3.5
 # Class hierarchies the classes map records (maps/MANIFEST.json notes): a test that made an
 # instance of one of these classes (or used it as a dialect) is credited to it and its bases.
 TRACKED_ROOTS = {
@@ -315,6 +322,8 @@ class Selector:
             except names.Fallback as exc:
                 self.notes.append(f"{'.'.join(r.chain) or module}: no narrowing ({exc})")
                 try:
+                    if wide is not None and self._cost(wide) < STATE_MIN_COST:
+                        raise names.Fallback("too cheap to pay for an import-state diff")
                     got, why = self._by_state(path, r, wide)
                     if wide is not None and self._seconds(got) >= self._seconds(wide):
                         raise names.Fallback(f"{why}, but no cheaper")
@@ -431,7 +440,7 @@ class Selector:
 
     def _by_state(self, path: str, r: classify.Region,
                   wide: set[int] | None) -> tuple[set[int], str]:
-        """Tests that can observe what the edit changes in import-time state (idea I16).
+        """Tests that can observe what the edit changes in import-time state (idea I22).
 
         Class-creation consumers (metaclass `__new__`, `__init_subclass__`, calls handed the
         class at import, call-valued table entries) are followed by running them:
@@ -486,23 +495,16 @@ class Selector:
                 touch |= self.maps.whole_file(owner_path) | self._class_users(
                     _module_of(owner_path), [chain])
             for site in index.sites(attr, owner_path, chain, True):
-                n_sites += 1
-                if site.path.startswith("tests/") and not site.dynamic:
-                    if site.when == "run":
-                        in_tests |= self.maps.span(site.path, *site.lines)
-                    else:  # test-module import code: every test of that file depends on it
-                        in_tests |= self._by_file.get(site.path, set()) | set(
-                            self.maps.test_imports.get(site.path))
-                    continue
-                if site.when == "def" and site.memo:
-                    raise names.Fallback(f"{attr} read in code cached across tests ({site.what})")
-                got = self.maps.span(site.path, *site.lines)
-                if kind == "M":
-                    free |= got
-                elif users is None or site.dynamic:
-                    loose |= got
-                else:
-                    held |= got & users
+                for bucket, got in self._site_reads(index, site, attr):
+                    n_sites += 1
+                    if bucket == "tests":
+                        in_tests |= got
+                    elif kind == "M":
+                        free |= got
+                    elif users is None or bucket == "loose":
+                        loose |= got
+                    else:
+                        held |= got & users
         # Class-attribute reads stay within the users of the owner classes and their files
         # (the bound `_by_names` relies on); `held` narrows that further.
         got = free | ((loose | held) & touch) | in_tests
@@ -513,6 +515,38 @@ class Selector:
         return got, (f"state: {', '.join(shown[:6])}{more} → {n_sites} reader sites "
                      f"(globals {len(free)}, unrestricted {len(loose & touch)}, "
                      f"held {len(held)}, tests {len(in_tests)})")
+
+    def _site_reads(self, index: nameindex.NameIndex, site: names.Site, attr: str,
+                    depth: int = 0) -> list[tuple[str, set[int]]]:
+        """Tests that can observe the value read at `site`, as (bucket, tests): "tests" (test
+        code reads it), "loose" (a dynamic read: any object), "held" (a read through an
+        object of the owner). Follows `site.flow`: a value bound to a local that is bound
+        once is observed where the local is loaded; a value handed to a constructor that only
+        stores it is observed where that attribute is read."""
+        if site.path.startswith("tests/") and not site.dynamic:
+            if site.when == "run":
+                return [("tests", self.maps.span(site.path, *site.lines))]
+            # test-module import code: every test of that file depends on it
+            return [("tests", self._by_file.get(site.path, set())
+                     | set(self.maps.test_imports.get(site.path)))]
+        if site.when == "def" and site.memo:
+            raise names.Fallback(f"{attr} read in code cached across tests ({site.what})")
+        bucket = "loose" if site.dynamic else "held"
+        flow = site.flow if site.when == "run" and not site.dynamic and depth < 3 else None
+        if flow is not None and flow[0] == "local":
+            got: set[int] = set()
+            for first, last in flow[1]:
+                got |= self.maps.span(site.path, first, last)
+            return [(bucket, got)]
+        if flow is not None and flow[0] == "attr":
+            _, path, chain, stored = flow
+            out = []
+            for inner in index.sites(stored, path, tuple(chain), False):
+                out += self._site_reads(index, inner, stored, depth + 1)
+            return out
+        # "def" sites outside cached code run at import: their products are in the diff; the
+        # line map still shows any test that ran them later.
+        return [(bucket, self.maps.span(site.path, *site.lines))]
 
     def _module_path(self, module: str) -> str | None:
         base = module.replace(".", "/")
@@ -554,6 +588,11 @@ class Selector:
                 if site.path.startswith("tests/") and site.when == "def":
                     users |= self._by_file.get(site.path, set())
         return path, chain, users
+
+    def _cost(self, numbers: set[int]) -> float:
+        """Scorer cost of running `numbers` alone (best packing), in seconds."""
+        ms = {n: pack.duration_ms(self._secs.get(n, 0.0)) for n in numbers}
+        return pack.cost_ms(pack.pack(set(numbers), ms), ms) / 1000
 
     def _seconds(self, numbers: set[int]) -> float:
         return sum(self._secs.get(n, 0.0) for n in numbers)

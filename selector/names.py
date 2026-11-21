@@ -259,6 +259,12 @@ class Site:
     dynamic: bool = False  # getattr(x, v) / vars(x) / …: may read any name, of any object
     memo: bool = False  # "def" site whose result is cached across tests (not just at import)
     typecheck: bool = False  # the class argument of isinstance / issubclass (not handed on)
+    # Where the value read here goes, when it can only be observed further on (run sites):
+    #   ("local", ((first, last), ...))  `v = x.NAME` in a def, v bound once: the lines that
+    #                                    load v
+    #   ("attr", path, chain, attr)      `Cls(..., kw=x.NAME)`, whose __init__ only does
+    #                                    `self.attr = kw`: the readers of `attr`
+    flow: tuple | None = None
 
 
 @dataclass
@@ -282,6 +288,7 @@ class Index:
         self._classes: dict[str, list[tuple[str, ast.ClassDef, tuple[str, ...]]]] | None = None
         self._dynamic: list[tuple] | None = None
         self._file_facts: dict[str, dict] = {}
+        self._parent_maps: dict[str, dict[int, ast.AST]] = {}
 
     # ── parsing and scopes ───────────────────────────────────────────────
 
@@ -497,6 +504,10 @@ class Index:
                     site = self._site(path, node, ctx, stmt)
                     if id(node) in checked:
                         site = dataclasses.replace(site, typecheck=True)
+                    if kind == "attr" and site.when == "run" and ctx.func is not None:
+                        flow = self._flow(path, node, ctx.func, stmt)
+                        if flow is not None:
+                            site = dataclasses.replace(site, flow=flow)
                     occ.setdefault(key, []).append((path, kind, ctx.kind, ctx.chain, site))
             for ref, holder, _ in facts["class_refs"]:
                 class_refs.setdefault(ref, set()).add(holder)
@@ -558,6 +569,117 @@ class Index:
             if targets and _copied(stmt.value, node):
                 copy = (ctx.chain, targets)
         return Site(path, (first, last), "def", copy=copy, what=what, memo=ctx.memo)
+
+    # ── where a read value goes (Site.flow) ──────────────────────────────
+
+    def _parents(self, path: str) -> dict[int, ast.AST]:
+        hit = self._parent_maps.get(path)
+        if hit is None:
+            hit = self._parent_maps[path] = {
+                id(c): p for p in ast.walk(self.tree(path)) for c in ast.iter_child_nodes(p)}
+        return hit
+
+    def _flow(self, path: str, node: ast.Attribute, func: ast.AST,
+              stmt: ast.stmt | None) -> tuple | None:
+        parents = self._parents(path)
+        parent = parents.get(id(node))
+        if (isinstance(stmt, ast.Assign) and stmt.value is node and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            return self._local_flow(path, func, stmt.targets[0].id, parents)
+        if isinstance(parent, ast.keyword) and parent.arg:
+            call = parents.get(id(parent))
+            if isinstance(call, ast.Call):
+                return self._init_flow(call, parent.arg, None)
+        if isinstance(parent, ast.Call) and node in parent.args:
+            return self._init_flow(parent, None, parent.args.index(node))
+        return None
+
+    def _local_flow(self, path: str, func: ast.AST, var: str,
+                    parents: dict[int, ast.AST]) -> tuple | None:
+        """`var = <read>` in `func`: the lines that load `var`, if that is its only binding."""
+        args = func.args
+        params = {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
+        params |= {a.arg for a in (args.vararg, args.kwarg) if a}
+        if var in params:
+            return None
+        stores, loads = 0, []
+        for n in ast.walk(func):
+            if isinstance(n, (ast.Global, ast.Nonlocal)) and var in n.names:
+                return None
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and n is not func:
+                inner = n.args
+                if var in {a.arg for a in inner.posonlyargs + inner.args + inner.kwonlyargs}:
+                    return None  # shadowed in a nested scope
+            if isinstance(n, ast.Name) and n.id == var:
+                if isinstance(n.ctx, ast.Load):
+                    loads.append(n)
+                else:
+                    stores += 1
+            elif isinstance(n, ast.ExceptHandler) and n.name == var:
+                return None
+            elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name == var:
+                return None
+            elif isinstance(n, ast.alias) and (n.asname or n.name).split(".")[0] == var:
+                return None
+        if stores != 1 or not loads:
+            return None
+        spans = []
+        for n in loads:
+            first, last = n.lineno, n.end_lineno or n.lineno
+            up = parents.get(id(n))
+            while up is not None and not isinstance(up, ast.stmt):
+                up = parents.get(id(up))
+            if up is not None:  # the map may credit the statement's first line(s)
+                body = getattr(up, "body", None)
+                head_end = body[0].lineno - 1 if isinstance(body, list) and body else up.end_lineno
+                first, last = min(first, up.lineno), max(last, up.lineno, head_end or up.lineno)
+            spans.append((first, last))
+        return ("local", tuple(sorted(set(spans))))
+
+    def _init_flow(self, call: ast.Call, kw: str | None, pos: int | None) -> tuple | None:
+        """`Cls(..., kw=<read>)` (or positional) where `Cls` is one repo class whose own
+        `__init__` only stores that parameter: `self.attr = param`."""
+        name = _last_name(call.func)
+        if not name or any(isinstance(a, ast.Starred) for a in call.args) or any(
+                k.arg is None for k in call.keywords):
+            return None
+        found = self.classes().get(name, [])
+        if len(found) != 1:
+            return None
+        cpath, cls, chain = found[0]
+        if cls.decorator_list or cls.keywords or any(
+                _last_name(b) not in ("object",) for b in cls.bases):
+            return None  # bases / metaclass / decorators could intercept construction
+        body = {s.name: s for s in cls.body if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        init = body.get("__init__")
+        if init is None or "__new__" in body or init.decorator_list:
+            return None
+        args = init.args
+        positional = [a.arg for a in args.posonlyargs + args.args][1:]
+        if args.vararg or args.kwarg or not (args.posonlyargs + args.args):
+            return None
+        me = (args.posonlyargs + args.args)[0].arg
+        if kw is not None:
+            param = kw if kw in positional + [a.arg for a in args.kwonlyargs] else None
+        else:
+            param = positional[pos] if pos is not None and pos < len(positional) else None
+        if param is None:
+            return None
+        uses = [n for n in ast.walk(init) if isinstance(n, ast.Name) and n.id == param]
+        target = None
+        for st in ast.walk(init):
+            if (isinstance(st, ast.Assign) and len(st.targets) == 1
+                    and isinstance(st.value, ast.Name) and st.value.id == param
+                    and isinstance(st.targets[0], ast.Attribute)
+                    and isinstance(st.targets[0].value, ast.Name)
+                    and st.targets[0].value.id == me):
+                if target is not None:
+                    return None
+                target = st.targets[0].attr
+        if target is None or len(uses) != 1:
+            return None  # the parameter is used for something else too
+        return ("attr", cpath, chain, target)
 
     def _dynamic_sites(self):
         """Reads whose attribute name is computed: getattr(x, v), vars(x), dir(x), x.__dict__."""
