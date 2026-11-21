@@ -8,11 +8,11 @@ Nothing here reads `sample/answers.json` or any patch; only `sample/tests.json` 
 ## Rebuild (one command)
 
 ```sh
-mapbuild/build.sh            # needs Docker; 560 s on an idle 4-core EC2 box (~35 min when shared)
+mapbuild/build.sh            # needs Docker; ~2 min on 32 cores, ~15-20 min on 4
 ```
 
 It builds `mapbuild/Dockerfile`, traces all 1620 tests, runs `import_time.py`, and writes
-`maps/{lines,classes,reads,test_imports,import_time}.json.gz` and `maps/MANIFEST.json`.
+`maps/{lines,lines_phase,lines_full,classes,reads,test_imports,import_time}.json.gz` and `maps/MANIFEST.json`.
 The build stops with `FATAL:` if any check fails.
 
 Check the result against the sample (reads `sample/answers.json`, so it is a check only and
@@ -45,10 +45,18 @@ module and class bodies, dialects loaded lazily by name, caches filled on first 
 class (each test runs it), and no test gets "free" imports because an earlier test in the
 same file paid for them. Cost: about 1 s of startup per test, which is fine for an offline build.
 
-**Lines** (`sys.monitoring` LINE events, tool `COVERAGE_ID`). Each callback records
-`(file, line)` for files under `sqlglot/` and `tests/` and returns `DISABLE`, so each location
-costs one callback per process. Module-level and class-body lines are included (they run at
-import, inside the test's process). Monitoring starts before `pytest` or `sqlglot` is imported.
+**Lines** (`sys.monitoring` LINE events, tool `COVERAGE_ID`, started before `pytest` or
+`sqlglot` is imported; files under `sqlglot/` and `tests/`). Three sets per test:
+- `lines_full`: everything the interpreter ran. Each location fires once (`DISABLE`).
+- `lines_phase`: what ran after the test item's setup began. A `tryfirst`
+  `pytest_runtest_setup` hook flips the phase and calls `restart_events()`, so lines already
+  run at import fire again if the test runs them.
+- `lines` (what the selector uses): the part of `lines_phase` run while no module body was
+  executing. PY_START/PY_RETURN/PY_UNWIND on `<module>` code objects from `.py` files keep an
+  import depth; while it is > 0 a line is recorded only in `lines_phase` and stays enabled, so
+  a later call from the test body is still seen. `eval`/`exec` of generated code (the executor
+  evaluates compiled SQL that way, also named `<module>`) does not count as an import.
+Import-time effects are covered by `import_time.json.gz` and `classes.json.gz` instead.
 
 **Process pool.** `tests/test_optimizer.py` and `tests/test_executor.py` use a spawn
 `ProcessPoolExecutor`. `trace_one.py` replaces it (in `concurrent.futures` and
@@ -102,16 +110,14 @@ carries `json_sha256` of each map's JSON; two builds give the same digests (only
 
 ## Last build
 
+- Built on a 32-core c7i.8xlarge (same image): 85 s tracing, 105 s total. 560 s on the
+  4-core box when idle (earlier build; tracing is now about 2x slower per test because of
+  the second phase).
 - 1620/1620 tests traced, all `passed` under the hooks; collection check ok (+1 skipped id).
-- Sizes: lines 1.60 MB, import_time 0.10 MB, classes 0.06 MB, reads 0.02 MB,
-  test_imports 0.02 MB (1.8 MB total).
-- Determinism: lines, classes and test_imports are byte-identical across 4 full builds; reads
-  across builds of the same code; import_time across 2 runs.
-- `validate.py` on the sample: 73/73 failing tests explained (63 by a changed line, 10 by a
-  fixture read), 0 unexplained.
-
-Note for the selector: because each test runs in its own interpreter, module- and class-body
-lines are credited to every test whose process imports that module (for example a
-`Snowflake.Tokenizer` class attribute maps to every test that loads the Snowflake dialect).
-That is the true import-time blast radius; narrowing such edits (by attribute name, the
-classes map, or import_time) is the selector's job.
+- Sizes: lines 0.64 MB, lines_phase 0.77 MB, lines_full 1.60 MB, import_time 0.09 MB,
+  classes 0.06 MB, reads 0.02 MB, test_imports 0.02 MB (3.1 MB total).
+- Determinism: two full builds give identical `json_sha256` for every map. `lines_full`
+  equals the earlier single-phase `lines` byte for byte.
+- `validate.py` on the sample: 73/73 failing tests explained (59 by a changed line, 10 by a
+  fixture read, 1 by the classes map (535z), 3 only at file level (rszg: the changed
+  lines run at import, which import_time covers)), 0 unexplained.

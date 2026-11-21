@@ -3,14 +3,18 @@
 Usage (cwd must be the sqlglot checkout):
     python trace_one.py <pytest node id> <output .json.gz>
 
-Why one process per test: everything the process executes is credited to the
-test -- interpreter-wide imports, collection of the test file, module and class
-bodies, lazily imported dialects, caches filled on first use, setUpClass, and
-the test itself. There is no "the first test of the file pays for the import"
+Why one process per test: nothing the test needs was done by an earlier test --
+caches filled on first use, setUpClass, lazily imported dialects all happen in
+this test's own process. There is no "the first test of the file pays for it"
 bias and no ordering dependence.
 
 Recorded (all paths repo-relative):
-  lines         every (file, line) executed under sqlglot/ or tests/ (sys.monitoring LINE)
+  lines_full    every (file, line) under sqlglot/ or tests/ the process executed (sys.monitoring)
+  lines_phase   the subset executed after the test item's setup began (setUpClass, setUp,
+                test body, teardown, pool jobs)
+  lines         the subset of lines_phase executed outside any module body execution, i.e.
+                not merely because the test imported a module for the first time; import-time
+                effects are covered separately by import_time.json.gz and classes
   classes       module.Qualname of every class in the MRO of each instantiated
                 Expr / Tokenizer / Parser / Generator / Dialect, plus dialect
                 classes looked up by name (Dialect["x"], Dialect.get, get_or_raise)
@@ -32,25 +36,80 @@ import os
 ROOT = os.path.realpath(os.getcwd()) + os.sep
 _TRACKED = (ROOT + "sqlglot" + os.sep, ROOT + "tests" + os.sep)
 _mon = sys.monitoring
+_E = _mon.events
 _TOOL = _mon.COVERAGE_ID
-_lines: dict[str, set[int]] = {}
+
+# Three line sets, file -> {line}:
+#   full     everything the process ran (interpreter start, collection, the test)
+#   phase    ran after the test item's setup began (setUpClass, setUp, test, teardown)
+#   in_test  ran in that phase *outside* any module execution, i.e. not merely because a
+#            module was being imported (a lazy `import sqlglot.dialects.x` inside the test)
+_full: dict[str, set[int]] = {}
+_phase: dict[str, set[int]] = {}
+_in_test: dict[str, set[int]] = {}
+_state = {"phase": False, "import_depth": 0}
+
+
+def _add(store, rel, line):
+    s = store.get(rel)
+    if s is None:
+        s = store[rel] = set()
+    s.add(line)
 
 
 def _on_line(code, line):
-    # Each location fires once: DISABLE turns the event off for that (code, line).
     fn = code.co_filename
-    if fn.startswith(_TRACKED):
-        rel = fn[len(ROOT):]
-        s = _lines.get(rel)
-        if s is None:
-            s = _lines[rel] = set()
-        s.add(line)
+    if line <= 0 or not fn.startswith(_TRACKED):  # line 0: RESUME of an empty module
+        return _mon.DISABLE
+    rel = fn[len(ROOT):]
+    _add(_full, rel, line)
+    if not _state["phase"]:
+        return _mon.DISABLE  # re-enabled by restart_events() when the phase starts
+    _add(_phase, rel, line)
+    if _state["import_depth"]:
+        # Keep the event live: if the test later runs this line outside an import we must see it.
+        return None
+    _add(_in_test, rel, line)
     return _mon.DISABLE
 
 
+# Import depth = number of module bodies currently executing. A module body is a "<module>"
+# code object compiled from a .py file; eval/exec of generated code is also named "<module>"
+# (the executor evaluates compiled SQL expressions that way) and must NOT count as an import.
+def _is_module_body(code):
+    return code.co_name == "<module>" and code.co_filename.endswith(".py")
+
+
+def _on_start(code, offset):
+    if not _is_module_body(code):
+        return _mon.DISABLE
+    _state["import_depth"] += 1
+    return None
+
+
+def _on_return(code, offset, retval):
+    if not _is_module_body(code):
+        return _mon.DISABLE
+    _state["import_depth"] -= 1
+    return None
+
+
+def _on_unwind(code, offset, exc):  # module body raised (failed import); cannot be disabled
+    if _is_module_body(code):
+        _state["import_depth"] -= 1
+
+
+def _begin_test_phase():
+    _state["phase"] = True
+    _mon.restart_events()  # lines run before (e.g. at import) must fire again in the phase
+
+
 _mon.use_tool_id(_TOOL, "mapbuild")
-_mon.register_callback(_TOOL, _mon.events.LINE, _on_line)
-_mon.set_events(_TOOL, _mon.events.LINE)
+_mon.register_callback(_TOOL, _E.LINE, _on_line)
+_mon.register_callback(_TOOL, _E.PY_START, _on_start)
+_mon.register_callback(_TOOL, _E.PY_RETURN, _on_return)
+_mon.register_callback(_TOOL, _E.PY_UNWIND, _on_unwind)
+_mon.set_events(_TOOL, _E.LINE | _E.PY_START | _E.PY_RETURN | _E.PY_UNWIND)
 
 # ---- 2. file reads (audit hook) -----------------------------------------------------------------
 _reads: set[str] = set()
@@ -229,6 +288,10 @@ import pytest  # noqa: E402
 
 
 class _Outcome:
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_runtest_setup(self, item):
+        _begin_test_phase()  # before any fixture, so setUpClass is in the phase
+
     def __init__(self):
         self.seen = False
         self.failed = False
@@ -270,6 +333,10 @@ def _test_modules():
     return sorted(out)
 
 
+def _dump(store):
+    return {f: sorted(v) for f, v in sorted(store.items())}
+
+
 def main():
     nodeid, out_path = sys.argv[1], sys.argv[2]
     outcome = _Outcome()
@@ -282,7 +349,9 @@ def main():
         "id": nodeid,
         "outcome": outcome.value,
         "exit_code": int(rc),
-        "lines": {f: sorted(v) for f, v in sorted(_lines.items())},
+        "lines_full": _dump(_full),
+        "lines_phase": _dump(_phase),
+        "lines": _dump(_in_test),
         "classes": _classes(),
         "reads": sorted(_reads),
         "test_modules": _test_modules(),

@@ -46,15 +46,16 @@ def write_map(path, ids, mapping, sort_key=None):
 
 def export(tests, trace_dir, out_dir, trace_secs, jobs):
     ids = [t["id"] for t in tests]
-    lines, classes, reads, imports = {}, {}, {}, {}
+    lines, lines_phase, lines_full, classes, reads, imports = {}, {}, {}, {}, {}, {}
     for t in tests:
         n = t["number"]
         tr = load_trace(os.path.join(trace_dir, f"{n}.json.gz"))
         if tr["id"] != t["id"]:
             raise SystemExit(f"FATAL: trace {n} is for {tr['id']}, expected {t['id']}")
-        for f, lns in tr["lines"].items():
-            for ln in lns:
-                lines.setdefault(f"{f}:{ln}", []).append(n)
+        for field, store in (("lines", lines), ("lines_phase", lines_phase), ("lines_full", lines_full)):
+            for f, lns in tr[field].items():
+                for ln in lns:
+                    store.setdefault(f"{f}:{ln}", []).append(n)
         for c in tr["classes"]:
             classes.setdefault(c, []).append(n)
         for r in tr["reads"]:
@@ -65,6 +66,8 @@ def export(tests, trace_dir, out_dir, trace_secs, jobs):
     os.makedirs(out_dir, exist_ok=True)
     files = {
         "lines.json.gz": (lines, _line_key),
+        "lines_phase.json.gz": (lines_phase, _line_key),
+        "lines_full.json.gz": (lines_full, _line_key),
         "classes.json.gz": (classes, None),
         "reads.json.gz": (reads, None),
         "test_imports.json.gz": (imports, None),
