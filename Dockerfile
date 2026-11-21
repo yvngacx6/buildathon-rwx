@@ -9,6 +9,14 @@ data=urllib.request.urlopen('https://github.com/tobymao/sqlglot/archive/${SQLGLO
 tarfile.open(fileobj=io.BytesIO(data)).extractall('/opt', filter='data')" \
  && mv /opt/sqlglot-${SQLGLOT_SHA} /opt/sqlglot
 
+# The labelers' environment, for selector/verify.py (runs cheap selections against the patch).
+COPY requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir -r /app/requirements.lock
+# Bytecode for the pinned tests, so each verification imports them from .pyc: plain compileall,
+# plus pytest's assertion-rewritten test modules (a collect-only pass writes them).
+RUN cd /opt/sqlglot && python -m compileall -q -j 4 tests \
+ && SKIP_INTEGRATION=0 python -m pytest --collect-only -q -p no:cacheprovider tests > /dev/null
+
 COPY selector /app/selector
 COPY maps /app/maps
 
@@ -27,5 +35,6 @@ RUN python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig
  && python -m selector.maps build /app/maps /app/index/maps \
  && python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl \
  && chmod -R a+rX /app /opt/sqlglot
-# -S: no site module (the selector needs only the standard library).
+# -S: no site module (the selector needs only the standard library). selector/verify.py starts
+# its pytest server with plain `python` (site on), so pytest and requirements.lock import there.
 CMD ["python", "-S", "-m", "selector"]
