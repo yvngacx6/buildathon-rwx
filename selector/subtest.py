@@ -490,9 +490,10 @@ def _hit(lines_by_file: dict, spans: dict) -> bool:
 #   * `global` / `nonlocal`, setattr / delattr / exec / eval / globals() / vars() / __import__
 #   * a store, del, augmented assignment or mutating method call (append, update, set, ...)
 #     whose base is a non-local object: a module-level name, builtin or import, `cls`, `self`
-#     outside sqlglot/optimizer/ (dialect / generator / parser / schema instances are cached and
-#     reused), or a local name bound to one of those by alias (x = MOD.TABLE, from m import X,
-#     for x in GLOBAL..., with GLOBAL as x)
+#     of a Dialect (instances are cached and shared; parser / generator / tokenizer / scope /
+#     schema objects are made per call), or a local name bound to one of those by alias
+#     (x = MOD.TABLE, from m import X, for x in GLOBAL..., with GLOBAL as x, x = M.get(...));
+#     exp.* builders and .copy() make new objects
 # Parameters and names bound from them / from calls of plain functions count as query-local:
 # the objects the optimizer works on are the query's tree and scopes, compared by the digest.
 # Not covered (documented gap, as r17's cross-query reuse): an unchanged callee that writes
@@ -534,12 +535,17 @@ def _root(node):
         if isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
             node = node.value
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            node = node.func.value
+            f = node.func
+            # sqlglot.expressions builders (exp.column(...), exp.Alias(...)) and .copy() make
+            # new objects
+            if f.attr in ("copy", "deepcopy") or (isinstance(f.value, ast.Name) and f.value.id == "exp"):
+                return node
+            node = f.value
         else:
             return node
 
 
-def _writes_shared(fn, in_optimizer: bool) -> str | None:
+def _writes_shared(fn, self_shared: bool) -> str | None:
     """Why `fn` (whole subtree) may write state that outlives its call, or None."""
     nodes = list(ast.walk(fn))
     params: set[str] = set()
@@ -548,7 +554,7 @@ def _writes_shared(fn, in_optimizer: bool) -> str | None:
             a = n.args
             params.update(p.arg for p in a.posonlyargs + a.args + a.kwonlyargs)
             params.update(p.arg for p in (a.vararg, a.kwarg) if p is not None)
-    shared_self = "self" if not in_optimizer else None
+    shared_self = "self" if self_shared else None
 
     # local bindings: name → [value expressions] (None: an import, i.e. a shared module object)
     binds: dict[str, list] = {}
@@ -650,7 +656,6 @@ def stage_guard(root: str, jobs) -> str | None:
         with open(os.path.join(root, path), encoding="utf-8") as fh:
             old_text = fh.read()
         old_defs, new_defs = _defs(ast.parse(old_text)), _defs(ast.parse(new_text))
-        in_opt = path.startswith("sqlglot/optimizer/")
         for k in set(old_defs) | set(new_defs):
             o, n = old_defs.get(k), new_defs.get(k)
             if o is not None and n is not None and ast.dump(o[0]) == ast.dump(n[0]):
@@ -658,7 +663,9 @@ def stage_guard(root: str, jobs) -> str | None:
             for d in (o, n):
                 if d is None:
                     continue
-                why = _writes_shared(d[1], in_opt)
+                # Dialect instances are cached and shared; parser / generator / tokenizer /
+                # scope / schema objects are made per call
+                why = _writes_shared(d[1], path.startswith("sqlglot/dialects/") or "Dialect" in k[0])
                 if why:
                     return f"{k[0]}: {why}"
     return None
