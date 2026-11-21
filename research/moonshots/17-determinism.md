@@ -11,7 +11,7 @@ longer decide anything. Each child is capped by its own CPU (ITIMER_PROF / RLIMI
 wall timeout only catches a child that blocks. A capped child that overruns still keeps
 everything. **Seconds impact: 0 on a quiet machine (same output, same CPU). Under throttling or a stall,
 each fixed flip is worth 5–18 s (op07 5.2 s, ktz3 4.9 s, tggb 18.3 s). On EC2, base flipped
-tggb in 2/2 throttled practice_like runs; fix flipped nothing in 0 of 28 runs.** On the final (5 reruns on an idle
+tggb in 2/2 throttled practice_like runs; fix had 0 flips in 30 full-set runs (13 of them throttled).** On the final (5 reruns on an idle
 machine, median taken) the expected gain is small, but nothing timing-based is left to decide
 an outcome except at pathological margins.
 
