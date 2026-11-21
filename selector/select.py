@@ -815,13 +815,16 @@ class Selector:
         """Files that import module `path` and mention one of `names`."""
         module = _module_of(path)
         parent, _, leaf = module.rpartition(".")
-        refers = re.compile(rf"\b{re.escape(module)}\b|from\s+{re.escape(parent)}\s+import\b[^\n]*\b{leaf}\b"
-                            rf"|from\s+\.+{leaf}\s+import")
+        # `module`, `from parent import … leaf`, `from .leaf import`; each one only searched
+        # for in texts that contain its literal part (a regex scan of every file is slow)
+        refers = [(module, re.compile(rf"\b{re.escape(module)}\b")),
+                  (parent, re.compile(rf"from\s+{re.escape(parent)}\s+import\b[^\n]*\b{leaf}\b")),
+                  (f".{leaf}", re.compile(rf"from\s+\.+{leaf}\s+import"))]
         mentions = re.compile(r"\b(" + "|".join(map(re.escape, sorted(names))) + r")\b") if names else None
         out = []
         for other, text in self._all_sources().items():
-            # every alternative of `refers` contains `leaf`: a cheap test first
-            if other == path or leaf not in text or not refers.search(text):
+            if other == path or not any(part in text and pattern.search(text)
+                                        for part, pattern in refers):
                 continue
             if f"{module} import *" in text or f".{leaf} import *" in text:
                 raise AllTests(f"{path}: star-imported by {other}")
