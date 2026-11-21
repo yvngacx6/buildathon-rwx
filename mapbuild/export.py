@@ -47,6 +47,7 @@ def write_map(path, ids, mapping, sort_key=None):
 def export(tests, trace_dir, out_dir, trace_secs, jobs):
     ids = [t["id"] for t in tests]
     lines, lines_phase, lines_full, classes, reads, imports = {}, {}, {}, {}, {}, {}
+    classes_run = {}
     for t in tests:
         n = t["number"]
         tr = load_trace(os.path.join(trace_dir, f"{n}.json.gz"))
@@ -58,6 +59,8 @@ def export(tests, trace_dir, out_dir, trace_secs, jobs):
                     store.setdefault(f"{f}:{ln}", []).append(n)
         for c in tr["classes"]:
             classes.setdefault(c, []).append(n)
+        for c in tr.get("classes_run", tr["classes"]):
+            classes_run.setdefault(c, []).append(n)
         for r in tr["reads"]:
             reads.setdefault(r, []).append(n)
         for m in tr["test_modules"]:
@@ -69,6 +72,7 @@ def export(tests, trace_dir, out_dir, trace_secs, jobs):
         "lines_phase.json.gz": (lines_phase, _line_key),
         "lines_full.json.gz": (lines_full, _line_key),
         "classes.json.gz": (classes, None),
+        "classes_run.json.gz": (classes_run, None),
         "reads.json.gz": (reads, None),
         "test_imports.json.gz": (imports, None),
     }

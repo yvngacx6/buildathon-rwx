@@ -48,6 +48,7 @@ _full: dict[str, set[int]] = {}
 _phase: dict[str, set[int]] = {}
 _in_test: dict[str, set[int]] = {}
 _state = {"phase": False, "import_depth": 0}
+_bodies: list[bool] = []  # per executing module body: is it a sqlglot/ source file?
 
 
 def _add(store, rel, line):
@@ -84,6 +85,7 @@ def _on_start(code, offset):
     if not _is_module_body(code):
         return _mon.DISABLE
     _state["import_depth"] += 1
+    _bodies.append(code.co_filename.startswith(_TRACKED[0]))
     return None
 
 
@@ -91,12 +93,16 @@ def _on_return(code, offset, retval):
     if not _is_module_body(code):
         return _mon.DISABLE
     _state["import_depth"] -= 1
+    if _bodies:
+        _bodies.pop()
     return None
 
 
 def _on_unwind(code, offset, exc):  # module body raised (failed import); cannot be disabled
     if _is_module_body(code):
         _state["import_depth"] -= 1
+        if _bodies:
+            _bodies.pop()
 
 
 def _begin_test_phase():
@@ -196,6 +202,15 @@ import importlib.abc  # noqa: E402
 import importlib.machinery  # noqa: E402
 
 _used_types: set[type] = set()
+# classes_run: like classes, minus objects made while a sqlglot/ module body executes (import-time
+# tables / templates: tests reach those through the globals that hold them, not by making one).
+_run_types: set[type] = set()
+
+
+def _note(t):
+    _used_types.add(t)
+    if not (_bodies and _bodies[-1]):
+        _run_types.add(t)
 
 # module that defines the base -> base class names to wrap
 _BASES = {
@@ -217,7 +232,7 @@ def _wrap_init(cls):
     own = cls.__dict__.get("__init__")
 
     def __init__(self, *args, **kwargs):
-        _used_types.add(type(self))
+        _note(type(self))
         if own is not None:
             return own(self, *args, **kwargs)
         return super(cls, self).__init__(*args, **kwargs)
@@ -234,9 +249,9 @@ def _wrap_dialect_lookups(mod):
         def wrapper(*args, **kwargs):
             res = fn(*args, **kwargs)
             if isinstance(res, type):
-                _used_types.add(res)
+                _note(res)
             elif res is not None:
-                _used_types.add(type(res))
+                _note(type(res))
             return res
 
         return wrapper
@@ -312,9 +327,9 @@ class _Outcome:
         return "failed" if self.failed else "skipped" if self.skipped else "passed"
 
 
-def _classes():
+def _classes(used=None):
     names = set()
-    for t in _used_types:
+    for t in (_used_types if used is None else used):
         for c in t.__mro__:
             m = getattr(c, "__module__", "") or ""
             if m == "sqlglot" or m.startswith("sqlglot."):
@@ -353,6 +368,7 @@ def main():
         "lines_phase": _dump(_phase),
         "lines": _dump(_in_test),
         "classes": _classes(),
+        "classes_run": _classes(_run_types),
         "reads": sorted(_reads),
         "test_modules": _test_modules(),
     }
