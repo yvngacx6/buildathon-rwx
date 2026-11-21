@@ -181,8 +181,10 @@ def test_new_method_is_a_class_body_change(selector):
     assert got == {A, C, D, U}
 
 
-def test_private_module_constant_selects_module_users_and_file(selector):
-    assert run(selector, edit("sqlglot/lib.py", "LIMIT = 10", "LIMIT = 11")) == {A, C, D, U}
+def test_private_module_constant_selects_tests_that_read_it(selector):
+    # LIMIT is read only in the `if` of Dialect.parse (lines 10-12), which test C ran
+    # (selector/names.py; tests/test_names.py covers the narrowing in detail).
+    assert run(selector, edit("sqlglot/lib.py", "LIMIT = 10", "LIMIT = 11")) == {C, U}
 
 
 def test_module_constant_used_elsewhere_selects_all(selector):

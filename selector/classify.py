@@ -115,10 +115,39 @@ class Scopes:
         return [s.chain[0] for s in self.scopes if s.kind == "class" and len(s.chain) == 1]
 
 
+def lambda_call_lines(lam: ast.Lambda) -> tuple[int, int]:
+    """Lines whose coverage means "this lambda was called".
+
+    The `lambda` line also runs when the lambda is *created* (at import, for a lambda in a
+    class-level table), so the line map credits it to whichever test imported first. When
+    the body is a call whose arguments start on later lines, and everything on the first
+    line is a plain name / constant / dotted name (cannot raise or short-circuit), every
+    call of the lambda executes those later lines: use only them.
+    """
+    first, last = lam.lineno, lam.end_lineno or lam.lineno
+    body = lam.body
+    if last == first or not isinstance(body, ast.Call):
+        return first, last
+    parts = [body.func] + list(body.args) + [k.value for k in body.keywords]
+    later = [p for p in parts if p.lineno > first]
+    early = [p for p in parts if p.lineno == first]
+    if later and all(_plain(p) and p.end_lineno == first for p in early):
+        return min(p.lineno for p in later), last
+    return first, last
+
+
+def _plain(node: ast.AST) -> bool:
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return isinstance(node, (ast.Name, ast.Constant))
+
+
 def _function_region(s: _Scope, line_in_scope: int | None) -> Region:
     if s.kind == "def" and (s.metaclass or s.chain[-1] in DEFINITION_TIME_METHODS):
         enclosing = s.chain[:-1]
         return Region("class", enclosing, classes=s.classes, via_def=s.chain)
+    if s.kind == "lambda":
+        return Region("function", s.chain, lambda_call_lines(s.node), False, s.classes)
     first = s.body_start if s.kind == "def" else s.start
     sig = s.kind == "def" and line_in_scope is not None and line_in_scope < s.body_start
     return Region("function", s.chain, (first, s.end), sig, s.classes)

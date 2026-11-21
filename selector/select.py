@@ -11,8 +11,11 @@ here knows which tests any particular edit breaks.
   .py that does not parse after patch    ALL
   sqlglot/ function body                 tests that ran any line of the function (lines map)
     … signature / decorator              + users of the enclosing classes (classes map)
-  sqlglot/ class body                    users of the class chain ∪ tests that ran the file
-  sqlglot/ module level                  users of the module's classes ∪ tests that ran the file
+  sqlglot/ class body / module level,    tests that ran a line reading a changed name, ∩ the
+    assignments with inert new values    conservative set below; ∪ test-file reads; a changed
+                                         lambda body → tests that called it (selector/names.py)
+  sqlglot/ class body (otherwise)        users of the class chain ∪ tests that ran the file
+  sqlglot/ module level (otherwise)      users of the module's classes ∪ tests that ran the file
                                          (ALL if the changed names are used in other modules)
   base class / module body (BASE_FILES)  ALL
   tests/ test function                   that test (and same-named inherited copies)
@@ -35,7 +38,7 @@ import ast
 import re
 from pathlib import Path, PurePosixPath
 
-from . import classify, diff
+from . import classify, diff, names
 from .maps import Maps
 
 # Class and module bodies of these files shape nearly every test (map gives ~1550 of 1620).
@@ -71,8 +74,11 @@ class Selector:
             self._by_file.setdefault(t["file"], set()).add(t["number"])
             self._id_of[t["number"]] = t["id"]
         self._number_of = {t["id"]: t["number"] for t in tests}
+        self._secs = {t["number"]: float(t.get("seconds", 0.0)) for t in tests}
         self._untraced: set[int] | None = None
         self._sources: dict[str, str] | None = None
+        self._name_index: names.Index | None = None
+        self.notes: list[str] = []  # why a definition-time region was (not) narrowed
 
     def all_numbers(self) -> set[int]:
         return set(self._all)
@@ -219,16 +225,42 @@ class Selector:
                 else:
                     kinds.append(f"def {'.'.join(r.chain) or '<lambda>'}")
             else:
+                self.notes.clear()
                 got = self._definition_time(path, module, old_tree, new_tree, r)
-                kinds.append(f"{r.kind} {'.'.join(r.chain) or module}")
+                note = f" [{'; '.join(self.notes)}]" if self.notes else ""
+                kinds.append(f"{r.kind} {'.'.join(r.chain) or module}{note}")
             chosen |= got
         return chosen, ", ".join(kinds)
 
     def _definition_time(self, path: str, module: str, old_tree: ast.Module,
                          new_tree: ast.Module, r: classify.Region) -> set[int]:
-        """Class or module body: runs once at import, so line coverage cannot see who uses it."""
+        """Class or module body: runs once at import, so line coverage cannot see who uses it.
+
+        First try to narrow by the changed names (`_by_names`); if that cannot be proven
+        safe, take the conservative set: users of the class chain ∪ tests that ran the file.
+        """
         if path in BASE_FILES:
             raise AllTests(f"{path}: base class / module body")
+        try:
+            wide: set[int] | None = self._conservative(path, module, old_tree, new_tree, r)
+            wide_error = None
+        except AllTests as exc:
+            wide, wide_error = None, exc
+        if r.kind in ("class", "module") and not r.via_def:
+            try:
+                got, why = self._by_names(path, old_tree, new_tree, r, wide)
+                if wide is not None and self._seconds(got) >= self._seconds(wide):
+                    raise names.Fallback(f"{why}, but no cheaper")
+                self.notes.append(f"{'.'.join(r.chain) or module}: {why}")
+                return got
+            except names.Fallback as exc:
+                self.notes.append(f"{'.'.join(r.chain) or module}: no narrowing ({exc})")
+        if wide_error is not None:
+            raise wide_error
+        return wide
+
+    def _conservative(self, path: str, module: str, old_tree: ast.Module,
+                      new_tree: ast.Module, r: classify.Region) -> set[int]:
         got = set(self.maps.whole_file(path))
         users = self._class_users(module, r.classes) if r.classes else set()
         if not users:
@@ -239,6 +271,86 @@ class Selector:
         if not got:
             raise AllTests(f"{path}: definition-time change with no known users")
         return got
+
+    def _by_names(self, path: str, old_tree: ast.Module, new_tree: ast.Module,
+                  r: classify.Region, wide: set[int] | None) -> tuple[set[int], str]:
+        """Tests that can observe the edit, found by the names it changes (selector/names.py).
+
+        = tests that ran a changed lambda
+        ∪ (tests that ran a line reading a changed name in sqlglot/) ∩ the conservative set
+        ∪ tests whose own code reads a changed name (tests/).
+        Raises names.Fallback when any step cannot be proven safe.
+        """
+        index = self._index()
+        if r.kind == "class":
+            old_node = names._find_class(old_tree, r.chain)
+            new_node = names._find_class(new_tree, r.chain)
+            if old_node is None or new_node is None:
+                raise names.Fallback("class added or removed")
+            head = lambda c: [ast.dump(x) for x in c.bases + c.keywords + c.decorator_list]  # noqa: E731
+            if head(old_node) != head(new_node):
+                raise names.Fallback("class bases / keywords / decorators changed")
+            old_body, new_body = old_node.body, new_node.body
+        else:
+            old_body, new_body = old_tree.body, new_tree.body
+        change = names.body_change(old_body, new_body, old_tree)
+        direct: set[int] = set()
+        for first, last in change.lambda_spans:  # a lambda body only runs when called
+            got = self.maps.span(path, first, last)
+            if not got:
+                raise names.Fallback(f"lambda at line {first} never ran under a test")
+            direct |= got
+        readers: set[int] = set()
+        in_tests: set[int] = set()
+        touch = set(wide) if wide is not None else None
+        todo = [(n, path, r.chain if r.kind == "class" else (), follow)
+                for n, follow in change.names.items()]
+        seen: set[tuple[str, str, tuple[str, ...]]] = set()
+        n_sites = 0
+        while todo:
+            name, owner_path, owner_chain, follow = todo.pop()
+            if (name, owner_path, owner_chain) in seen:
+                continue
+            seen.add((name, owner_path, owner_chain))
+            if name.startswith("__") and name.endswith("__"):
+                raise names.Fallback(f"{name} is a special name")
+            if owner_chain:
+                family = index.check_class(owner_path, owner_chain)
+                blocker = index.handles(family)
+                if blocker:
+                    raise names.Fallback(blocker)
+                if touch is not None and (owner_path, owner_chain) != (path, r.chain):
+                    touch |= self.maps.whole_file(owner_path) | self._class_users(
+                        _module_of(owner_path), [owner_chain])
+            for site in index.sites(name, owner_path, owner_chain, name in change.new_names):
+                n_sites += 1
+                if site.path.startswith("tests/") and not site.dynamic:
+                    if site.when == "run":
+                        in_tests |= self.maps.span(site.path, *site.lines)
+                    else:  # test-module import code: every test of that file depends on it
+                        in_tests |= self._by_file.get(site.path, set()) | set(
+                            self.maps.test_imports.get(site.path))
+                elif site.when == "run" or (site.path.startswith("tests/") and site.dynamic):
+                    readers |= self.maps.span(site.path, *site.lines)
+                elif site.copy is not None and follow:
+                    chain, targets = site.copy
+                    todo.extend((t, site.path, chain, True) for t in targets)
+                else:
+                    raise names.Fallback(f"{name} read at import / in cached code ({site.what})")
+        if change.names and not (readers or in_tests):
+            raise names.Fallback(f"no test ran a line reading {sorted(change.names)}")
+        if touch is not None:
+            readers &= touch
+        shown = ", ".join(sorted(change.names)) or "lambda bodies"
+        return readers | in_tests | direct, f"names {shown} → {n_sites} reader sites"
+
+    def _seconds(self, numbers: set[int]) -> float:
+        return sum(self._secs.get(n, 0.0) for n in numbers)
+
+    def _index(self) -> names.Index:
+        if self._name_index is None:
+            self._name_index = names.Index(self._all_sources())
+        return self._name_index
 
     def _class_users(self, module: str, chains) -> set[int]:
         out: set[int] = set()
