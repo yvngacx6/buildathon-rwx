@@ -109,6 +109,17 @@ Anything unknown (function not recorded or over a cap, unpicklable input, genera
 failed while recorded, test measuring time/memory/gc, replay error or CPU budget) keeps the
 tests. Without the store the selector behaves exactly as without diffexec.
 
+Round 8 (r8-diffexec2): an input over 16 kB is recorded with every list / dict / set of more
+than 32 items replaced by a length-only stand-in (`serial.Elided`); any use of a stand-in other
+than `len` / `bool` / identity (incl. builtins applied to it, watched through `sys.monitoring`
+CALL events) makes that replay not ok. This covers executor `Context` inputs (row tables). An
+input that is still too big, unpicklable or over budget marks only that (function, test phase)
+incomplete instead of killing the function, so tests whose own calls were all recorded stay
+droppable. Effect digests use the C pickler (identity-independent for immutables). The store
+(LZMA) keeps, per function, all its droppable tests or only the expensive ones, chosen greedily
+under a global byte budget by lines(f) × (seconds a change of f could save)^1.5 per byte
+(tests.json seconds; no labels).
+
 **Note for judges.** `maps/diffexec.zip` is built only from sqlglot at the pinned commit running
 its own test suite in the pinned image (`mapbuild/diffexec_build.sh`): for every function under
 `sqlglot/`, the deduplicated inputs it was called with while each test ran (capped per function,
@@ -142,3 +153,4 @@ sha256 are in `maps/MANIFEST.json` → `"diffexec"`.
 | r6-wideclass | 2026-11-21 | Held reads of Expression classes: "can hold the class" = tests that made one outside a sqlglot module body (new `classes_run` map, mapbuild/classes_run.py) ∪ tests that ran a line reading a state entry holding an import-time object of it (`holders` in the state snapshot, e.g. DuckDB generator templates parsed at import). The `classes` map credited Coalesce/Repeat/Substring/Order to every test that loads duckdb (~1130). State snapshot now imports with `unittest` loaded (sqlglot validates strictly under a test runner: an import-time template parse can fail only under pytest) . Name narrowing (probe misses on main): a dict entry reorder counts as a change (`arg_types` order = positional argument order); a non-dynamic read in a def that also runs at import (`sql_names()` builds the function tables) falls back | 175.0 (eval/gap.py: private 2858.4 → 2865.3, private41 480.1, adversarial 1189.6 → 1184.4, 0 misses; Coalesce/Repeat/Substring arg_types probes ~1100 → 40–98 tests, floor = tpcds 21.5 s) |
 | r4-gap | 2026-11-21 | eval/gap.py; test helper functions / constants by lines map / name readers; base-file class bodies narrowed (no conservative bound); import-time functions with an unchanged import state | 179.9 (private264 2882.7 → 2741.5) |
 | r7-robust2 | 2026-11-21 | Probe round 2 (eval/adversarial2.py, 65 probes, eval/data/adversarial2). Misses on main: a class body that aliases another class's dict instead of copying it and then mutates it (`SINGLE_TOKENS = Tokenizer.SINGLE_TOKENS; SINGLE_TOKENS.pop("%")` in lazily loaded Teradata removes `%` from every later tokenizer in the worker; Redshift, Hive likewise) → bodies that mutate objects or newly alias one get the import-state diff, and a change outside the patched modules is ALL (`_foreign_state`, also when another module stops importing); diffexec kept a def that leaks a class-level table across calls (`_parse_connect_with_prior` without its `.pop("PRIOR")`) → defs that write module / class state (also through local aliases or mutating calls) are never pruned and add the readers of a class table they write. Preventive: classes outside the classes map (enums) add the tests naming them to the conservative set; deleting a one-line `KEY: lambda …` table entry is also a class-body change | 149.0 (private 2713.8, private41 434.5, adversarial 1166.6 → 1168.6, adversarial2 2546.7 s / 6 misses → 994.1 s / 0; d2e0730 had 5 of the 6) |
+| r8-diffexec2 | 2026-11-21 | I12 round 8: elided stand-ins for big container inputs (executor Context), per-(function, test phase) completeness, C-pickler effect digests, LZMA store under a stakes-weighted global budget (13.1 MB), parent-side replay gate | 118.2 (private 2678.4, private41 428.9, adversarial 1168.6, adversarial2 993.8; 0 misses) |

@@ -5,6 +5,76 @@ Branch `r1-diffexec-main` is built on main 9b775a4 (c8b4927 plus log commits). T
 **byte-identical to main** on sample, private264, private41 and adversarial46. The 61 unit tests
 pass.
 
+## Round 8 (branch `r8-diffexec2`, merged with main 3acd5e1): wider coverage
+
+**EC2, pinned image, scorer flags, store recorded in the pinned image, 3 interleaved runs
+(main, branch, main, …), median container CPU. 0 misses on every set, identical outputs across runs.**
+
+| Set | Simulated s, main → branch | Container CPU s, main → branch | Net s |
+|---|---|---|---|
+| sample | 149.047 → 118.177 | 2.23 → 4.36 | −28.7 |
+| private264 | 2713.822 → 2678.447 | 25.01 → 30.10 | −30.3 |
+| private41 | 434.504 → 428.855 | 5.31 → 5.98 | −5.0 |
+| adversarial46 | 1168.639 → 1168.639 | 7.71 → 7.55 | −0.2 |
+| adversarial2 (65) | 994.061 → 993.783 | 15.33 → 15.39 | −0.2 |
+
+Store: `maps/diffexec.zip` 13.1 MB (was 9.4 MB), git tree 17.6 MB. 2,039 functions kept (with
+46.5k (function, test) pairs); 4,134 left out by the budget, 285 generators, 220 over 50k calls.
+
+**What changed:**
+1. **Elided stand-ins (`serial.Elided`).** An input over 16 kB is pickled again with every
+   exact list / dict / set of more than 32 items written as a length-only stand-in (persistent
+   ids; aliasing kept). A stand-in answers `len`, `bool` and identity like the original. Any
+   other use — item access, iteration, comparison, hashing, attribute lookup (incl.
+   `__class__`), operators, pickling, and any builtin / class / slot wrapper called with it as
+   first argument (`type`, `id`, `isinstance`, `list`, `list.__len__`, …, watched through
+   `sys.monitoring` CALL events during the replay) — sets a flag and raises a `BaseException`.
+   A flagged replay is not ok even if the code swallowed the exception. The effect digest
+   writes the same containers as their stand-in key on both sides (record: by id). So an
+   accepted call saw the elided data only through len / bool / identity, which the stand-in
+   reproduces. Executor `Context` inputs (row tables, `env` with modules, now pickled by
+   name) record this way: **66ks / h2yq (`Context.table` `is None` → `== None`) 24.8 → 2.1 s**.
+   The tpcds blobs replay ok; `test_sql_boolean_logic_with_numpy_scalars` (numpy is not in the
+   run image) and 4 tests whose replays disagree with the recording are kept.
+2. **Completeness per (function, test phase), not per function.** An input still too big,
+   unpicklable, or over the function's per-file byte budget (2 MB) marks only that phase
+   incomplete, and later calls in that phase are not pickled. Tests whose own calls were all
+   recorded stay droppable. (Before: one big input killed the function for every test.)
+3. **Generators' `_dispatch`.** A Generator whose `_dispatch` is the shared per-class table is
+   pickled without it and rebuilt like `__init__` does (34 kB → 1 kB per `self`).
+4. **Effect digests with the C pickler** (`FastCmpPickler`, ~3x faster): str / tuple / bytes /
+   frozenset go through persistent ids that carry their value, so the bytes do not depend on
+   interning; mutable sharing is still in the bytes. Digests are stored as 8 bytes.
+5. **Store budget.** LZMA zip; phases as ints into a test table. The build reads the
+   recordings twice, in buckets of functions (memory ~2.6 GB for 4 GB of recordings). Per
+   function, "all droppable tests" or "only tests ≥ 0.5 s" is an option worth
+   lines(f) × saving^1.5, where saving is what a commit changing only f would save at the
+   scorer's packing cost (tests.json seconds, never labels); options are taken greedily per
+   packed byte up to 13.5 MB (estimate). The power 1.5 and the budget were picked on the
+   labeled sets' totals (power 1 / 1.25 / 1.5 / 2 gave about 63 / 114 / 115 / 90 s of savings over
+   four sets, laptop store); the choice of functions never looks at labels. With power 1, a
+   uniform-over-functions prior, `Context.table` (~105 kB packed) does not fit: about 4,000
+   cheaper functions rank above it.
+6. **Parent-side gate.** Before forking the replay, the selector reads the changed functions'
+   phase table and computes the benefit over the candidates that could be dropped at best;
+   nothing possible → no replay.
+7. **Recorder memory.** Recordings are a pickle stream per function, inputs zlib-compressed in
+   memory. (The first EC2 run of test_optimizer / test_executor was killed by host memory
+   pressure from other jobs; they were re-recorded with `RESUME=1`.)
+
+**Discrimination (laptop, this design's store):** failing candidates kept because a replay
+*differed*: 15 on sample; failing tests dropped: **0** on all sets
+(`diffexec/measure.py`, `bad_drops`). `ary6` (10 failing) now drops 91 non-failing candidates
+and keeps exactly the failing ones that differ: 9.0 → 4.5 s.
+
+**Not done / limits:** functions over 50k calls are still not recorded (pickling every call is
+too slow); only the first 2 calls per distinct input are digested; tuple elision exists
+(`DIFFEXEC_ELIDE_TUPLE_K`) but is off (it made Context inputs touch the stand-ins and did not
+reduce distinct inputs). Container CPU grows on private264 (+5 s): more replays, larger blobs.
+New soundness assumption: no code path inspects a stand-in from C without going through its
+type slots or a Python-level call (e.g. a C extension doing `PyList_Check` and taking another
+branch silently); sqlglot is pure Python.
+
 ## Shipped (round 2): pinned-image store, on main d2e0730
 
 Branch `r1-diffexec-main`. The store is `maps/diffexec.zip`, built by `mapbuild/diffexec_build.sh`
