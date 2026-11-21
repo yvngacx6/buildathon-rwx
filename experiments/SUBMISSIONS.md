@@ -7,3 +7,4 @@
 | S03 | 11-20 23:16 | eac471c | v1+I08+robust+slowtests | 185.0 | 3329.9 / 0 (264) | 216.0 (213.7 sim + 2.3 CPU) | 0/40 | First with robustness + slow-test statement rule. |
 | S04 | 11-21 00:18 | c893605 | + definitive maps, import closure, class-creation state diff | 179.9 | 2882.7 / 0 (264); adv 0/46 | 212.7 (209.5 sim + 3.2 CPU) | 0/40 | CPU up 1 s from state diff. |
 | S05 | 11-21 01:20 | 8585937 | + CPU cut (compiled stdlib, marshal shards) | 179.9 | 2882.7 / 0 (264) | 210.8 (209.5 sim + 1.3 CPU) | 0/40 | CPU −1.9 s. |
+| S06 | 11-21 02:22 | d2e0730 | + tune, class-attr narrowing, wide-class (2 miss fixes) | 175.0 | 2865.3 / 0 (264); adv 0/46 | pending | pending | |
