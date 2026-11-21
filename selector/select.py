@@ -200,6 +200,12 @@ class Selector:
             self.slowverify = SlowVerify.create(self)
         except Exception:  # noqa: BLE001  (optional pruner)
             self.slowverify = None
+        self.genmem = None
+        try:
+            from .genmem import GenMem
+            self.genmem = GenMem.create(self)
+        except Exception:  # noqa: BLE001  (optional pruner)
+            self.genmem = None
 
     def all_numbers(self) -> set[int]:
         return set(self._all)
@@ -237,6 +243,8 @@ class Selector:
             for pruner in (self.subtest, self.slowverify):
                 if pruner is not None:
                     per_file = self._subtest(per_file, reasons, pruner)
+        if self.genmem is not None:
+            per_file = self._genmem(per_file, reasons)
         for _, got in per_file:
             chosen |= got
         if chosen:
@@ -269,6 +277,29 @@ class Selector:
         if note:
             reasons.append(note)
         return [(p, got - dropped) for p, got in per_file]
+
+    def _genmem(self, per_file, reasons):
+        """Drop test_generator_memory when its body passes on the patched package
+        (selector/genmem.py)."""
+        from . import pack
+        n = self.genmem.number
+        everything = set().union(*(got for _, got in per_file))
+        if n not in everything:
+            return per_file
+        ms_of = {k: pack.duration_ms(s) for k, s in self._secs.items()}
+        base = pack.cost_ms(pack.pack(everything, ms_of), ms_of)
+
+        def benefit(only):
+            rest = everything - only
+            return base - (pack.cost_ms(pack.pack(rest, ms_of), ms_of) if rest else 0)
+
+        try:
+            drop, note = self.genmem.prune(self._files, per_file, benefit)
+        except Exception as e:  # noqa: BLE001
+            drop, note = False, f"genmem: keep ({type(e).__name__})"
+        if note:
+            reasons.append(note)
+        return [(p, got - {n}) for p, got in per_file] if drop else per_file
 
     def _benefit(self, per_file, only: set[int] | None = None) -> int:
         """Cost saved (ms) if diffexec dropped every prunable test (or every prunable test in
