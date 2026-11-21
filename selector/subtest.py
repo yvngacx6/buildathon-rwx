@@ -796,7 +796,8 @@ class SubTest:
         self.stage_ok, self.stage_why = False, "off"
         if STAGE:
             try:
-                why = stage_guard(str(self.sel.sqlglot), jobs)
+                why = (None if os.environ.get("BR_SUBTEST_GUARD") == "0"  # experiments only
+                       else stage_guard(str(self.sel.sqlglot), jobs))
             except Exception as e:  # noqa: BLE001
                 why = type(e).__name__
             self.stage_ok = why is None
