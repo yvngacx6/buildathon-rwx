@@ -53,6 +53,7 @@ SCORER_SLOWDOWN = 2.0
 BUDGET_S = float(os.environ.get("BR_SUBTEST_S", "12"))
 STAGE = os.environ.get("BR_SUBTEST_STAGE", "1") != "0"  # moon-05 checkpoint verification
 FALLBACK = os.environ.get("BR_SUBTEST_FALLBACK", "0") != "0"  # checkpoint differs → whole query
+FALLBACK_CAP = float(os.environ.get("BR_SUBTEST_FALLBACK_CAP", "1.5"))  # laptop s
 SHARE = 0.6  # spend at most this share of what dropping saves
 
 
@@ -580,7 +581,7 @@ class SubTest:
         if not todo:
             return chosen, f"subtest: {sorted(chosen)} dropped (no query runs a touched statement)"
         try:
-            ok = self.verify(jobs, todo, min(BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0))
+            ok = self.verify(jobs, todo, min(BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0 + FALLBACK_CAP))
         except Exception as e:  # noqa: BLE001
             return set(), f"subtest: keep ({type(e).__name__})"
         if not ok:
@@ -680,6 +681,7 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
     import sqlglot.executor as E
     from sqlglot import parse_one as _parse_one, transpile as _transpile
     full = []
+    fb_cpu = 0.0  # pinned CPU of the queries re-run whole after a checkpoint diverged
     # checkpoint-verified queries first (cheap; a divergence ends the child early)
     for suite, i, opt, mode, parse_hit, optb_hit, duck_hit in todo:
         if mode != "stage":
@@ -694,7 +696,8 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
                 if parse_hit:
                     e = pickle.loads(pickle.dumps(_parse_one(q["sql"])))
                     if strict_digest(e) != q["outs"]["d_parse"]:
-                        if not FALLBACK: return False
+                        fb_cpu += q["cpu_exec"]
+                        if not FALLBACK and fb_cpu > FALLBACK_CAP: return False
                         full.append((suite, i, opt))  # parse differs: run the whole query
                         continue
                 if optb_hit:
@@ -705,7 +708,8 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
                     if strict_digest(oe) != q["outs"]["d_opt"]:
                         if os.environ.get("SUBTEST_DEBUG"):
                             print("subtest stage diff:", suite, i, file=sys.stderr)
-                        if not FALLBACK: return False
+                        fb_cpu += q["cpu_exec"]
+                        if not FALLBACK and fb_cpu > FALLBACK_CAP: return False
                         full.append((suite, i, opt))  # optimized tree differs: run it all
                         continue
             except Exception:  # noqa: BLE001
