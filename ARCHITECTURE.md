@@ -10,6 +10,8 @@ patch ──► diff.parse/apply ──► per file ──► rule (select.py) �
                                   │                   (slow tests: only if they ran a touched statement)
                                   │                   ∪ import-time map: run while `import sqlglot` → ALL,
                                   │                     run while importing module M → M's dependents
+                                  │                     (nothing if only sqlglot/ modules run it and the
+                                  │                     import-state diff is empty)
                                   │        class / module assignment → names.py: readers of the changed
                                   │                   names (line map) ∩ conservative set, else:
                                   │        class-creation consumers → state.py: import old + patched,
@@ -17,8 +19,10 @@ patch ──► diff.parse/apply ──► per file ──► rule (select.py) �
                                   │                   changed value among tests that can hold its class, else:
                                   │        class    → classes map (class chain, MRO) ∪ tests that ran the file
                                   │        module   → module users ∪ tests that ran the file ∪ importers' users
+                                  │        base files (BASE_FILES): name / state narrowing, unbounded, else ALL
                                   ├─ tests/fixtures/** → reads map (never AST-filtered)
-                                  ├─ tests/*.py → test functions, or whole file ∪ test_imports
+                                  ├─ tests/*.py → test functions; other functions → lines map;
+                                  │        module constants → name readers; else whole file ∪ test_imports
                                   └─ docs/config/unknown → nothing / pytest-section check / ALL
 ```
 
@@ -38,10 +42,12 @@ Every rule is about code structure; no rule names an edit kind as harmless or ma
 | `selector/pack.py` | Choose worker count and split tests (scorer cost model). |
 | `mapbuild/import_time.py` | Build `maps/import_time.json.gz`: per line, the modules whose import runs it (fresh interpreter per module, sys.monitoring). |
 | `eval/adversarial.py` | Write the adversarial private patch set (import-time code, removed names, hunkless diffs, …). Patches and labels stay out of git. |
+| `eval/adversarial2.py` | Round-2 probes (65) aimed at the newer narrowing: name narrowing (aliases, f-strings, partial, defaults, lambdas, shadowing, `__getattr__`), import-state diff (metaclass-derived values, held reads), shared-state aliasing, slow-test statement rule, import bound, multi-file mixes. Labeled with the full suite in the pinned image; set in `eval/data/adversarial2/` (gitignored). |
 | `mapbuild/import_map.py` | Builds `maps/imports.json.gz`: runs every test alone in a fresh pytest process with `mapbuild/importtrace/sitecustomize.py` on PYTHONPATH (audit "import" hook, also in subprocesses / spawned pool workers) and records each module it loads. Selector use: the import bound (below). |
 | `mapbuild/convert_prototype.py` | INTERIM: convert the laptop prototype maps (research reports 02 and 05) into the SCHEMA format. |
 | `maps/` | `lines`, `classes`, `reads`, `test_imports`, `import_time` (.json.gz) + `MANIFEST.json`. |
 | `eval/evaluate.py` | Score the selector on `sample/` and the private set, without Docker. |
+| `eval/gap.py` | Oracle-gap report (I14): per commit our cost, the oracle cost (failing tests packed alone), the gap, the reason, and which mechanism (function map, statement rule, name / state narrowing, conservative set, import bound, ALL fallback, fixture readers, test-file rules, untraced, near-ALL) added the extra tests; aggregated by mechanism and kind. |
 | `tests/test_select.py` | One unit test per rule, on a tiny fake repo (`python -m pytest tests/`). |
 | `tests/test_names.py` | The I08 narrowing and each of its fallbacks. |
 | `tests/test_state.py` | The I22 import-state narrowing on a fake package with a metaclass. |
@@ -58,7 +64,18 @@ interrupt the whole session (pytest default). Deleting a test file nothing impor
 
 Safety nets: hunk does not apply → ALL; does not parse → import bound; definition-time change
 with no known users → import bound; module-level non-assignment change → import bound;
-base-class bodies (`BASE_FILES`) → import bound (≈ ALL: 1617 tests load them);
+base-class bodies (`BASE_FILES`) that the name / state narrowing cannot take → import bound
+(≈ ALL: 1617 tests load them);
+shared state (r7-robust2): a class / module body that mutates objects (`KEYWORDS.pop(...)`,
+`COERCES_TO[k] |= {...}`, loops) or whose edit binds an existing object by reference
+(`SINGLE_TOKENS = Tokenizer.SINGLE_TOKENS`) gets the import-state diff first; a changed entry
+outside the patched modules (not a subclass of one of their classes, not a copy of one of their
+changed values) means the edit mutates another module's state → ALL, never the import bound:
+once the module is imported (lazily, by any earlier test in the worker) every later test sees it;
+a def that writes a class-level table at run time (`self.NO_PAREN_FUNCTION_PARSERS["PRIOR"] = …`
+… `.pop("PRIOR")`) adds the tests that ran a line naming the table; a class the classes map does
+not record (enums, namespaces) adds, to its conservative set, the tests that ran a line naming it
+(`ErrorLevel.RAISE` is read in parser.py by tests that never run errors.py);
 a function no test ran is treated as definition-time code (it may run only at import);
 Import-time: a function whose body runs while modules are imported (trie builders, decorator
 factories, `X = build()` tables, module `__getattr__`) is a change to every importer: ALL if
@@ -123,3 +140,5 @@ sha256 are in `maps/MANIFEST.json` → `"diffexec"`.
 | r3-cpu | 2026-11-21 | Run-time CPU only, identical output: stdlib/selector/sqlglot bytecode, compiled map shards, AST work proportional to the edit (text-identical statements skip dumps / recompiling), old files parsed once per run | 179.9 (container CPU 3.5 → 1.4 s, loaded EC2) |
 | r5-classattr | 2026-11-21 | I22 held reads: a computed-name lookup (`getattr(x, v)`, `hasattr`, `attrgetter`) of a changed class attribute is restricted to tests that can hold the class, like a static `x.NAME` read (both reach a class attribute only through an object of the class or the class itself). Namespace listings (`vars`, `__dict__`, `dir`, `getmembers`) and test code stay unrestricted. Fixes per-class `arg_types` edits selecting every `getattr` caller (serde, Token repr, …) | 175.0 (private 2882.7 → 2862.4, private41 506.7 → 480.1) |
 | r6-wideclass | 2026-11-21 | Held reads of Expression classes: "can hold the class" = tests that made one outside a sqlglot module body (new `classes_run` map, mapbuild/classes_run.py) ∪ tests that ran a line reading a state entry holding an import-time object of it (`holders` in the state snapshot, e.g. DuckDB generator templates parsed at import). The `classes` map credited Coalesce/Repeat/Substring/Order to every test that loads duckdb (~1130). State snapshot now imports with `unittest` loaded (sqlglot validates strictly under a test runner: an import-time template parse can fail only under pytest) . Name narrowing (probe misses on main): a dict entry reorder counts as a change (`arg_types` order = positional argument order); a non-dynamic read in a def that also runs at import (`sql_names()` builds the function tables) falls back | 175.0 (eval/gap.py: private 2858.4 → 2865.3, private41 480.1, adversarial 1189.6 → 1184.4, 0 misses; Coalesce/Repeat/Substring arg_types probes ~1100 → 40–98 tests, floor = tpcds 21.5 s) |
+| r4-gap | 2026-11-21 | eval/gap.py; test helper functions / constants by lines map / name readers; base-file class bodies narrowed (no conservative bound); import-time functions with an unchanged import state | 179.9 (private264 2882.7 → 2741.5) |
+| r7-robust2 | 2026-11-21 | Probe round 2 (eval/adversarial2.py, 65 probes, eval/data/adversarial2). Misses on main: a class body that aliases another class's dict instead of copying it and then mutates it (`SINGLE_TOKENS = Tokenizer.SINGLE_TOKENS; SINGLE_TOKENS.pop("%")` in lazily loaded Teradata removes `%` from every later tokenizer in the worker; Redshift, Hive likewise) → bodies that mutate objects or newly alias one get the import-state diff, and a change outside the patched modules is ALL (`_foreign_state`, also when another module stops importing); diffexec kept a def that leaks a class-level table across calls (`_parse_connect_with_prior` without its `.pop("PRIOR")`) → defs that write module / class state (also through local aliases or mutating calls) are never pruned and add the readers of a class table they write. Preventive: classes outside the classes map (enums) add the tests naming them to the conservative set; deleting a one-line `KEY: lambda …` table entry is also a class-body change | 149.0 (private 2713.8, private41 434.5, adversarial 1166.6 → 1168.6, adversarial2 2546.7 s / 6 misses → 994.1 s / 0; d2e0730 had 5 of the 6) |
