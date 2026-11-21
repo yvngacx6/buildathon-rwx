@@ -1553,6 +1553,15 @@ class Selector:
             start = int(start)
             if own is not None and file == path and start <= first and end == last:
                 continue  # the edited def itself
+            # a call while a test module is imported is not in the lines map: only test
+            # modules whose own import-time code runs no sqlglot code (as for the edit)
+            mods = self.maps.import_time.modules(file, start, end)
+            roots = (self._test_modules() if ImportTimeMap.ROOT in mods
+                     else {m for m in mods if m.split(".")[0] == "tests"})
+            if not all(self._explained_root(m, file, start, end) for m in roots) or any(
+                    m != ImportTimeMap.ROOT and (m.split(".")[0] not in ("sqlglot", "tests")
+                                                 or m == "sqlglot.__main__") for m in mods):
+                return None
             seen |= self.maps.span(file, start, end)
         drop = dropable - seen
         if not drop:
