@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+DEFAULT_STORE = REPO / "maps" / "diffexec.zip"
 # Test sources mentioning these observe resources that replay cannot compare.
 RESOURCE_MODULES = {"tracemalloc", "gc", "resource", "time", "timeit", "psutil", "threading",
                     "signal", "faulthandler", "pyperf"}
@@ -43,6 +44,7 @@ class DiffExec:
         self.store = store
         self.spent = 0.0
         self._idx = None
+        self._failed: set[str] = set()  # tests that failed while recorded: never dropped
         self._by_name: dict | None = None
         self._warm = False
         self.why_kept: dict[str, str] = {}
@@ -61,8 +63,8 @@ class DiffExec:
     def create(cls, selector):
         if os.environ.get("BR_DIFFEXEC", "1") == "0":
             return None
-        store = Path(os.environ.get("BR_DIFFEXEC_STORE", REPO / "diffexec_store"))
-        if not (store / "index.pkl").is_file():
+        store = Path(os.environ.get("BR_DIFFEXEC_STORE", DEFAULT_STORE))
+        if not store.is_file():
             return None
         return cls(selector, store)
 
@@ -165,8 +167,11 @@ class DiffExec:
     def _index(self) -> dict:
         if self._idx is None:
             import pickle
-            with open(self.store / "index.pkl", "rb") as fh:
-                self._idx = pickle.load(fh)
+            import zipfile
+            with zipfile.ZipFile(self.store) as zf:
+                meta = pickle.loads(zf.read("index.pkl"))
+            self._idx = meta["functions"]
+            self._failed = set(meta.get("failed", ()))
         return self._idx
 
     def _precheck(self, jobs) -> str | None:
@@ -244,10 +249,12 @@ class DiffExec:
                 tid = self.sel._id_of[num]
                 if tid in bad_tests:
                     continue
+                if tid in self._failed:
+                    self.why_kept[tid] = "failed-while-recorded"
+                    continue
                 if tid not in seen_tests or self._is_resource(tid):
                     self.why_kept[tid] = "unseen" if tid not in seen_tests else "resource"
                     continue
-                # setUpClass of a classmate that ran a changed function must also be ok
                 out.add(num)
             dropped[path] = out
             n += len(out)

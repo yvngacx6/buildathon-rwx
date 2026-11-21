@@ -3,7 +3,7 @@
 Invoked by the selector as a child process (``python -m diffexec.replay``) with
 PYTHONHASHSEED=0 and a JSON request on stdin:
 
-    {"root": "/opt/sqlglot", "store": "<store dir>", "deadline_s": 20,
+    {"root": "/opt/sqlglot", "store": "<store .zip>", "deadline_s": 20,
      "files": [{"path": "sqlglot/x.py", "new_text": "..."}]}
 
 Answer on stdout (JSON):
@@ -27,7 +27,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import gc
-import gzip
+import zipfile
 import importlib
 import io
 import json
@@ -106,8 +106,8 @@ def run_request(req: dict) -> dict:
     from diffexec import serial
 
     out = {"bail": None, "codes": {}, "stats": {}}
-    with open(os.path.join(req["store"], "index.pkl"), "rb") as fh:
-        index = pickle.load(fh)
+    store = zipfile.ZipFile(req["store"])
+    index = pickle.loads(store.read("index.pkl"))["functions"]
 
     plan = []  # (key str, store entry, old code, new code, module name)
     swaps = []  # (old code, new code)
@@ -222,8 +222,7 @@ def run_request(req: dict) -> dict:
         if old_code.co_flags & GEN_FLAGS:
             info["state"] = "dead:generator"
             continue
-        with gzip.open(os.path.join(req["store"], "c", f"{fileno}.pkl.gz"), "rb") as fh:
-            rec = pickle.load(fh)
+        rec = pickle.loads(store.read(f"c/{fileno}.pkl"))
         live_old = next((c for fn, c, _ in live if c.co_qualname == old_code.co_qualname
                          and c.co_firstlineno == old_code.co_firstlineno), old_code)
         verdict = []

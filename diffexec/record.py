@@ -26,10 +26,14 @@ import time
 from diffexec import serial
 
 OUT = os.environ.get("DIFFEXEC_OUT", ".")
+# Caps. The store applies the same caps again after merging all workers (diffexec/build.py):
+# merged calls >= any worker's calls and merged distinct bytes >= any worker's, so a function a
+# worker kills here would be killed after merging too, and the store does not depend on -n.
 CALL_CAP = int(os.environ.get("DIFFEXEC_CALL_CAP", "50000"))
-BYTE_CAP = int(float(os.environ.get("DIFFEXEC_BYTE_CAP", "2e6")))
+BYTE_CAP = int(float(os.environ.get("DIFFEXEC_BYTE_CAP", "300e3")))  # distinct input bytes
 INPUT_CAP = int(float(os.environ.get("DIFFEXEC_INPUT_CAP", "16e3")))  # one call's input bytes
-TIME_CAP = float(os.environ.get("DIFFEXEC_TIME_CAP", "2.0"))  # pickling seconds per function
+# Safety only (worker-dependent): pickling seconds per function per worker. Default: off.
+TIME_CAP = float(os.environ.get("DIFFEXEC_TIME_CAP", "inf"))
 ROOT = os.path.realpath(os.environ.get("DIFFEXEC_ROOT", os.getcwd())) + "/sqlglot/"
 # Measurement only: record just these "path:qualname" functions (all others are skipped, as
 # if dead). Used to simulate the full recorder on the functions a labeled set changes.
@@ -250,6 +254,16 @@ def pytest_runtest_teardown(item):
     cur["phase"] = "OTHER"
 
 
+failed_tests: set = set()
+
+
+def pytest_runtest_logreport(report):
+    """A test (or one of its subtests) that fails or errors under recording: its recording may
+    be cut short or differ from a clean run, so the store marks its phases incomplete."""
+    if report.failed:
+        failed_tests.add(report.nodeid)
+
+
 def pytest_sessionfinish(session):
     mon.set_events(TOOL, 0)
     for code in recs:
@@ -258,6 +272,6 @@ def pytest_sessionfinish(session):
     for rec in recs.values():
         out[rec.key] = {"dead": rec.dead, "calls": rec.calls, "secs": rec.secs, "nbytes": rec.nbytes,
                         "blobs": rec.blobs, "uses": rec.uses}
-    wid = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    wid = os.environ.get("DIFFEXEC_TAG") or os.environ.get("PYTEST_XDIST_WORKER", "main")
     with open(os.path.join(OUT, f"rec_{wid}.pkl"), "wb") as fh:
-        pickle.dump({"recs": out, "stats": stats}, fh, protocol=5)
+        pickle.dump({"recs": out, "stats": stats, "failed": sorted(failed_tests)}, fh, protocol=5)
