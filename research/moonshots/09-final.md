@@ -76,10 +76,8 @@ overstates our safety on truly unseen kinds. **Takeaway:** spend moonshot effort
 - Two different methods tying within 1 s on about 250–400 s needs a cluster. We are about 100 s
   off the top, so the tie rule barely affects us. Don't optimise for it, but follow these free rules:
   1. **Pick the final explicitly.** The default "best practice submission" rewards practice
-     score, not robustness. Pick the commit that has:
-     - 0 misses on sample, private, private41, adversarial and adversarial2;
-     - the wall guard;
-     - a valid board run.
+     score, not robustness. Pick the commit with 0 misses on sample, private, private41,
+     adversarial and adversarial2, the wall guard, and a valid board run.
   2. **Freeze and submit the candidate by Sun ~04:00 PST**, leaving 3–4 hourly slots. A later
      commit loses every tie within 1 s to anyone earlier. Switch only for an expected final gain
      **> 2 s** (the 1 s window plus run noise) that passes the full regression.
