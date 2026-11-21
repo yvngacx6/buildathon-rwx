@@ -190,6 +190,7 @@ class Selector:
         self._defaults: dict[str, list] = {}
         self._no_default_readers: bool | None = None
         self._code_reader_tests: tuple = ()  # `_code_readers` memo: (tests or None,)
+        self._attr_meta: tuple | None = None  # `_attr_readers`: (tracked, untracked, always)
         self._families: dict[tuple, list] = {}  # `_related`: owner class → its family
         self._ancestor_memo: dict[tuple, set | None] = {}
         self._test_imports = None  # testimport.Checker, on first use
@@ -1239,6 +1240,8 @@ class Selector:
                 owner_path, chain, users = owners[owner]
                 touch |= self.maps.whole_file(owner_path) | self._class_users(
                     _module_of(owner_path), [chain])
+            # moon-19: tests that looked `attr` up through the owner's family (attrs map)
+            looked = self._attr_readers(owner, attr, info) if kind == "C" else None
             same = frozenset(found.get("same", {}).get(f"{kind} {owner} {attr}", ()))
             key_free: set[int] = set()
             key_touched: set[int] = set()
@@ -1255,6 +1258,12 @@ class Selector:
                     elif kind == "M":
                         free |= got
                         key_free |= got
+                    elif bucket == "held" and looked is not None:
+                        # a static / getattr read goes through the attribute lookup the
+                        # attrs map recorded: only tests that made that lookup can see it
+                        hit = got & looked if users is None else got & users & looked
+                        held |= hit
+                        key_touched |= hit
                     elif users is None or bucket == "loose":
                         loose |= got
                         key_touched |= got
@@ -1275,6 +1284,42 @@ class Selector:
         return got, (f"state: {', '.join(shown[:6])}{more} → {n_sites} reader sites "
                      f"(globals {len(free)}, unrestricted {len(loose & touch)}, "
                      f"held {len(held)}, tests {len(in_tests)})")
+
+    def _attr_readers(self, owner: str, attr: str, info: dict) -> set[int] | None:
+        """moon-19. Tests that looked `attr` up (x.attr, cls.attr, getattr, hasattr, super())
+        through `owner` or a subclass of it while they ran, from the attrs map
+        (mapbuild/trace_attrs.py: every plain class entry of every sqlglot class was a
+        recording descriptor). Valid only when, at the pinned commit, the lookup through
+        `owner` resolves to such a recorded entry: walking owner's MRO (state info), the first
+        class defining `attr` must have it tracked; a class the tracer never walked, an
+        import-made (`#`) class, an untracked definition (function, class, descriptor) or no
+        definition at all (a new name: getattr defaults) → None (no restriction).
+        Tests the map does not vouch for (untraced, rebound a tracked entry, failed under
+        the tracer) are always included."""
+        amap = self.maps.attrs
+        if amap is None or owner.endswith("#") or ":" not in owner:
+            return None
+        if self._attr_meta is None:
+            extra = amap.extra
+            number_of = self.maps._number_of
+            traced = {number_of[t] for t in amap.traced_ids() if t in number_of}
+            always = (self.all_numbers() - traced) | set(
+                amap._translate(extra.get("replaced", []) + extra.get("failed", [])))
+            self._attr_meta = ({k: frozenset(v) for k, v in extra["tracked"].items()},
+                               {k: frozenset(v) for k, v in extra["untracked"].items()},
+                               always)
+        tracked, untracked, always = self._attr_meta
+        chain = [owner] + [k for k in (info.get(owner) or {}).get("mro", []) if k]
+        for k in chain:
+            if k.endswith("#") or k not in tracked:
+                return None
+            if attr in tracked[k]:
+                break
+            if attr in untracked.get(k, ()):
+                return None
+        else:
+            return None
+        return set(amap.get(f"{owner} {attr}")) | always
 
     def _site_reads(self, index: nameindex.NameIndex, site: names.Site, attr: str,
                     depth: int = 0, same: frozenset[str] = frozenset()
