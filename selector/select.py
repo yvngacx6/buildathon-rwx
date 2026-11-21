@@ -29,6 +29,11 @@ here knows which tests any particular edit breaks.
   sqlglot/ class body (otherwise)        users of the class chain ∪ tests that ran the file
   sqlglot/ module level (otherwise)      users of the module's classes ∪ tests that ran the file
                                          (ALL if the changed names are used in other modules)
+  sqlglot/ removed / renamed def or      tests that ran the old body ∪ `from … import name` in
+    assignment (module or class level)   defs ∪ readers of every changed import-time value
+                                         (`_removed_bindings`); test code reading / importing
+                                         it at collection, removed classes / imports, cached
+                                         readers → import bound / ALL
   base class / module body (BASE_FILES)  the name / state narrowing above, not bounded by
                                          the conservative set (~ALL); if neither applies → ALL
   tests/ test function                   that test (and same-named inherited copies)
@@ -167,6 +172,9 @@ class Selector:
         self._jobs: list = []
         self._mixed_py = False
         self._chains: dict[str, list] = {}
+        self._families: dict[tuple, list] = {}  # `_related`: owner class → its family
+        self._ancestor_memo: dict[tuple, set | None] = {}
+        self._test_imports = None  # testimport.Checker, on first use
         self.diffexec = None
         try:
             from .diffexec import DiffExec
@@ -324,13 +332,28 @@ class Selector:
         if same(old_tree, new_tree):
             return set(), "same syntax tree (ignoring comments and docstrings)"
         lost = _bindings(old_tree) - _bindings(new_tree)
+        gone: set[int] | None = None
         if lost:
-            # A removed/renamed module- or class-level name breaks every importer or caller
-            # (ImportError at collection, AttributeError at call) – far beyond its own tests.
-            raise AllTests(f"{path}: binding removed ({', '.join(sorted(lost)[:3])})")
+            # A removed/renamed module- or class-level name breaks its importers and callers
+            # (ImportError at collection, AttributeError at call): `_removed_bindings`.
+            gone, gone_why = self._removed_bindings(path, old_tree, new_tree, lost)
         removed, added = diff.changed_lines(fp)
         found = classify.regions(old_tree, new_tree, removed, added, same,
                                  self._old_scopes(path))
+        if gone is not None:
+            # Class / module bodies: every value they now build differently is in the
+            # import-state diff `_removed_bindings` took the readers of. The removed defs:
+            # their callers ran their bodies (taken there too). Other defs: as usual.
+            self._mixed_py = True  # diffexec would replay a renamed, unchanged body
+            lost_defs = {tuple(q.split(".")) for q in lost}
+            found = [r for r in found
+                     if (r.kind == "function"
+                         and not any(r.chain[:len(d)] == d for d in lost_defs))
+                     or (r.kind == "class" and r.via_def)]
+            if not found:
+                return gone, gone_why
+            got, why = self._library(path, old_tree, new_tree, found, "")
+            return got | gone, f"{gone_why}; {why}"
         if not found:
             return set(), "no behaviour-changing region"
         if path.startswith("tests/"):
@@ -339,6 +362,102 @@ class Selector:
         if path.startswith("sqlglot/"):
             return self._library(path, old_tree, new_tree, found, new_text)
         raise AllTests(f"{path}: .py outside sqlglot/ and tests/")
+
+    def _removed_bindings(self, path: str, old_tree: ast.Module, new_tree: ast.Module,
+                          lost: set[str]) -> tuple[set[int], str]:
+        """Module- or class-level defs / assignments the patch removes or renames (idea I26).
+
+        Who can notice that `name` is gone:
+          * code that reads it (`x.name`, bare `name`, "name", getattr / dir with a computed
+            name that can be it): the name sites (names.py) – run-time lines the map knows,
+            or import-time code, whose products are in the import-state diff;
+          * callers of a removed def: they ran its body (lines map over the old body; also
+            covers references the name scan cannot see, e.g. a stored callable);
+          * importers: `from module import name` inside a def → tests that ran that line; at
+            module level in sqlglot/ → the patched package fails to import (the state diff
+            is then unavailable → fallback); in a test file → collection error → ALL;
+          * test code reading it while test modules are collected → ALL;
+          * everything the patched package builds differently at import (class-creation
+            consumers, tables holding the old function, the added name of a rename): the
+            readers of each changed value in the import-state diff (`_state_readers`).
+        Raises AllTests (→ import bound) for removed classes and imports (registries and
+        re-exports the name scan cannot follow), special names, names the state snapshot
+        does not see, reads in code cached across tests, an unavailable diff, and other
+        edits of the file's class / module bodies the diff cannot see (a class head: the
+        snapshot does not compare bases; a statement other than def / class / assignment:
+        its effects may lie outside sqlglot's state)."""
+        why = f"{path}: binding removed ({', '.join(sorted(lost)[:3])})"
+        if not path.startswith("sqlglot/"):
+            raise AllTests(why)
+        unseen = _unseen_body_change(old_tree, new_tree)
+        if unseen:
+            raise AllTests(f"{why}: {unseen}")
+        kinds = _binding_kinds(old_tree)
+        module = _module_of(path)
+        index = self._index()
+        got: set[int] = set(self.maps.reads.get(path))
+        scopes = self._old_scopes(path)
+        callers: set[int] = set()  # tests that ran a removed def's body
+        for q in sorted(lost):
+            *chain, name = q.split(".")
+            kind = kinds.get(q)
+            if kind not in ("def", "assign"):
+                raise AllTests(f"{why}: {q} is bound by {kind}")
+            if name.startswith("__") and name.endswith("__"):
+                raise AllTests(f"{why}: {q} is a special name")
+            try:
+                sites = index.sites(name, path, tuple(chain), True)
+            except names.Fallback as exc:
+                raise AllTests(f"{why}: {exc}") from None
+            if not chain:
+                got |= self._from_imports(name, why, module)
+            for site in sites:
+                if site.path.startswith("tests/") and site.when == "def" and not site.dynamic:
+                    raise AllTests(f"{why}: {site.path}:{site.lines[0]} reads {name} at collection")
+                if site.when == "def" and site.memo:  # (as `_site_reads`, before the diff)
+                    raise AllTests(f"{why}: {name} read in code cached across tests ({site.what})")
+            if kind == "def":
+                s = scopes.by_chain.get(tuple(q.split(".")))
+                if s is None or s.kind != "def":
+                    raise AllTests(f"{why}: {q} not found")
+                callers |= self.maps.span(path, s.body_start, s.end)
+        found = self._state_diff()
+        if found is None:
+            raise AllTests(f"{why}: import-state diff unavailable")
+        changed = set(found["changed"])
+        for q in lost:
+            *chain, name = q.split(".")
+            key = f"C {module}:{'.'.join(chain)} {name}" if chain else f"M {module} {name}"
+            if key not in changed:
+                raise AllTests(f"{why}: {q} not in the import state")
+        try:
+            # no reader ran: fine if the removed defs' callers are known (as for a value
+            # change, an unseen value with no seen reader is a map blind spot → fallback)
+            readers, how = self._state_readers(found, None, allow_empty=bool(callers))
+        except names.Fallback as exc:
+            raise AllTests(f"{why}: {exc}") from None
+        return got | callers | readers, f"removed {', '.join(sorted(lost)[:3])} → callers, {how}"
+
+    def _from_imports(self, name: str, why: str, module: str) -> set[int]:
+        """`from … import name` statements: inside a def → the tests that ran that line;
+        at module level in a test file → AllTests (collection error); at module level in an
+        unpatched sqlglot/ file, from this module → AllTests (the patched package does not
+        import: the state diff would be unavailable); other module-level imports → the diff
+        tells (it fails if one does import the removed name)."""
+        got: set[int] = set()
+        patched = {fp.path for fp in self._files}
+        for other in sorted({p for p, _ in self._index().data["imports"].get(name, ())}):
+            source = self._source(other)
+            if source is None:
+                continue
+            for node, in_def in _import_froms(ast.parse(source), name):
+                if in_def:
+                    got |= self.maps.span(other, node.lineno, node.end_lineno or node.lineno)
+                elif other.startswith("tests/"):
+                    raise AllTests(f"{why}: {other} imports {name} at collection")
+                elif other not in patched and _from_module(other, node) == module:
+                    raise AllTests(f"{why}: {other} imports {name}")
+        return got
 
     # ── tests/*.py ────────────────────────────────────────────────────────────
 
@@ -450,7 +569,8 @@ class Selector:
                 # A lambda's first line is where it is created (class-body dicts run it at
                 # import); only its later lines are body that can run at import.
                 first, last = r.span
-                at_import, same_state = self._function_at_import(path, first + r.is_lambda, last)
+                at_import, same_state = self._function_at_import(path, first + r.is_lambda, last,
+                                                                 chosen | got)
                 if not got and same_state:
                     # Never ran under a test, and its runs at import built the same state.
                     kinds.append(f"unrun def {'.'.join(r.chain) or '<lambda>'}, runs at import:"
@@ -775,6 +895,13 @@ class Selector:
                    for kind, owner, _ in changed):
             # the edit must show up: else the snapshot is blind to it
             raise names.Fallback(f"no import-time change seen in {own}")
+        return self._state_readers(found, wide)
+
+    def _state_readers(self, found: dict, wide: set[int] | None,
+                       allow_empty: bool = False) -> tuple[set[int], str]:
+        """`_by_state` for an import-state diff `found`: the readers of every changed value.
+        Fallback when no test ran a reader, unless `allow_empty`."""
+        changed = [k.split(" ", 2) for k in found["changed"]]
         index = self._index()
         info, with_instances = found["info"], set(found["instances"])
         touch = set(wide) if wide is not None else set()
@@ -802,6 +929,9 @@ class Selector:
                     _module_of(owner_path), [chain])
             same = frozenset(found.get("same", {}).get(f"{kind} {owner} {attr}", ()))
             for site in index.sites(attr, owner_path, chain, True):
+                if (kind == "C" and site.recv is not None
+                        and not self._related(index, (site.path, site.recv), owner_path, chain)):
+                    continue  # `self.attr` in a method of a class unrelated to the owner
                 for bucket, got in self._site_reads(index, site, attr, same=same):
                     n_sites += 1
                     if bucket == "tests":
@@ -815,7 +945,7 @@ class Selector:
         # Class-attribute reads stay within the users of the owner classes and their files
         # (the bound `_by_names` relies on); `held` narrows that further.
         got = free | ((loose | held) & touch) | in_tests
-        if not got:
+        if not got and not allow_empty:
             raise names.Fallback("no test ran a line reading a changed value")
         shown = sorted({f"{o.rsplit(':', 1)[-1]}.{a}" for _, o, a in changed})
         more = f" +{len(shown) - 6}" if len(shown) > 6 else ""
@@ -871,6 +1001,52 @@ class Selector:
         # "def" sites outside cached code run at import: their products are in the diff; the
         # line map still shows any test that ran them later.
         return [(bucket, self.maps.span(site.path, *site.lines))]
+
+    def _related(self, index: nameindex.NameIndex, cls: tuple[str, tuple[str, ...]],
+                 owner_path: str, owner_chain: tuple[str, ...]) -> bool:
+        """Can an object of class `cls` (path, chain) or of a subclass read an attribute as
+        the owner class defines it? Only if some class of the owner's family (the owner and
+        its subclasses) is `cls` or derives from it. True when unsure (a metaclass, a base
+        outside the repo)."""
+        key = (owner_path, owner_chain)
+        family = self._families.get(key)
+        if family is None:
+            family = self._families[key] = index.check_class(owner_path, owner_chain)
+        for member in family:
+            ancestors = self._ancestors(index, member)
+            if ancestors is None or cls in ancestors:
+                return True
+        return False
+
+    def _ancestors(self, index: nameindex.NameIndex,
+                   cls: tuple[str, tuple[str, ...]]) -> set | None:
+        """`cls` and every repo class it may derive from (bases matched by name, so a
+        superset); None for a metaclass or a base outside the repo."""
+        if cls in self._ancestor_memo:
+            return self._ancestor_memo[cls]
+        classes = index.data["classes"]
+        out: set | None = set()
+        todo = [cls]
+        while todo:
+            c = todo.pop()
+            if c in out:
+                continue
+            out.add(c)
+            entries = [e for e in classes.get(c[1][-1], ()) if (e[0], tuple(e[1])) == c]
+            if not entries:
+                out = None
+                break
+            # the bases as spelled (a `metaclass=` keyword is not an ancestor of instances)
+            for dotted in entries[0][3]:
+                base = dotted.rsplit(".", 1)[-1]
+                if base == "type" or (base not in classes and base not in names.HARMLESS_BASES):
+                    out = None
+                    break
+                todo.extend((p, tuple(ch)) for p, ch, *_ in classes.get(base, ()))
+            if out is None:
+                break
+        self._ancestor_memo[cls] = out
+        return out
 
     def _module_path(self, module: str) -> str | None:
         base = module.replace(".", "/")
@@ -1025,7 +1201,8 @@ class Selector:
                 got |= self._import_time(path, s.body_start, s.end)
         return got
 
-    def _function_at_import(self, path: str, first: int, last: int) -> tuple[set[int], bool]:
+    def _function_at_import(self, path: str, first: int, last: int,
+                            have: set[int] | None = None) -> tuple[set[int], bool]:
         """Tests that depend on function lines path:first..last having run while modules
         were imported (`_import_time`: ALL for `import sqlglot`, else the dependents of each
         such module) – unless the import-state diff (selector/state.py) shows that importing
@@ -1033,8 +1210,9 @@ class Selector:
         attribute, digested in full (containers, objects, closures and lambdas with their
         code, defaults). Then what the function computed at import is unchanged, and only
         tests that run it later can see the edit (the lines map has them). Only for modules
-        under sqlglot/ (the diff imports those); the diff costs ~1.2 s CPU, so only when the
-        dependents cost at least STATE_MIN_GAIN.
+        under sqlglot/ (the diff imports those) and test modules whose own import-time code
+        runs no sqlglot code (`_explained_root`); the diff costs ~1.2 s CPU, so only when the
+        dependents add at least STATE_MIN_GAIN to `have` (what the commit selects already).
 
         Returns (tests, True if the state diff showed no change)."""
         modules = self.maps.import_time.modules(path, first, last)
@@ -1044,15 +1222,28 @@ class Selector:
             wide, error = self._import_time(path, first, last), None
         except AllTests as exc:
             wide, error = None, exc
-        if ((wide is None or self._cost(wide) >= STATE_MIN_GAIN)
-                and all(m.split(".")[0] == "sqlglot" and m != "sqlglot.__main__"  # state.SKIP_MODULES
-                        for m in modules)):
+        have = have or set()
+        if ((wide is None or self._cost(wide | have) - self._cost(have) >= STATE_MIN_GAIN)
+                and all((m.split(".")[0] == "sqlglot" and m != "sqlglot.__main__")  # state.SKIP_MODULES
+                        or self._explained_root(m, path, first, last) for m in modules)):
             found = self._state_diff()
             if found is not None and not found["changed"]:
                 return set(), True
         if error is not None:
             raise error
         return wide, False
+
+    def _explained_root(self, module: str, path: str, first: int, last: int) -> bool:
+        """A test module whose own import-time code runs no sqlglot code of its own
+        (selector/testimport; a package `__getattr__` only if the edit is not in it): what
+        its import runs in sqlglot/ is what importing sqlglot modules runs, which the
+        import-state diff covers."""
+        if module.split(".")[0] != "tests":
+            return False
+        if self._test_imports is None:
+            from .testimport import Checker
+            self._test_imports = Checker(self.sqlglot)
+        return self._test_imports.explained_for(module, path, first, last)
 
     def _import_time(self, path: str, first: int, last: int) -> set[int]:
         """Tests that depend on lines path:first..last having run while modules were imported."""
@@ -1426,24 +1617,85 @@ def name_of(path: str) -> str:
 def _bindings(tree: ast.Module) -> set[str]:
     """Names bound at module level and in class bodies (nested classes included), as
     dotted paths: `func`, `Class`, `Class.attr`, `Class.method`. Function bodies are skipped."""
-    out: set[str] = set()
+    return set(_binding_kinds(tree))
+
+
+def _unseen_body_change(old_tree: ast.Module, new_tree: ast.Module) -> str | None:
+    """A module- or class-body edit the import-state diff cannot show: a changed class head
+    (bases, keywords, decorators), or a changed statement that is not a def, a class or an
+    assignment. None if there is none."""
+    plain = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign,
+             ast.AugAssign)
+
+    def classes(tree: ast.Module) -> dict[tuple[str, ...], ast.ClassDef]:
+        out: dict[tuple[str, ...], ast.ClassDef] = {}
+        todo: list[tuple[list[ast.stmt], tuple[str, ...]]] = [(tree.body, ())]
+        while todo:
+            body, chain = todo.pop()
+            for node in body:
+                if isinstance(node, ast.ClassDef):
+                    out[chain + (node.name,)] = node
+                    todo.append((node.body, chain + (node.name,)))
+        return out
+
+    def others(body: list[ast.stmt]) -> list[str]:
+        return [ast.dump(s) for s in body if not isinstance(s, plain)]
+
+    old, new = classes(old_tree), classes(new_tree)
+    for chain in old.keys() & new.keys():
+        if classify._class_head(old[chain]) != classify._class_head(new[chain]):
+            return f"class {'.'.join(chain)}: bases / keywords / decorators changed"
+        if others(old[chain].body) != others(new[chain].body):
+            return f"class {'.'.join(chain)}: a statement other than def / class / assignment changed"
+    if others(old_tree.body) != others(new_tree.body):
+        return "a module-level statement other than def / class / assignment changed"
+    return None
+
+
+def _from_module(path: str, node: ast.ImportFrom) -> str:
+    """The absolute module a `from … import` in file `path` names."""
+    if not node.level:
+        return node.module or ""
+    package = _module_of(path) if path.endswith("__init__.py") else _module_of(path).rpartition(".")[0]
+    parts = package.split(".")
+    base = ".".join(parts[:len(parts) - (node.level - 1)])
+    return f"{base}.{node.module}" if node.module else base
+
+
+def _import_froms(tree: ast.Module, name: str):
+    """(`from … import name` node, inside a def or lambda) for every such import."""
+    stack: list[tuple[ast.AST, bool]] = [(tree, False)]
+    while stack:
+        node, in_def = stack.pop()
+        if isinstance(node, ast.ImportFrom) and any(a.name == name for a in node.names):
+            yield node, in_def
+        inner = in_def or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+        stack.extend((c, inner) for c in ast.iter_child_nodes(node))
+
+
+def _binding_kinds(tree: ast.Module) -> dict[str, str]:
+    """`_bindings` → how each is bound: "def", "class", "assign", "import", or "mixed"."""
+    out: dict[str, str] = {}
+
+    def add(name: str, kind: str) -> None:
+        out[name] = kind if out.get(name, kind) == kind else "mixed"
 
     def walk(body: list[ast.stmt], prefix: str) -> None:
         for node in body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                out.add(prefix + node.name)
+                add(prefix + node.name, "def")
             elif isinstance(node, ast.ClassDef):
-                out.add(prefix + node.name)
+                add(prefix + node.name, "class")
                 walk(node.body, f"{prefix}{node.name}.")
             elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 for t in targets:
                     for n in ast.walk(t):
                         if isinstance(n, ast.Name):
-                            out.add(prefix + n.id)
+                            add(prefix + n.id, "assign")
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 for a in node.names:
-                    out.add(prefix + (a.asname or a.name).split(".")[0])
+                    add(prefix + (a.asname or a.name).split(".")[0], "import")
             elif isinstance(node, (ast.If, ast.Try, ast.With)):
                 for field in ("body", "orelse", "finalbody"):
                     walk(getattr(node, field, []) or [], prefix)
