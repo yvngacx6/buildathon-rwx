@@ -23,16 +23,18 @@ Decoding: python3 -m selector.telemetry decode '<spec>' <sim_seconds> <misses> <
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 
 from . import pack
 
-UNIT_MS = 100       # board shows simulated seconds to 0.1 s; set 1 if it shows ms
+# Resolution of one payload unit. 100 if the board shows the sim component to 0.1 s; 1 if to the
+# ms; >= 1000 if only the total (sim + CPU) is shown (then subtract main's CPU before decoding).
+UNIT_MS = int(os.environ.get("BR_TELEMETRY_UNIT_MS", "100"))
 FLOOR_MS = 100      # every synthetic worker carries at least this load (never empty)
 SYN_OFFSET_MS = 100_000  # syn: total = offset + payload (offset > 40 x 2.1 s of floors)
 HYB_OFFSET_MS = 250_000  # hybrid: offset must exceed the real cost of the non-B commits
-SLOW_IDS = {"test_max_nodes": "maxnodes", "test_execute_tpcds": "tpcds"}
 
 
 def parse(spec: str):

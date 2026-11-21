@@ -81,11 +81,21 @@ Commit cost = max worker load + 2 s/worker, so slow tests interact. I computed t
 | T3 (optional) | `hyb:re=<bucket regex>` chosen after T2, e.g. `not recorded` or `~ALL cost` | n, cost, headroom of one mechanism bucket | Run only if T1/T2 leave two candidate investments within 2× of each other, and n ≥ 3. |
 | G-k | an improvement submission bundling k new pruners | real sim and M | Group test. M = 0 → keep all of them (only weak evidence: 95 % upper bound on miss rate ≈ 3/n_fire; the 446 local labeled patches stay the main soundness check). M > 0 → bisect with halves, ⌈log2 k⌉ slots; M itself bounds how many mechanisms are guilty. |
 
-Combined readout:
-- T1 + S14 give n_ALL·36.8 (ALL spend), g_slow (slow spend) and the paid-no-op count.
-- T2 adds where the expensive commits sit and whether they are real.
-- Together they locate the gap to the leaders (~63 s) in 3 slots, without any per-commit
-  information.
+S14 with 1 miss: G_M = 189.1 − (sim − 300). T1 + S14 + T2 locate the ~63 s gap to the leaders
+(ALL spend, slow spend, paid no-ops, expensive-commit headroom) in 3 slots, no per-commit info.
+
+**"Which mechanisms help/hurt", "disable M", "ALL for area A":** these are label-free
+counterfactuals (cost only; disabling can't add misses, ALL never misses), so they never need a
+dedicated slot. Read them from deltas between consecutive real submissions (as S06→S07, S10→S12),
+or add a second selector pass (e.g. `BR_DIFFEXEC=0`) and encode its saving as one more T2 digit
+(not implemented; ~2× selector CPU, fine for the 3-min limit). Only *more aggressive* mechanisms
+need the miss channel, which is what the G-k group tests are for.
+
+**Build lines (quote them: regexes may hold spaces).** T1 and T2 must be built from exactly
+`moon-08` = S13 code (e2e1325) + the two telemetry files (verified: no other diff under
+selector/ maps/ mapbuild/ Dockerfile). Otherwise "misses = N_f" and 189.1 − g_slow are invalid.
+`ENV BR_TELEMETRY="syn;n_all/1/6,n_empty/1/41,g_slow/3000/40"` (T1);
+`ENV BR_TELEMETRY="hyb:costge=4;n_costge=4/1/41,c_costge=4/5000/40"` (T2).
 
 ## 5. Schedule (cadence ~62 min; S14 ≈ 11:20 PST Sat; cutoff Sun 08:00 → about S14–S33)
 | slot | ≈ time | what | why there |
@@ -102,18 +112,13 @@ Combined readout:
 | S32–S33 | 06:00–07:00 | **slack**: a fix for a rejected or timeout run; nothing new | |
 
 Two operating rules:
-- **Pick the final commit explicitly.** "If you pick none, your best practice submission
-  counts." S14 can become our *best practice score* with 0 misses (sim 189.1 − G_M) if the
-  slow-failing commit does not need max_nodes, and that is a diagnostic. Telemetry runs sit at
-  ≥ 300 s and cannot win, but S14 and any drop probe can.
-- **Compare sim only.** CPU varies by about ±0.2 s. Tag every diagnostic as
-  `DIAGNOSTIC` in experiments/SUBMISSIONS.md.
+- **Pick the final commit explicitly** ("if you pick none, your best practice submission
+  counts"): S14 becomes our best practice score if it has 0 misses. Telemetry (≥ 300 s) can't.
+- **Compare sim only** (CPU ±0.2 s). Tag every diagnostic `DIAGNOSTIC` in experiments/SUBMISSIONS.md.
 
 ## 6. Using the answers without overfitting
-- Reweight P/Q to match the practice mix: share of empties, ALL, ≥ 4 s commits, and N_f/40.
-  Then local A/B numbers predict the board better. Today P/Q over-predict practice cost by
-  1.7×. This also calibrates the expectation for the final (unseen, new kinds): practice is one
-  draw of 40.
+- Reweight P/Q to the practice mix (empties, ALL, ≥ 4 s commits, N_f/40): today they over-predict
+  practice cost 1.7×. Practice is one draw of 40; the final has unseen kinds.
 - Decide **mechanisms**, not thresholds tuned to 40 commits. Example: "paid no-ops are 10 of
   40" → build a general no-op proof. Never "commit with reason R needs test T".
 
@@ -132,19 +137,14 @@ Two operating rules:
   These answer about half the questions in twice the slots.
 
 ## 8. Risks
-- **Board shows sim to 0.1 s.** Assumed. If it shows ms, set `UNIT_MS=1` and capacity triples.
-  Check the S14 row on the board first.
-- **Non-determinism across the 3 runs** (diffexec budgets). S12 and S13 gave identical sims,
-  so the risk is low. The mod-3 check digit catches 2/3 of corruptions; on a failure, ignore
-  the slot.
-- **T1 needs a fresh image of main + 2 small files.** About 25 min of work including
-  `make sample` on EC2. Overflow is guarded (the real output is printed instead).
+- **Display precision (pre-flight check on the S14 row):** if the board breaks out sim to 0.1 s,
+  keep the default (`BR_TELEMETRY_UNIT_MS=100`); if to the ms, set it to 1 (capacity ×3); if
+  it shows only the total, set it to ≥ 1000 and subtract main's CPU (~5.0 s) before decoding.
+- **Non-determinism across the 3 runs:** S12 = S13 sim, so low risk. The mod-3 check digit
+  catches 2/3 of corruptions; on failure, ignore the slot.
+- **Overflow / error** prints the real output instead (board ≈ 189); the run never fails.
 
-**Bottom line.**
-- P(T1 and T2 decode cleanly and give actionable attribution) ≈ 0.8.
-- Direct saving: 0 s. Indirect: it points the remaining ~15 slots and 15 h at the right
-  ~60 s. My guess is it gains 10–25 s over choosing levers blind, mainly by avoiding a
-  wrong-lever slot or two.
-- The single most valuable number is **paid no-ops** (40 − N_f − n_empty). Nobody on the team
-  knows it today, and it tells us whether "prove no-op" or "narrow the set" is the gap to the
-  leaders.
+**Bottom line.** P(T1 and T2 decode cleanly and give actionable attribution) ≈ 0.8. Direct
+saving 0 s; indirectly it points ~15 slots / 15 h at the right ~60 s (guess: 10–25 s better than
+choosing levers blind). The most valuable unknown is **paid no-ops** (40 − N_f − n_empty): it says
+whether "prove no-op" or "narrow the set" is the gap to the leaders.
