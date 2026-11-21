@@ -52,9 +52,9 @@ FAMILY = ("sqlglot.dialects.", "sqlglot.generators.", "sqlglot.parsers.",
           "sqlglot.tokenizers.", "sqlglot.typing.")
 NOT_FAMILY = {"sqlglot.dialects.dialect"}
 BUDGET_S = float(os.environ.get("BR_GENMEM_S", "6"))  # child CPU cap (scorer seconds)
-STARTUP_S = 0.25  # laptop CPU of the child without the loops (spawn, import, dialect loads)
-PER_DIALECT_S = 0.03  # laptop CPU of one dialect's loops and container scan
-SCORER_SLOWDOWN = 2.0
+STARTUP_S = 0.35  # EC2 container CPU of the child without the loops (spawn, imports; laptop ~0.2)
+PER_DIALECT_S = 0.07  # EC2 CPU of one dialect's loops and container scan (laptop ~0.03)
+SCORER_SLOWDOWN = 2.0  # scorer CPU vs EC2
 SHARE = 0.5  # spend at most this share of what dropping saves
 
 
