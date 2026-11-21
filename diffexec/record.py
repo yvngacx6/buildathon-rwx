@@ -63,6 +63,17 @@ SKIP: set = set()
 if os.environ.get("DIFFEXEC_SKIP"):
     with open(os.environ["DIFFEXEC_SKIP"], "rb") as _fh:
         SKIP = pickle.load(_fh)
+# Hot functions (round 15): record only these keys (a pickled set of (path, qualname, line),
+# chosen from the census and tests.json, never labels), with no function-wide call cap but a
+# cap per (function, test phase): a phase with more than PHASE_CAP calls is incomplete (its
+# test is never dropped for a change to that function) and is not pickled further. Other
+# tests' phases stay usable. build.py merges these keys over the main recordings.
+HOT = None
+PHASE_CAP = int(float(os.environ.get("DIFFEXEC_PHASE_CAP", "inf").replace("inf", "1e18")))
+if os.environ.get("DIFFEXEC_HOT"):
+    with open(os.environ["DIFFEXEC_HOT"], "rb") as _fh:
+        HOT = pickle.load(_fh)
+    CALL_CAP = 10 ** 18
 CENSUS = os.environ.get("DIFFEXEC_CENSUS") == "1"  # count calls only
 GEN_FLAGS = 0x20 | 0x80 | 0x100 | 0x200  # GENERATOR | COROUTINE | ITERABLE_COROUTINE | ASYNC_GENERATOR
 
@@ -72,7 +83,8 @@ E = mon.events
 
 
 class Rec:
-    __slots__ = ("key", "calls", "nbytes", "blobs", "uses", "dead", "argn", "nfree", "secs", "big")
+    __slots__ = ("key", "calls", "nbytes", "blobs", "uses", "dead", "argn", "nfree", "secs", "big",
+                 "pcalls")
 
     def __init__(self, code):
         self.key = (code.co_filename[len(ROOT) - len("sqlglot/"):], code.co_qualname, code.co_firstlineno)
@@ -87,9 +99,12 @@ class Rec:
         self.nfree = code.co_freevars
         self.secs = 0.0
         self.big = False  # an input was over INPUT_CAP: pickle later calls elided right away
+        self.pcalls: dict = {}  # phase -> calls (PHASE_CAP)
         if code.co_flags & GEN_FLAGS:
             self.dead = "generator"
         elif ONLY is not None and f"{self.key[0]}:{self.key[1]}" not in ONLY:
+            self.dead = "skipped"
+        elif HOT is not None and self.key not in HOT:
             self.dead = "skipped"
         elif self.key in SKIP:
             self.dead = "calls"
@@ -142,6 +157,10 @@ def _start(code, offset):
         # measures and is ~100x slower under tracemalloc. Mark the phase incomplete (its test
         # can never be dropped) and do not record.
         rec.uses[phase] = None
+    if PHASE_CAP < 10 ** 18:
+        n = rec.pcalls[phase] = rec.pcalls.get(phase, 0) + 1
+        if n > PHASE_CAP:
+            rec.uses[phase] = None
     if phase in rec.uses and rec.uses[phase] is None:
         # this (function, phase) is already incomplete: nothing more to learn, do not pickle
         stack.append((rec, frame, None, None, phase, None))

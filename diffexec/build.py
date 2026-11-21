@@ -54,6 +54,22 @@ EXPENSIVE_S = float(os.environ.get("DIFFEXEC_EXPENSIVE_S", "0.5"))
 LINE_WEIGHT = os.environ.get("DIFFEXEC_LINE_WEIGHT", "1") == "1"
 STAKES_POWER = float(os.environ.get("DIFFEXEC_STAKES_POWER", "1.5"))
 SOURCE_ROOT = os.environ.get("DIFFEXEC_ROOT", "/opt/sqlglot")
+# Hot functions (round 15, record.py DIFFEXEC_HOT): their recordings (no function-wide call cap,
+# a per-test-phase cap instead) live in DIFFEXEC_HOT_DIR and replace these keys' entries in the
+# main recordings (where they are dead "calls"); the hot run's other keys ("skipped") are ignored.
+HOT_DIR = os.environ.get("DIFFEXEC_HOT_DIR") or None
+HOT: set = set()
+if HOT_DIR:
+    with open(os.environ.get("DIFFEXEC_HOT") or os.path.join(HOT_DIR, "hot.pkl"), "rb") as _fh:
+        HOT = pickle.load(_fh)
+
+
+def _paths(rec_dir: str) -> list[tuple[str, bool]]:
+    """(recording, is hot run) of the main run and, if set, the hot run."""
+    got = [(p, False) for p in sorted(glob.glob(os.path.join(rec_dir, "rec_*.pkl")))]
+    if HOT_DIR:
+        got += [(p, True) for p in sorted(glob.glob(os.path.join(HOT_DIR, "rec_*.pkl")))]
+    return got
 
 
 def _records(path: str):
@@ -84,7 +100,7 @@ def bucket_of(key, buckets: int) -> int:
 def headers(rec_dir: str) -> tuple[dict, set]:
     failed: set = set()
     stats = {"workers": 0, "pickle_s": 0.0, "recorded": 0, "elided": 0, "incomplete": 0}
-    for path in sorted(glob.glob(os.path.join(rec_dir, "rec_*.pkl"))):
+    for path, _ in _paths(rec_dir):
         with open(path, "rb") as fh:
             head = pickle.load(fh)
         stats["workers"] += 1
@@ -97,10 +113,12 @@ def headers(rec_dir: str) -> tuple[dict, set]:
 def merge(rec_dir: str, bucket: int = 0, buckets: int = 1) -> dict:
     """Merge the recordings of the functions in one bucket (of `buckets`)."""
     merged: dict = {}
-    for path in sorted(glob.glob(os.path.join(rec_dir, "rec_*.pkl"))):
+    for path, hot_run in _paths(rec_dir):
         _, recs = _records(path)
         for key, r in recs:
             if buckets > 1 and bucket_of(key, buckets) != bucket:
+                continue
+            if (key in HOT) != hot_run:
                 continue
             m = merged.setdefault(key, {"dead": None, "calls": 0, "blobs": {}, "uses": {}})
             m["calls"] += r["calls"]
@@ -131,9 +149,10 @@ def merge(rec_dir: str, bucket: int = 0, buckets: int = 1) -> dict:
     return merged
 
 
-def prepare(m: dict, failed: set) -> None:
-    """Call cap, tests that failed while recorded, unused blobs."""
-    if not m["dead"] and m["calls"] > CALL_CAP:
+def prepare(m: dict, failed: set, key=None) -> None:
+    """Call cap (not for hot keys: capped per phase), tests that failed while recorded, unused
+    blobs."""
+    if not m["dead"] and m["calls"] > CALL_CAP and key not in HOT:
         m["dead"] = "calls"
     if m["dead"]:
         m["blobs"], m["uses"] = {}, {}
@@ -334,7 +353,7 @@ def build(rec_dir: str, out: str, secs_of: dict, buckets: int) -> dict:
         merged = merge(rec_dir, bucket, buckets)
         for key, m in merged.items():
             test_ids.update(p[1] for p in m["uses"] if isinstance(p, tuple))
-            prepare(m, failed)
+            prepare(m, failed, key)
             got = plan_of(m, secs_of)
             if got is not None:
                 plans[key] = got
@@ -351,7 +370,7 @@ def build(rec_dir: str, out: str, secs_of: dict, buckets: int) -> dict:
         for bucket in range(buckets):
             merged = merge(rec_dir, bucket, buckets)
             for key, m in merged.items():
-                prepare(m, failed)
+                prepare(m, failed, key)
                 restrict(m, kept.get(key))
             write_functions(zf, merged, functions, test_no)
             for m in merged.values():
@@ -360,7 +379,7 @@ def build(rec_dir: str, out: str, secs_of: dict, buckets: int) -> dict:
                 incomplete += sum(1 for v in m["uses"].values() if v is None)
             del merged
         index = {"functions": functions, "failed": sorted(failed), "tests": tests,
-                 "caps": {"calls": CALL_CAP, "store_budget": STORE_BUDGET}}
+                 "caps": {"calls": CALL_CAP, "store_budget": STORE_BUDGET, "hot": len(HOT)}}
         _entry(zf, "index.pkl", pickle.dumps(index, protocol=5))
     os.replace(tmp, out)
     stats.update({"functions": len(functions), "alive": sum(1 for v in functions.values() if not v[0]),

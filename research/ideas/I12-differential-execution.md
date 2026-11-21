@@ -344,3 +344,44 @@ Makefile's scorer flags.
 | `selector/diffexec.py` | gates, fork server, drop rule, resource rule |
 | `diffexec/measure.py`, `report_store.py`, `changed.py`, `try_patch.py`, `i13_bytecode.py` | measurement tools |
 | `diffexec/Dockerfile` | measurement image (`STORE=` prebuilt, or `RECORD=1` for an in-build recording) |
+
+## Round 15 (branch `r15-hotcalls`): hot functions recorded per test phase — no gain, store not changed
+
+**Idea.** The 240 functions over 50k suite calls were never recorded (function-wide cap), so every
+commit touching them kept all tests. Record them with a cap per (function, test phase) instead
+(`DIFFEXEC_PHASE_CAP`, K = 20,000): a phase over K is incomplete, the other tests stay droppable.
+`mapbuild/diffexec_hot.py` picks which hot functions to record from a per-test census and
+tests.json only (lines × saving^1.5 / calls to pickle, ≤ 1.5M calls; test_max_nodes counted as
+never droppable for parser/tokenizer methods, whose `self` holds a ~1M-token list that is elided).
+40 functions (`mapbuild/diffexec_hot.pkl`). Recorded on EC2 in the pinned image
+(`diffexec_run.py --hot`, 146 s wall, 569 CPU-s, 4 cores); `diffexec.build` merges them over the
+r8 recordings (`DIFFEXEC_HOT_DIR`; hot keys come only from the hot run, all others only from r8).
+Projected `self` state (idea b) was not tried: replay runs the callees, which read attributes
+neither body names (`_match` → `_advance` → `_tokens`), so a static read set is unsound.
+
+**Distinct inputs** (calls → distinct inputs, raw bytes, all files merged):
+executor helpers dedupe very well (`sql_and` 1.26M → 6, `null_if_any…_func` 1.21M → 360,
+`<lambda>` 631k → 89, `Generator.__init__` 74k → 226, `flatten_schema` 58k → 868), but their
+tpcds / tpch phases are far over K. Optimizer and parser methods barely dedupe and their inputs
+are big: `Simplifier.*` 50k → ~3.6k (≈ 22 MB raw each), `Scope.__init__` 115k → 11.8k (27 MB),
+`DataType.is_type` 79k → 12.6k (18 MB), `Parser._parse_types` 62k → 29k (53 MB),
+`Generator.select_sql` 51k → 22k (49 MB). Total 739 MB raw for 36 live functions. In
+test_execute_tpcds most of them hit the 8 MB per-file byte cap, so tpcds — the test that sets the
+cost of these commits — stays non-droppable.
+
+**Result.** The store budget chooser keeps only 4 hot functions (`Scope._collect` 4.1 MB raw,
+`Scope.columns`, `flatten_schema`, `Generator.__init__`); the rest are "budget" (the "calls"
+bucket moves to "budget").
+
+| | P (600) | Q (1000) | sample | private264 | private41 | adv46 | adv2 |
+|---|---|---|---|---|---|---|---|
+| main (laptop) | 5234.4 | 8581.9 | 118.716 | 2524.656 | 388.873 | 1157.064 | 961.491 |
+| A: + hot, budget 13.5e6 (13.0 MB) | 5232.7 | 8581.7 | same | same | same | same | same |
+| B: + hot, budget 16e6 (15.0 MB) | 5227.6 | 8574.9 | same | 2519.680 | same | same | same |
+
+0 misses everywhere. A saves 1.9 s over 1,600 unlabeled mutants; B's extra 12 s comes from the
+larger budget (non-hot functions), not from the hot recordings, and costs 2 MB of tree. Not
+shipped: `maps/diffexec.zip` is unchanged. The tooling stays (off unless `--hot` /
+`DIFFEXEC_HOT_DIR` is set). To get at the ALL / calls buckets a test like tpcds must become
+droppable, which needs a far smaller input encoding (e.g. node ids into a per-test tree table)
+rather than more call coverage.

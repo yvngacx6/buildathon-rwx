@@ -36,6 +36,8 @@ def main() -> None:
     ap.add_argument("--resume", action="store_true",
                     help="keep per-file recordings already in --work (after an interrupted run)")
     ap.add_argument("--no-manifest", action="store_true", help="experiment: do not touch MANIFEST.json")
+    ap.add_argument("--hot", help="pickled set of function keys: record only these, capped per "
+                                  "test phase (DIFFEXEC_PHASE_CAP), into --work; no census, no build")
     a = ap.parse_args()
     repo = Path(__file__).resolve().parent.parent
     work = Path(a.work)
@@ -58,6 +60,23 @@ def main() -> None:
 
     start = time.time()
     cpu0 = os.times()
+    if a.hot:
+        # Round 15: record only the hot keys (mapbuild/diffexec_hot.py), capped per test phase.
+        # The store is then built from the main recordings + these (DIFFEXEC_HOT_DIR).
+        env.update(DIFFEXEC_HOT=a.hot, DIFFEXEC_PHASE_CAP=os.environ.get("DIFFEXEC_PHASE_CAP", "20000"),
+                   DIFFEXEC_REC_BYTE_CAP=os.environ.get("DIFFEXEC_REC_BYTE_CAP", "8e6"))
+        secs: dict = {}
+        for t in json.loads(Path(a.tests).read_text())["tests"]:
+            secs[t["file"]] = secs.get(t["file"], 0.0) + t["seconds"]
+        with ThreadPoolExecutor(a.j) as pool:
+            results = list(pool.map(run, sorted(files, key=lambda f: -secs[f])))
+        cpu1 = os.times()
+        bad = [r for r in results if not r[2] or r[1] not in (0, 1)]
+        if bad:
+            sys.exit(f"FATAL: hot recording failed for {[r[0] for r in bad]}: {bad[0][4]}")
+        cpu = (cpu1.children_user - cpu0.children_user) + (cpu1.children_system - cpu0.children_system)
+        print(f"hot record wall {time.time() - start:.0f}s cpu {cpu:.0f}s", file=sys.stderr)
+        return
     # Pass 1 (census, cheap): suite-wide call count per function. A function over the call cap
     # is dropped after merging anyway, so pass 2 does not record it (same store, far less work).
     census = work / "census"
