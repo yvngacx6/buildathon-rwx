@@ -35,10 +35,11 @@ cost nearly as much as ALL becomes ALL (same price, no risk).
 from __future__ import annotations
 
 import ast
+import os
 import re
 from pathlib import Path, PurePosixPath
 
-from . import classify, diff, names
+from . import classify, diff, nameindex, names
 from .maps import Maps
 
 # Class and module bodies of these files shape nearly every test (map gives ~1550 of 1620).
@@ -77,7 +78,7 @@ class Selector:
         self._secs = {t["number"]: float(t.get("seconds", 0.0)) for t in tests}
         self._untraced: set[int] | None = None
         self._sources: dict[str, str] | None = None
-        self._name_index: names.Index | None = None
+        self._name_index: nameindex.NameIndex | None = None
         self.notes: list[str] = []  # why a definition-time region was (not) narrowed
 
     def all_numbers(self) -> set[int]:
@@ -349,9 +350,14 @@ class Selector:
     def _seconds(self, numbers: set[int]) -> float:
         return sum(self._secs.get(n, 0.0) for n in numbers)
 
-    def _index(self) -> names.Index:
+    def _index(self) -> nameindex.NameIndex:
+        """The prebuilt name index (image build) if it describes this source; else build it
+        in memory (same answers, ~2 s more CPU)."""
         if self._name_index is None:
-            self._name_index = names.Index(self._all_sources())
+            fp = nameindex.fingerprint(self.sqlglot)
+            path = Path(os.environ.get("BR_INDEX", nameindex.DEFAULT_PATH))
+            self._name_index = nameindex.load(path, fp) or nameindex.NameIndex(
+                nameindex.build(self._all_sources(), fp))
         return self._name_index
 
     def _class_users(self, module: str, chains) -> set[int]:

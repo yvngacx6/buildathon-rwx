@@ -38,6 +38,9 @@ but wide. This module answers a narrower question, statically, on the pinned sou
    definition-time call is handed the class or its registry name (`"mysql"`), unless the
    callee only captures that argument in a closure.
 
+`Index` does the scanning and `Index.export()` turns the result into plain tables; that runs
+at image build (`selector/nameindex.py`), whose `NameIndex` answers the queries at run time.
+
 The caller (select.py) unions the line map over the `run` sites and intersects with the
 conservative set. Nothing here depends on labels; everything is computed from the pinned source.
 """
@@ -409,122 +412,6 @@ class Index:
                         stack.append((child, c))
         return self._classes
 
-    def check_class(self, path: str, chain: tuple[str, ...]) -> list[tuple[str, tuple[str, ...]]]:
-        """Raise Fallback when class machinery outside our view may consume its attributes.
-
-        Returns the class's family: itself and every subclass (by name), as (path, chain).
-        """
-        node = _find_class(self.tree(path), chain)
-        if node is None:
-            raise Fallback(f"class {'.'.join(chain)} not found")
-        seen: set[int] = set()
-        todo = [node]
-        while todo:  # every ancestor must be a repo class or a harmless builtin base
-            c = todo.pop()
-            if id(c) in seen:
-                continue
-            seen.add(id(c))
-            for d in c.decorator_list:
-                if not self._identity(_last_name(d), call=isinstance(d, ast.Call)):
-                    raise Fallback(f"class {c.name} is decorated with {_last_name(d)}")
-            for base in c.bases + [k.value for k in c.keywords if k.arg == "metaclass"]:
-                name = _last_name(base.value if isinstance(base, ast.Subscript) else base)
-                found = [n for _, n, _ in self.classes().get(name, ())]
-                if not found and name not in HARMLESS_BASES and name != "type":
-                    raise Fallback(f"class {c.name} derives from {name}")
-                todo.extend(found)
-        family = [(path, chain)]
-        todo_chains = [chain]
-        while todo_chains:  # subclasses: a base spelled `...Name` (top level) / `...Outer.Inner`
-            want = ".".join(todo_chains.pop())
-            for entries in self.classes().values():
-                for p, c, ch in entries:
-                    if (p, ch) in family:
-                        continue
-                    for b in c.bases:
-                        spelled = _dotted(b)
-                        if spelled == want or spelled.endswith("." + want):
-                            family.append((p, ch))
-                            todo_chains.append(ch[-1:] if len(ch) == 1 else ch)
-                            break
-        return family
-
-    def _identity(self, name: str, call: bool) -> bool:
-        """Every repo function called `name` returns the decorated object untouched
-        (`return f`; for a decorator factory, `return lambda f: f`)."""
-        self.deftime_defs()
-        found = self._functions.get(name, [])
-        if not found:
-            return False
-        for f in found:
-            body = [s for s in f.body if not (isinstance(s, ast.Expr)
-                                              and isinstance(s.value, ast.Constant))]
-            if len(body) != 1 or not isinstance(body[0], ast.Return):
-                return False
-            value = body[0].value
-            if call:
-                if not (isinstance(value, ast.Lambda) and len(value.args.args) == 1
-                        and isinstance(value.body, ast.Name)
-                        and value.body.id == value.args.args[0].arg):
-                    return False
-            elif not (isinstance(value, ast.Name) and f.args.args
-                      and value.id == f.args.args[0].arg):
-                return False
-        return True
-
-    def handles(self, family: list[tuple[str, tuple[str, ...]]]) -> str | None:
-        """A definition-time call that is handed one of these classes (or names its dialect).
-
-        Such a call may read any attribute of the class at import; we cannot follow it.
-        """
-        names = {ch[-1] for _, ch in family}
-        # Classes are also found by registry name: the lower-cased name of the class, or of a
-        # class whose body holds it (`class MySQL(Dialect): parser_class = MySQLParser`).
-        holders = set(names)
-        for path, text in self.sources.items():
-            if path.startswith("sqlglot/") and any(n in text for n in names):
-                for node, ctx, stmt in self._facts(path)["class_refs"]:
-                    if node in names and ctx:
-                        holders.add(ctx)
-        tags = {n.lower() for n in holders}
-        for path, text in self.sources.items():
-            if not any(n in text for n in names) and not any(t in text.lower() for t in tags):
-                continue
-            for call, slots in self._facts(path)["deftime_calls"]:
-                for slot, handed, strings in slots:
-                    hit = sorted(handed & names) or [repr(s) for s in sorted(strings & tags)]
-                    if hit and not self._captured_only(call, slot):
-                        return f"{path}:{call.lineno} hands {hit[0]} to a call at import"
-        return None
-
-    def _captured_only(self, call: ast.Call, slot: int | str) -> bool:
-        """The callee (a repo function, found by name) only stores this argument in a closure
-        (`def build(kind): def _builder(args): ... kind ...; return _builder`): nothing reads
-        it at import, and the closure's own reads are ordinary run-time sites."""
-        self.deftime_defs()
-        if not isinstance(call.func, ast.Name) or slot == "receiver":
-            return False
-        found = self._functions.get(call.func.id, [])
-        if not found:
-            return False
-        for f in found:
-            params = f.args.posonlyargs + f.args.args
-            if isinstance(slot, int):
-                if slot >= len(params):
-                    return False
-                param = params[slot].arg
-            else:
-                names = [a.arg for a in params + f.args.kwonlyargs]
-                if slot not in names:
-                    return False
-                param = slot
-            if any(isinstance(n, ast.Name) and n.id == param for n in _own_nodes(f)):
-                return False
-            defaults = f.args.defaults + [d for d in f.args.kw_defaults if d is not None]
-            if any(isinstance(n, ast.Name) and n.id == param for d in defaults for n in ast.walk(d)):
-                return False
-        return True
-
     def _facts(self, path: str) -> dict:
         """One walk per file: name occurrences, definition-time calls, class-body references."""
         hit = self._file_facts.get(path)
@@ -551,66 +438,83 @@ class Index:
                                          "class_refs": class_refs}
         return hit
 
-    # ── readers ──────────────────────────────────────────────────────────
+    # ── export: everything the run-time queries need, as plain data ──────
 
-    def sites(self, name: str, owner_path: str, owner_chain: tuple[str, ...],
-              new_name: bool) -> list[Site]:
-        """Every place that can read `name` as defined by the owner (class chain, or module)."""
-        out: list[Site] = []
-        word = re.compile(rf"\b{re.escape(name)}\b")
-        module = owner_path[:-3].replace("/", ".").removesuffix(".__init__")
-        importers = re.compile(rf"import\b[^\n]*\b{re.escape(name)}\b|import\s*\(")
-        for path, text in self.sources.items():
-            if word.search(text):
-                out.extend(self._static_sites(path, name, owner_path, owner_chain, module,
-                                              bool(importers.search(text))))
-        for path, node, site, allowed, names_only, on_module in self._dynamic_sites():
-            if names_only and not new_name:
-                continue  # dir(): sees which names exist, not their values
-            if on_module is not None and (owner_chain or not on_module.fullmatch(module)):
-                continue  # reads attributes of other modules; a class attribute is not one
-            if allowed is None or allowed.fullmatch(name):
-                out.append(site)
-        return out
+    def export(self) -> dict:
+        """Scan the whole source once and return the data `NameIndex` answers from.
 
-    def _static_sites(self, path, name, owner_path, owner_chain, module,
-                      maybe_imported: bool) -> list[Site]:
-        out = []
-        aliases: set[str] = set()
-        if owner_chain == ():  # module names reach other files only through imports
-            if path == owner_path:
-                aliases.add(name)
-            if maybe_imported:
-                for node in ast.walk(self.tree(path)):
-                    if isinstance(node, ast.ImportFrom):
-                        for a in node.names:
-                            if a.name == name:
-                                aliases.add(a.asname or a.name)
-            leaf = module.rsplit(".", 1)[-1]
-            if re.search(rf"import\s+\*", self.sources[path]):
-                for node in ast.walk(self.tree(path)):
-                    if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names) \
-                            and (node.module or "").endswith(leaf):
-                        raise Fallback(f"{path} star-imports {module}")
-        occ = self._facts(path)["occ"]
-        keys = {name} | aliases
-        for key in keys:
-            for node, ctx, stmt in occ.get(key, ()):
-                if isinstance(node, ast.Attribute):
-                    hit = node.attr == name and (
-                        not isinstance(node.ctx, ast.Store) or isinstance(stmt, ast.AugAssign))
-                elif isinstance(node, ast.Constant):
-                    hit = node.value == name
-                elif isinstance(node.ctx, ast.Store):
-                    hit = False
-                elif owner_chain:  # a class attribute is a bare name only in its own body
-                    hit = (node.id == name and path == owner_path and ctx.kind == "class"
-                           and ctx.chain == owner_chain)
-                else:
-                    hit = node.id in aliases
-                if hit:
-                    out.append(self._site(path, node, ctx, stmt))
-        return out
+        Run at image build time (`python -m selector.names build`): the run then never parses
+        the library. See `NameIndex` for the meaning of each table.
+        """
+        occ: dict[str, list] = {}
+        imports: dict[str, list[tuple[str, str]]] = {}
+        stars: list[tuple[str, str]] = []
+        class_refs: dict[str, set[str]] = {}
+        calls: list[tuple] = []
+        for path in sorted(self.sources):
+            for node in ast.walk(self.tree(path)):
+                if isinstance(node, ast.ImportFrom):
+                    for a in node.names:
+                        if a.name == "*":
+                            stars.append((path, node.module or ""))
+                        else:
+                            imports.setdefault(a.name, []).append((path, a.asname or a.name))
+            facts = self._facts(path)
+            for key, rows in facts["occ"].items():
+                if not key.isidentifier():
+                    continue
+                for node, ctx, stmt in rows:
+                    if isinstance(node, ast.Attribute):
+                        if isinstance(node.ctx, ast.Store) and not isinstance(stmt, ast.AugAssign):
+                            continue
+                        kind = "attr"
+                    elif isinstance(node, ast.Constant):
+                        kind = "str"
+                    elif isinstance(node.ctx, ast.Store):
+                        continue
+                    else:
+                        kind = "name"
+                    occ.setdefault(key, []).append(
+                        (path, kind, ctx.kind, ctx.chain, self._site(path, node, ctx, stmt)))
+            for ref, holder, _ in facts["class_refs"]:
+                class_refs.setdefault(ref, set()).add(holder)
+            for call, slots in facts["deftime_calls"]:
+                callee = call.func.id if isinstance(call.func, ast.Name) else None
+                calls.append((path, call.lineno, callee, slots))
+        classes = {
+            name: [(p, ch, [_last_name(b.value if isinstance(b, ast.Subscript) else b)
+                            for b in c.bases + [k.value for k in c.keywords
+                                                if k.arg == "metaclass"]],
+                    [_dotted(b) for b in c.bases],
+                    [(_last_name(d), isinstance(d, ast.Call)) for d in c.decorator_list])
+                   for p, c, ch in entries]
+            for name, entries in self.classes().items()}
+        self.deftime_defs()
+        functions = {}
+        for name, defs in self._functions.items():
+            functions[name] = [self._function_facts(f) for f in defs]
+        dynamic = [(site, allowed.pattern if allowed else None, names_only,
+                    on_module.pattern if on_module else None)
+                   for _, _, site, allowed, names_only, on_module in self._dynamic_sites()]
+        return {"occ": occ, "imports": imports, "stars": stars, "class_refs": class_refs,
+                "calls": calls, "classes": classes, "functions": functions, "dynamic": dynamic}
+
+    def _function_facts(self, f: ast.AST) -> tuple:
+        """(positional params, keyword-only params, names its own code / defaults load,
+        `return <first param>` decorator, `return lambda x: x` decorator factory)."""
+        params = [a.arg for a in f.args.posonlyargs + f.args.args]
+        kwonly = [a.arg for a in f.args.kwonlyargs]
+        used = {n.id for n in _own_nodes(f) if isinstance(n, ast.Name)}
+        for d in f.args.defaults + [d for d in f.args.kw_defaults if d is not None]:
+            used |= {n.id for n in ast.walk(d) if isinstance(n, ast.Name)}
+        body = [s for s in f.body if not (isinstance(s, ast.Expr)
+                                          and isinstance(s.value, ast.Constant))]
+        value = body[0].value if len(body) == 1 and isinstance(body[0], ast.Return) else None
+        plain = isinstance(value, ast.Name) and bool(params) and value.id == params[0]
+        factory = (isinstance(value, ast.Lambda) and len(value.args.args) == 1
+                   and isinstance(value.body, ast.Name)
+                   and value.body.id == value.args.args[0].arg)
+        return params, kwonly, frozenset(used), plain, factory
 
     def _site(self, path: str, node: ast.AST, ctx: _Ctx, stmt: ast.stmt | None) -> Site:
         first = node.lineno
