@@ -632,13 +632,9 @@ class Selector:
                     and self._defaults_unread() else None)
         for r in found:
             if r.kind == "function":
-                ran = self.maps.span(path, *r.span)
-                # spans for the run-time pruners (subtest / slowverify): the statement view
-                # only where the lines map shows some test running it (else the whole body)
                 self._spans.setdefault(path, []).extend(
-                    r.statements if r.statements is not None
-                    and any(self.maps.span(path, a, b) & ran for a, b in r.statements)
-                    else [r.span])
+                    r.statements if r.statements is not None else [r.span])
+                ran = self.maps.span(path, *r.span)
                 got = self._off_statements(path, ran, r, old_tree, new_tree)
                 if got and r.signature and defaults:
                     prunable |= got
