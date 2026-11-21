@@ -532,7 +532,8 @@ class Selector:
                 # A lambda's first line is where it is created (class-body dicts run it at
                 # import); only its later lines are body that can run at import.
                 first, last = r.span
-                at_import, same_state = self._function_at_import(path, first + r.is_lambda, last)
+                at_import, same_state = self._function_at_import(path, first + r.is_lambda, last,
+                                                                 chosen | got)
                 if not got and same_state:
                     # Never ran under a test, and its runs at import built the same state.
                     kinds.append(f"unrun def {'.'.join(r.chain) or '<lambda>'}, runs at import:"
@@ -1069,7 +1070,8 @@ class Selector:
                 got |= self._import_time(path, s.body_start, s.end)
         return got
 
-    def _function_at_import(self, path: str, first: int, last: int) -> tuple[set[int], bool]:
+    def _function_at_import(self, path: str, first: int, last: int,
+                            have: set[int] | None = None) -> tuple[set[int], bool]:
         """Tests that depend on function lines path:first..last having run while modules
         were imported (`_import_time`: ALL for `import sqlglot`, else the dependents of each
         such module) – unless the import-state diff (selector/state.py) shows that importing
@@ -1079,7 +1081,7 @@ class Selector:
         tests that run it later can see the edit (the lines map has them). Only for modules
         under sqlglot/ (the diff imports those) and test modules whose own import-time code
         runs no sqlglot code (`_explained_root`); the diff costs ~1.2 s CPU, so only when the
-        dependents cost at least STATE_MIN_GAIN.
+        dependents add at least STATE_MIN_GAIN to `have` (what the commit selects already).
 
         Returns (tests, True if the state diff showed no change)."""
         modules = self.maps.import_time.modules(path, first, last)
@@ -1089,7 +1091,8 @@ class Selector:
             wide, error = self._import_time(path, first, last), None
         except AllTests as exc:
             wide, error = None, exc
-        if ((wide is None or self._cost(wide) >= STATE_MIN_GAIN)
+        have = have or set()
+        if ((wide is None or self._cost(wide | have) - self._cost(have) >= STATE_MIN_GAIN)
                 and all((m.split(".")[0] == "sqlglot" and m != "sqlglot.__main__")  # state.SKIP_MODULES
                         or self._explained_root(m, path, first, last) for m in modules)):
             found = self._state_diff()
