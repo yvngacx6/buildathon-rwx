@@ -10,6 +10,8 @@ patch ──► diff.parse/apply ──► per file ──► rule (select.py) �
                                   │                   (slow tests: only if they ran a touched statement)
                                   │                   ∪ import-time map: run while `import sqlglot` → ALL,
                                   │                     run while importing module M → M's dependents
+                                  │                     (nothing if only sqlglot/ modules run it and the
+                                  │                     import-state diff is empty)
                                   │        class / module assignment → names.py: readers of the changed
                                   │                   names (line map) ∩ conservative set, else:
                                   │        class-creation consumers → state.py: import old + patched,
@@ -17,8 +19,10 @@ patch ──► diff.parse/apply ──► per file ──► rule (select.py) �
                                   │                   changed value among tests that can hold its class, else:
                                   │        class    → classes map (class chain, MRO) ∪ tests that ran the file
                                   │        module   → module users ∪ tests that ran the file ∪ importers' users
+                                  │        base files (BASE_FILES): name / state narrowing, unbounded, else ALL
                                   ├─ tests/fixtures/** → reads map (never AST-filtered)
-                                  ├─ tests/*.py → test functions, or whole file ∪ test_imports
+                                  ├─ tests/*.py → test functions; other functions → lines map;
+                                  │        module constants → name readers; else whole file ∪ test_imports
                                   └─ docs/config/unknown → nothing / pytest-section check / ALL
 ```
 
@@ -42,6 +46,7 @@ Every rule is about code structure; no rule names an edit kind as harmless or ma
 | `mapbuild/convert_prototype.py` | INTERIM: convert the laptop prototype maps (research reports 02 and 05) into the SCHEMA format. |
 | `maps/` | `lines`, `classes`, `reads`, `test_imports`, `import_time` (.json.gz) + `MANIFEST.json`. |
 | `eval/evaluate.py` | Score the selector on `sample/` and the private set, without Docker. |
+| `eval/gap.py` | Oracle-gap report (I14): per commit our cost, the oracle cost (failing tests packed alone), the gap, the reason, and which mechanism (function map, statement rule, name / state narrowing, conservative set, import bound, ALL fallback, fixture readers, test-file rules, untraced, near-ALL) added the extra tests; aggregated by mechanism and kind. |
 | `tests/test_select.py` | One unit test per rule, on a tiny fake repo (`python -m pytest tests/`). |
 | `tests/test_names.py` | The I08 narrowing and each of its fallbacks. |
 | `tests/test_state.py` | The I22 import-state narrowing on a fake package with a metaclass. |
@@ -58,7 +63,8 @@ interrupt the whole session (pytest default). Deleting a test file nothing impor
 
 Safety nets: hunk does not apply → ALL; does not parse → import bound; definition-time change
 with no known users → import bound; module-level non-assignment change → import bound;
-base-class bodies (`BASE_FILES`) → import bound (≈ ALL: 1617 tests load them);
+base-class bodies (`BASE_FILES`) that the name / state narrowing cannot take → import bound
+(≈ ALL: 1617 tests load them);
 a function no test ran is treated as definition-time code (it may run only at import);
 Import-time: a function whose body runs while modules are imported (trie builders, decorator
 factories, `X = build()` tables, module `__getattr__`) is a change to every importer: ALL if
@@ -80,3 +86,4 @@ tests that no map knows join every non-empty selection. Without the imports map,
 | r2-slowtests | 2026-11-20 | Slow tests (≥ 5 s) in function bodies need a touched statement (private264: 3453.9 → 3269.2) | 185.0 |
 | r2-importclosure | 2026-11-20 | I22: import bound (traced per-test import closure) instead of ALL, run-time-only modules | 183.9 (private264 3263.9 → 2923.7) |
 | r2-classcreate | 2026-11-20 | I22: import-state diff follows class-creation consumers to derived values; readers among owner-class holders | 179.9 |
+| r4-gap | 2026-11-21 | eval/gap.py; test helper functions / constants by lines map / name readers; base-file class bodies narrowed (no conservative bound); import-time functions with an unchanged import state | 179.9 (private264 2882.7 → 2741.5) |

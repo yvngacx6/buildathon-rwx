@@ -57,7 +57,8 @@ class TestLib:
     def test_b(self):
         assert True
 '''
-HELPERS = "def load():\n    return 1\n"
+HELPERS = ("TABLE = {\"a\": 1}\n\n\ndef load():\n    return TABLE[\"a\"]\n\n\n"
+           "def unused():\n    return 2\n")
 FIXTURE = "# meta: x\nSELECT 1;\n"
 
 FILES = {
@@ -93,7 +94,7 @@ ALL = set(range(5))
 MAPS = {
     "lines": {"sqlglot/lib.py:10": [C], "sqlglot/lib.py:13": [C], "sqlglot/lib.py:14": [D],
               "sqlglot/other.py:4": [A], "sqlglot/parser.py:5": [B],
-              "sqlglot/fifth.py:5": [B], "sqlglot/sixth.py:2": [C], "sqlglot/seventh.py:5": [D],
+              "sqlglot/fifth.py:5": [B], "sqlglot/sixth.py:2": [C], "tests/helpers.py:5": [A], "sqlglot/seventh.py:5": [D],
               "sqlglot/ninth.py:5": [A],
               "sqlglot/slow_lambda.py:3": [D], "sqlglot/slow_lambda.py:4": [C],
               "sqlglot/slow_cache.py:5": [C, D], "sqlglot/slow_cache.py:6": [C], "sqlglot/slow_cache.py:7": [C, D]},
@@ -269,8 +270,15 @@ def test_renamed_module_selects_all(selector):
     assert run(selector, text) == ALL
 
 
-def test_base_class_body_selects_all(selector):
-    assert run(selector, edit("sqlglot/parser.py", "STRICT = False", "STRICT = True")) == ALL
+def test_base_class_body_narrows_to_name_readers(selector):
+    # Base files: no conservative bound, but the name readers still narrow (line 5 reads it).
+    assert run(selector, edit("sqlglot/parser.py", "STRICT = False", "STRICT = True")) == {B, U}
+
+
+def test_base_class_body_without_narrowing_selects_all(selector):
+    # A value computed at import cannot be narrowed by name, and there is no state
+    # snapshot here: base files never fall back to the conservative set → ALL.
+    assert run(selector, edit("sqlglot/parser.py", "STRICT = False", "STRICT = bool(0)")) == ALL
 
 
 def test_base_file_function_body_uses_map(selector):
@@ -295,8 +303,28 @@ def test_test_setup_edit_selects_whole_file(selector):
     assert run(selector, edit("tests/test_lib.py", "self.x = 1", "self.x = 2")) == {A, B, U}
 
 
-def test_test_helper_selects_importers(selector):
-    assert run(selector, edit("tests/helpers.py", "return 1", "return 2")) == {A, B, U}
+def test_test_helper_function_selects_tests_that_ran_it(selector):
+    assert run(selector, edit("tests/helpers.py", 'return TABLE["a"]', 'return TABLE["a"] + 1')) == {A, U}
+
+
+def test_test_helper_constant_selects_tests_that_read_it(selector):
+    assert run(selector, edit("tests/helpers.py", '{"a": 1}', '{"a": 2}')) == {A, U}
+
+
+def test_test_helper_function_no_test_ran_selects_importers(selector):
+    assert run(selector, edit("tests/helpers.py", "return 2", "return 3")) == {A, B, U}
+
+
+def test_test_helper_function_run_at_import_selects_importers(selector):
+    # A body that runs while a test module is imported (collection) is invisible to the
+    # lines map: keep the importers rule.
+    selector.maps.import_time.modules = lambda path, first, last: (
+        {"tests.test_lib"} if path == "tests/helpers.py" else set())
+    assert run(selector, edit("tests/helpers.py", 'return TABLE["a"]', 'return TABLE["a"] + 1')) == {A, B, U}
+
+
+def test_test_helper_signature_change_selects_importers(selector):
+    assert run(selector, edit("tests/helpers.py", "def load():", "def load(x=1):")) == {A, B, U}
 
 
 def test_fixture_selects_readers_without_ast_filter(selector):
@@ -392,7 +420,7 @@ def test_rule_that_gives_up_falls_back_to_import_bound(bounded):
     # module-level import change and base-class body were ALL
     assert run(bounded, edit("sqlglot/other.py", "from sqlglot.lib import Dialect",
                              "from sqlglot.lib import Dialect, LIMIT")) == {A, U}
-    assert run(bounded, edit("sqlglot/parser.py", "STRICT = False", "STRICT = True")) == ALL
+    assert run(bounded, edit("sqlglot/parser.py", "STRICT = False", "STRICT = bool(0)")) == ALL
 
 
 def test_hunk_that_does_not_apply_still_selects_all(bounded):
@@ -424,7 +452,7 @@ def test_isolation_failures_join_the_bound(selector, tmp_path):
 def test_syntax_error_in_collected_file_selects_all(bounded):
     # a collection error: pytest's default interrupts the whole session
     assert run(bounded, edit("tests/test_lib.py", "assert True", "assert True +")) == ALL
-    assert run(bounded, edit("tests/helpers.py", "return 1", "return 1 +")) == ALL
+    assert run(bounded, edit("tests/helpers.py", "return 2", "return 2 +")) == ALL
 
 
 def test_deleted_test_file_selects_all(bounded):
@@ -446,8 +474,27 @@ def test_function_run_by_import_sqlglot_selects_all(selector):
     assert run(selector, edit("sqlglot/tenth.py", "return 1", "return 2")) == ALL
 
 
+def test_function_run_by_import_sqlglot_with_unchanged_import_state(selector):
+    # The import-state diff shows the patched import builds the same state: what boot()
+    # computed at import is unchanged, and no test runs it later.
+    selector._state_diff = lambda: {"changed": []}
+    assert run(selector, edit("sqlglot/tenth.py", "return 1", "return 2")) == set()
+
+
+def test_function_run_by_import_sqlglot_with_changed_import_state_selects_all(selector):
+    selector._state_diff = lambda: {"changed": ["M sqlglot.tenth VALUE"]}
+    assert run(selector, edit("sqlglot/tenth.py", "return 1", "return 2")) == ALL
+
+
 def test_function_run_while_importing_a_module_selects_its_dependents(selector):
     # fifth.py:5 runs while tests/test_lib.py is imported → that file's tests join line users.
+    got = run(selector, edit("sqlglot/fifth.py", "return VALUE\n", "return VALUE + 1\n"))
+    assert got == {A, B, U}
+
+
+def test_function_run_while_importing_a_test_module_ignores_the_state_diff(selector):
+    # The state diff imports sqlglot/ only: a test module's import products are unseen.
+    selector._state_diff = lambda: {"changed": []}
     got = run(selector, edit("sqlglot/fifth.py", "return VALUE\n", "return VALUE + 1\n"))
     assert got == {A, B, U}
 

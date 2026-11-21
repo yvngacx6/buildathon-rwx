@@ -33,8 +33,9 @@ call made while selecting one file is credited with the tests it returned:
   library file readers    tests that read the edited sqlglot/ file as data (reads map)
   import bound            tests that load the module (imports map)
   fixture readers         tests/fixtures/** or other data file → reads map
-  test-file functions     edited test functions
+  test-file functions     edited test functions (+ helper functions / names in a test file)
   test-file whole file    test-file setup / helper code → the whole file ∪ importers
+  test helper functions / names   helper module function / constant → tests that ran it
   test helper importers   helper module → importing test files
   untraced tests          tests in no map; join every non-empty selection
   ALL fallback: <why>     a rule raised AllTests (whole gap)
@@ -140,8 +141,9 @@ class TracingSelector(Selector):
             self.credits.append(("import bound", set(result[0])))
         elif name == "_test_code":
             got, why = result
-            label = ("test-file functions" if why == "test functions" else
-                     "test helper importers" if why.startswith("test helper") else
+            label = ("test-file functions" if why.startswith("test functions") else
+                     "test helper functions / names" if why.startswith("test helper functions")
+                     else "test helper importers" if why.startswith("test helper") else
                      "test-file whole file")
             self.credits.append((label, set(got)))
 

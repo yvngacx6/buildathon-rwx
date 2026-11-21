@@ -12,6 +12,9 @@ here knows which tests any particular edit breaks.
   sqlglot/ function body                 tests that ran any line of the function (lines map)
     … slow tests (≥ SLOW_SECONDS)        only if they ran a touched statement (see below)
     … signature / decorator              + users of the enclosing classes (classes map)
+    … run while modules are imported     + ALL (`import sqlglot`) / the modules' dependents,
+                                         unless the import-state diff shows the patched
+                                         sqlglot/ imports build the same state: then nothing
   sqlglot/ class body / module level,    tests that ran a line reading a changed name, ∩ the
     assignments with inert new values    conservative set below; ∪ test-file reads; a changed
                                          lambda body → tests that called it (selector/names.py)
@@ -22,10 +25,14 @@ here knows which tests any particular edit breaks.
   sqlglot/ class body (otherwise)        users of the class chain ∪ tests that ran the file
   sqlglot/ module level (otherwise)      users of the module's classes ∪ tests that ran the file
                                          (ALL if the changed names are used in other modules)
-  base class / module body (BASE_FILES)  ALL
+  base class / module body (BASE_FILES)  the name / state narrowing above, not bounded by
+                                         the conservative set (~ALL); if neither applies → ALL
   tests/ test function                   that test (and same-named inherited copies)
+  tests/ other function (helper, setUp,  tests that ran its body (lines map), unless the def
+    Validator method, nested def)        line changed / no test ran it / it runs at import
+  tests/ module-level assignment         readers of the changed names (as for sqlglot/)
   tests/ other test-file code            the file's tests ∪ importers (test_imports map)
-  tests/ helper module                   importers (test_imports map)
+  tests/ helper module (otherwise)       importers (test_imports map)
   tests/fixtures/**                      tests that read the file (reads map); never AST-filtered
   new .py file (not conftest)            nothing: nothing at the pinned commit imports it
   deleted / renamed .py file             import bound of the old path
@@ -70,7 +77,8 @@ from pathlib import Path, PurePosixPath
 from . import classify, diff, nameindex, names, pack, state
 from .maps import ImportTimeMap, Maps
 
-# Class and module bodies of these files shape nearly every test (map gives ~1550 of 1620).
+# Class and module bodies of these files shape nearly every test (map gives ~1550 of 1620):
+# no conservative set for them, only the name / state narrowing, else ALL.
 BASE_FILES = {
     "sqlglot/__init__.py",
     "sqlglot/expressions/core.py",
@@ -263,14 +271,15 @@ class Selector:
         if not found:
             return set(), "no behaviour-changing region"
         if path.startswith("tests/"):
-            return self._test_code(path, found)
+            return self._test_code(path, found, old_tree, new_tree)
         if path.startswith("sqlglot/"):
             return self._library(path, old_tree, new_tree, found)
         raise AllTests(f"{path}: .py outside sqlglot/ and tests/")
 
     # ── tests/*.py ────────────────────────────────────────────────────────────
 
-    def _test_code(self, path: str, found: list[classify.Region]) -> tuple[set[int], str]:
+    def _test_code(self, path: str, found: list[classify.Region], old_tree: ast.Module,
+                   new_tree: ast.Module) -> tuple[set[int], str]:
         if name_of(path) == "__init__.py":
             raise AllTests(f"{path}: test package init")
         importers = set(self.maps.test_imports.get(path))
@@ -278,9 +287,15 @@ class Selector:
         if not name_of(path).startswith("test_"):  # a helper module
             if not importers:
                 raise AllTests(f"{path}: helper with no known importers")
+            ran = [self._test_helper_function(path, r)
+                   if r.kind == "function" else self._test_names(path, old_tree, new_tree, r)
+                   for r in found]
+            if all(got is not None for got in ran):
+                return set().union(*ran), "test helper functions / names → tests that ran them"
             return importers | own, "test helper → importing test files"
         chosen: set[int] = set()
         whole_file = False
+        helpers = False
         for r in found:
             test_name = r.chain[-1] if r.kind == "function" and r.chain else ""
             if r.kind == "function" and test_name.startswith("test") and len(r.chain) <= 2:
@@ -288,11 +303,45 @@ class Selector:
                 chosen |= {n for n in own if self._id_of[n].endswith(suffix)}
                 method = "::" + test_name  # copies inherited by test classes in importers
                 chosen |= {n for n in importers if self._id_of[n].endswith(method)}
+            elif (got := (self._test_helper_function(path, r) if r.kind == "function"
+                          else self._test_names(path, old_tree, new_tree, r))) is not None:
+                chosen |= got
+                helpers = True
             else:
                 whole_file = True
         if whole_file:
             return own | importers | chosen, "test-file setup / helper code → whole file"
-        return chosen, "test functions"
+        return chosen, "test functions" + (" + helper functions / names → tests that ran them"
+                                           if helpers else "")
+
+    def _test_helper_function(self, path: str, r: classify.Region) -> set[int] | None:
+        """A function in test code that is not a test (helper, `Validator.validate_all`,
+        `setUp`, `setUpClass`, a nested def): the tests that ran its body (lines map). Each
+        test was traced alone from the start of its setup, so `setUpClass` work is credited
+        to every test of the class. None (→ whole file / importers) when the map cannot see
+        every use: the def / decorator line changed, no test ran the body, or the body runs
+        while some module is imported (a module-level or class-body call: collection)."""
+        if r.kind != "function" or r.signature:
+            return None
+        first, last = r.span
+        if self.maps.import_time.modules(path, first + r.is_lambda, last):
+            return None
+        return self.maps.span(path, first, last) or None
+
+    def _test_names(self, path: str, old_tree: ast.Module, new_tree: ast.Module,
+                    r: classify.Region) -> set[int] | None:
+        """A module-level assignment in test code (`TPCDS_SCHEMA = {...}` in tests/helpers.py):
+        the tests that ran a line reading a changed name, as for sqlglot/ (`_by_names`, no
+        conservative bound to intersect with: every reader is a traced line). Class bodies
+        (unittest / pytest read their attributes) and anything `_by_names` cannot prove
+        → None (whole file / importers)."""
+        if r.kind != "module" or r.via_def:
+            return None
+        try:
+            got, _ = self._by_names(path, old_tree, new_tree, r, None)
+        except names.Fallback:
+            return None
+        return got or None
 
     # ── sqlglot/*.py ──────────────────────────────────────────────────────────
 
@@ -313,8 +362,12 @@ class Selector:
                 # A lambda's first line is where it is created (class-body dicts run it at
                 # import); only its later lines are body that can run at import.
                 first, last = r.span
-                at_import = self._import_time(path, first + r.is_lambda, last)
-                if not got:
+                at_import, same_state = self._function_at_import(path, first + r.is_lambda, last)
+                if not got and same_state:
+                    # Never ran under a test, and its runs at import built the same state.
+                    kinds.append(f"unrun def {'.'.join(r.chain) or '<lambda>'}, runs at import:"
+                                 " import state unchanged")
+                elif not got:
                     # Never ran under a test: may run only at import or class creation.
                     # Treat it as a change to the scope that defines it.
                     got = self._definition_time(path, module, old_tree, new_tree, r)
@@ -325,6 +378,8 @@ class Selector:
                                  + (f" (-{dropped} slow, off touched statements)" if dropped else ""))
                 if at_import:
                     kinds.append(f"(runs at import: +{len(at_import - got)})")
+                elif same_state and got:
+                    kinds.append("(runs at import: import state unchanged)")
                 got |= at_import
             else:
                 self.notes.clear()
@@ -353,11 +408,17 @@ class Selector:
 
         First try to narrow by the changed names (`_by_names`); if that cannot be proven
         safe, take the conservative set: users of the class chain ∪ tests that ran the file.
+
+        Base files (BASE_FILES): nearly every test uses their classes, so the conservative
+        set is ~ALL and is not used as a bound (wide = every test); the name / state
+        narrowing runs unbounded, and if neither applies → ALL.
         """
-        if path in BASE_FILES:
+        base = path in BASE_FILES
+        if base and (r.kind not in ("class", "module") or r.via_def):
             raise AllTests(f"{path}: base class / module body")
         try:
-            wide: set[int] | None = self._conservative(path, module, old_tree, new_tree, r)
+            wide: set[int] | None = (self.all_numbers() if base else
+                                     self._conservative(path, module, old_tree, new_tree, r))
             wide_error = None
         except AllTests as exc:
             wide, wide_error = None, exc
@@ -390,6 +451,8 @@ class Selector:
                 except names.Fallback as exc2:
                     self.notes.append(f"{'.'.join(r.chain) or module}: no state narrowing "
                                       f"({exc2})")
+        if base:
+            raise AllTests(f"{path}: base class / module body [{'; '.join(self.notes)}]")
         if wide_error is not None:
             raise wide_error
         return wide
@@ -705,6 +768,35 @@ class Selector:
                 got |= self.maps.span(path, s.body_start, s.end)
                 got |= self._import_time(path, s.body_start, s.end)
         return got
+
+    def _function_at_import(self, path: str, first: int, last: int) -> tuple[set[int], bool]:
+        """Tests that depend on function lines path:first..last having run while modules
+        were imported (`_import_time`: ALL for `import sqlglot`, else the dependents of each
+        such module) – unless the import-state diff (selector/state.py) shows that importing
+        the patched package builds exactly the same state: every module global and class
+        attribute, digested in full (containers, objects, closures and lambdas with their
+        code, defaults). Then what the function computed at import is unchanged, and only
+        tests that run it later can see the edit (the lines map has them). Only for modules
+        under sqlglot/ (the diff imports those); the diff costs ~1.2 s CPU, so only when the
+        dependents cost at least STATE_MIN_GAIN.
+
+        Returns (tests, True if the state diff showed no change)."""
+        modules = self.maps.import_time.modules(path, first, last)
+        if not modules:
+            return set(), False
+        try:
+            wide, error = self._import_time(path, first, last), None
+        except AllTests as exc:
+            wide, error = None, exc
+        if ((wide is None or self._cost(wide) >= STATE_MIN_GAIN)
+                and all(m.split(".")[0] == "sqlglot" and m not in state.SKIP_MODULES
+                        for m in modules)):
+            found = self._state_diff()
+            if found is not None and not found["changed"]:
+                return set(), True
+        if error is not None:
+            raise error
+        return wide, False
 
     def _import_time(self, path: str, first: int, last: int) -> set[int]:
         """Tests that depend on lines path:first..last having run while modules were imported."""
