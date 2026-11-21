@@ -186,10 +186,32 @@ class CmpPickler(pickle._Pickler):
         return InPickler.reducer_override(self, obj)
 
 
-def dumps_in(value) -> bytes:
-    buf = io.BytesIO()
+class TooBig(Exception):
+    pass
+
+
+class _CappedBuffer(io.BytesIO):
+    """Stops a pickle early once it is over `cap` bytes (the pickler writes in ~64 kB frames)."""
+
+    def __init__(self, cap: float):
+        super().__init__()
+        self.cap = cap
+
+    def write(self, b):
+        n = super().write(b)
+        if self.tell() > self.cap:
+            raise TooBig()
+        return n
+
+
+def dumps_in(value, cap: float = float("inf")) -> bytes:
+    """Pickle a call's input. Raises TooBig as soon as it is known to be over `cap` bytes."""
+    buf = _CappedBuffer(cap)
     InPickler(buf, protocol=5).dump(value)
-    return buf.getvalue()
+    data = buf.getvalue()
+    if len(data) > cap:
+        raise TooBig()
+    return data
 
 
 def digest_cmp(value) -> bytes:

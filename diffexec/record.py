@@ -137,7 +137,9 @@ def _start(code, offset):
         loc = frame.f_locals
         vals = tuple(loc[n] for n in rec.argn)
         cells = tuple(loc.get(n, serial._EMPTY) for n in rec.nfree)
-        data = serial.dumps_in((vals, cells))
+        data = serial.dumps_in((vals, cells), INPUT_CAP)
+    except serial.TooBig:
+        data = None
     except BaseException:
         rec.uses[phase] = None
         stack.append((rec, frame, None, None, phase))
@@ -147,7 +149,7 @@ def _start(code, offset):
         dt = time.perf_counter() - t0
         stats["pickle_s"] += dt
         rec.secs += dt
-    why = ("input" if len(data) > INPUT_CAP else "time" if rec.secs > TIME_CAP else None)
+    why = ("input" if data is None else "time" if rec.secs > TIME_CAP else None)
     if why:
         _kill(rec, why)
         mon.set_local_events(TOOL, code, 0)
