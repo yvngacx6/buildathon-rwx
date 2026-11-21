@@ -686,11 +686,14 @@ class Selector:
                 else:
                     self._mixed_py = True
                 if r.signature and path in self._defaults:
-                    # literal defaults only: calls are what can observe them (prunable);
-                    # the class users stay as for any signature edit
-                    users = self._class_users(module, r.classes) - got
-                    got |= users
-                    fixed |= users
+                    # literal defaults only (nothing reads `__defaults__`): only a call that
+                    # leaves the parameter out can observe the new value, and every call runs
+                    # the body, so the tests that ran the function bound it (no class users);
+                    # narrower: the tests that ran such a call site (R-DEF, report 16)
+                    seen = self._default_observers(path, old_tree, new_tree, r, defaults)
+                    if seen is not None:
+                        got &= seen
+                        kinds.append(f"(default: {len(got)} via default-observing calls)")
                 elif r.signature:
                     got |= self._class_users(module, r.classes)
                     fixed |= got
@@ -778,6 +781,66 @@ class Selector:
             self._jobs.append((path, self._source(path) if path in self._defaults else new_text,
                                prunable - fixed))
         return chosen, ", ".join(kinds)
+
+    def _default_observers(self, path: str, old_tree: ast.Module, new_tree: ast.Module,
+                           r: classify.Region, defaults: list) -> set[int] | None:
+        """R-DEF: the tests that ran a call site that can leave an edited default parameter of
+        r's def unpassed (any call whose callee is named like the def, over sqlglot/ and
+        tests/: a superset of its real calls), or None (→ every test that ran the function)
+        when the def can be reached other than through such a call: a dunder (constructors,
+        operators), any other load of the name (bound method handed on, stored in a table,
+        `partial`, an import alias), a string of the name or a getattr pattern matching it
+        (dynamic dispatch, `*_sql`), a call at definition time (its import-time effect is the
+        import-state diff's), or a file that does not parse.
+
+        A call "supplies" a parameter by keyword, or positionally when it passes at least
+        index + 1 positional arguments counting `self` (exact for plain functions,
+        conservative for bound methods); `*args` / `**kwargs` never supply one. A call site's
+        own lines (not its statement's): whenever the call runs, one of them executes, also
+        when it sits in a lambda of a class-body table."""
+        name = r.chain[-1] if r.chain and not r.is_lambda else None
+        if name is None or name.startswith("__"):
+            return None
+        params = {p for n, _, ps in defaults if n == name for p in ps}
+        defs = _edited_defs(old_tree, new_tree, r)
+        index = self._index()
+        if not params or not defs or index is None:
+            return None
+        a = defs[0].args
+        positional = [x.arg for x in a.posonlyargs + a.args]
+        slots = {p: (positional.index(p) if p in positional else None) for p in params}
+        if any(alias != name for _, alias in index.data["imports"].get(name, ())):
+            return None
+        module = _module_of(path)
+        out: set[int] = set()
+        for site, allowed, names_only, on_module in index.data["dynamic"]:
+            if names_only:
+                continue  # dir(): names, not values
+            if on_module is not None and (len(r.chain) > 1
+                                          or not re.fullmatch(on_module, module, re.S)):
+                continue  # getattr on modules: reaches module-level defs only
+            if allowed is not None and not re.fullmatch(allowed, name, re.S):
+                continue
+            if allowed is not None or site.when != "run":
+                return None  # dispatch that can name this def (`*_sql` tables), or at import
+            # an any-name getattr run inside a def: whatever it calls, it calls there
+            out |= self.maps.span(site.path, *site.lines)
+        for src in sorted({o[0] for o in index._occurrences(name)}):
+            if any(o[1] == "str" for o in index._occurrences(name) if o[0] == src):
+                return None
+            text = self._source(src)
+            try:
+                tree = ast.parse(text) if text is not None else None
+            except SyntaxError:
+                tree = None
+            if tree is None:
+                return None
+            got = _default_call_sites(tree, name, slots)
+            if got is None:
+                return None
+            for first, last in got:
+                out |= self.maps.span(src, first, last)
+        return out
 
     def _defaults_unread(self) -> bool:
         """No code in sqlglot/ or tests/ reads a function's defaults (`__defaults__`,
@@ -1887,6 +1950,52 @@ def _literal(node: ast.AST | None):
             return False, None
         return True, v
     return False, None
+
+
+def _default_call_sites(tree: ast.Module, name: str,
+                        slots: dict[str, int | None]) -> list[tuple[int, int]] | None:
+    """The line spans of the calls of `name` (`x.name(...)` / `name(...)`) in tree that can
+    leave one of `slots`' parameters unpassed, or None if the name is loaded otherwise (handed
+    on, stored, aliased) or called while a module / class body runs (definition time)."""
+    out: list[tuple[int, int]] = []
+    callees: set[int] = set()
+
+    def supplies(call: ast.Call, param: str, slot: int | None) -> bool:
+        if any(k.arg is None for k in call.keywords) or any(
+                isinstance(x, ast.Starred) for x in call.args):
+            return False
+        if any(k.arg == param for k in call.keywords):
+            return True
+        return slot is not None and len(call.args) >= slot + 1
+
+    def named(node: ast.AST) -> bool:
+        return (isinstance(node, ast.Attribute) and node.attr == name
+                or isinstance(node, ast.Name) and node.id == name)
+
+    def visit(node: ast.AST, run: bool) -> bool:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            a = node.args
+            heads = list(a.defaults) + [d for d in a.kw_defaults if d is not None]
+            if not isinstance(node, ast.Lambda):
+                heads += node.decorator_list + ([node.returns] if node.returns else [])
+            if not all(visit(h, run) for h in heads):
+                return False
+            body = [node.body] if isinstance(node, ast.Lambda) else node.body
+            return all(visit(b, True) for b in body)
+        if isinstance(node, ast.Call) and named(node.func):
+            if not run:
+                return False
+            callees.add(id(node.func))
+            if not all(supplies(node, p, s) for p, s in slots.items()):
+                out.append((node.lineno, node.end_lineno or node.lineno))
+        elif named(node) and id(node) not in callees:
+            return False  # any other load / store of the name
+        elif isinstance(node, ast.alias) and name in (node.name.rsplit(".", 1)[-1], node.asname):
+            if node.asname not in (None, name):
+                return False
+        return all(visit(c, run) for c in ast.iter_child_nodes(node))
+
+    return out if visit(tree, False) else None
 
 
 def _default_changes(old_tree: ast.Module, new_tree: ast.Module) -> list | None:
