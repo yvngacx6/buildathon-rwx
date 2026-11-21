@@ -346,7 +346,7 @@ class DiffExec:
             n += len(out)
         stats = got.get("stats", {})
         return dropped, (f"diffexec: dropped {n} "
-                         f"(blobs {stats.get('ok')}/{stats.get('blobs')}, late {stats.get('late')}, bytes {stats.get('bytes')}, budget {self.last_budget:.2f}s, child cpu {stats.get('cpu_s')}s, rusage {self.last_child}s, "
+                         f"(blobs {stats.get('ok')}/{stats.get('blobs')}, late {stats.get('late')}, retry {stats.get('retry')}, bytes {stats.get('bytes')}, budget {self.last_budget:.2f}s, child cpu {stats.get('cpu_s')}s, rusage {self.last_child}s, "
                          f"parent {time.process_time() - t0:.2f}s)")
 
     def _is_resource(self, tid: str) -> bool:
