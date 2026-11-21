@@ -664,8 +664,9 @@ class Selector:
         lazily, by some earlier test in the same worker. Check it on the import-state diff:
         an entry that changed outside the patched modules, not a subclass of one of their
         classes and not a copy of one of their changed values (equal to it both before and
-        after the edit: a re-export, `X = other.X.copy()`) → GlobalEffect (ALL). No diff
-        (the patched package does not import): the module's own bound still holds."""
+        after the edit: a re-export, `X = other.X.copy()`) → GlobalEffect (ALL). The patched
+        package does not import: ALL if the failing file is not a patched one (the edit broke
+        another module), else the module's own bound still holds."""
         found = self._state_diff()
         if found is None:
             broken = self._state_error
