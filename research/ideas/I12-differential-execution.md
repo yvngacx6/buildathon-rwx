@@ -56,7 +56,11 @@ over commits. `eval/evaluate.py` with the uncut store C (21.5 MB) gives 157.9, 3
 **Recommendation.** Adopt the method only together with these steps:
 
 1. Re-record store C300 on EC2 in the pinned image. That is about 8.4k CPU-s, roughly 40 min on
-   4 cores, offline.
+   4 cores, offline. Re-check the gains: they may shrink at 4 workers (hole 9).
+1a. Add `python -m compileall /opt/sqlglot/sqlglot` to the shipped Dockerfile.
+    The EC2 CPU figures were measured with it. Without `.pyc` files, the one sqlglot import
+    recompiles every module on every run, and that could erase the private41 and private264
+    nets.
 2. Pack the store into a single archive. Commit it with a MANIFEST, as the maps are committed.
 3. Rerun the four sets.
 
@@ -205,6 +209,13 @@ Makefile's scorer flags.
    image. Hash seed 0 is assumed. A mismatch makes replays disagree, so all tests are kept
    (safe, gain lost).
 7. **Identity against globals.** f returning a module singleton vs an equal copy looks the same.
+8. **Tests that fail while recording have truncated recordings.** In recC, the only failures
+   were the 33 `test_generator_memory` subtests: tracemalloc sees the recorder's memory. The
+   resource rule excludes that test. Before adoption, `record.py` should record outcomes
+   (`pytest_runtest_logreport`) and mark a failing test's phases incomplete.
+9. **Caps are per worker.** C was recorded with 14 workers. Re-recording with `-n 4` in the
+   pinned image hits the caps sooner, so fewer functions stay alive and the C300 gains may
+   shrink.
 
 ## Cheaper variants
 
