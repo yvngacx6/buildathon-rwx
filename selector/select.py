@@ -664,6 +664,11 @@ class Selector:
         fixed = set(chosen)  # tests diffexec may never drop (readers, definition-time users ...)
         prunable: set[int] = set()
         kinds = []
+        if new_text and found and all(r.kind == "module" for r in found):
+            hit = self._constant_defaults(path, old_tree, new_tree)
+            if hit is not None:
+                self._mixed_py = True
+                return chosen | hit[0], hit[1]
         # Every change in the file is a literal default value of a def (`depth: int = 0` →
         # `= 1`): diffexec replays the old code with the new default where a recorded call
         # may have used it (diffexec/replay.py "defaults").
@@ -809,6 +814,15 @@ class Selector:
         a = defs[0].args
         positional = [x.arg for x in a.posonlyargs + a.args]
         slots = {p: (positional.index(p) if p in positional else None) for p in params}
+        return self._observing_calls(path, name, slots, len(r.chain) > 1)
+
+    def _observing_calls(self, path: str, name: str, slots: dict[str, int | None],
+                         method: bool) -> set[int] | None:
+        """The tests that ran a call of `name` that can leave a `slots` parameter unpassed
+        (see `_default_observers`), or None when the name can be reached otherwise."""
+        index = self._index()
+        if index is None:
+            return None
         if any(alias != name for _, alias in index.data["imports"].get(name, ())):
             return None
         module = _module_of(path)
@@ -816,7 +830,7 @@ class Selector:
         for site, allowed, names_only, on_module in index.data["dynamic"]:
             if names_only:
                 continue  # dir(): names, not values
-            if on_module is not None and (len(r.chain) > 1
+            if on_module is not None and (method
                                           or not re.fullmatch(on_module, module, re.S)):
                 continue  # getattr on modules: reaches module-level defs only
             if allowed is not None and not re.fullmatch(allowed, name, re.S):
@@ -841,6 +855,82 @@ class Selector:
             for first, last in got:
                 out |= self.maps.span(src, first, last)
         return out
+
+    def _constant_defaults(self, path: str, old_tree: ast.Module,
+                           new_tree: ast.Module) -> tuple[set[int], str] | None:
+        """R-DEF for a module constant read only as a default value (`LIMIT = 100` …
+        `def f(x, n=LIMIT)`): the edit is then the same as editing those defaults, so the
+        tests that ran a call leaving them unpassed (`_observing_calls`) ∩ the tests that ran
+        the def. None (→ the usual module-body rules) unless every changed statement is
+        `NAME = literal`, every load of NAME is a default of a def in this file (no import of
+        it elsewhere, no string, no star import, no module getattr that can reach it), no
+        such def runs at import, and nothing reads `__defaults__`."""
+        if len(old_tree.body) != len(new_tree.body) or not self._defaults_unread():
+            return None
+        changed = set()
+        for o, n in zip(old_tree.body, new_tree.body):
+            if ast.dump(o) == ast.dump(n):
+                continue
+            if not (isinstance(o, ast.Assign) and isinstance(n, ast.Assign)
+                    and len(o.targets) == len(n.targets) == 1
+                    and isinstance(o.targets[0], ast.Name)
+                    and ast.dump(o.targets[0]) == ast.dump(n.targets[0])
+                    and _literal(o.value)[0] and _literal(n.value)[0]):
+                return None
+            changed.add(o.targets[0].id)
+        index = self._index()
+        if not changed or index is None:
+            return None
+        module = _module_of(path)
+        leaf = module.rsplit(".", 1)[-1]
+        if any(m.endswith(leaf) for _, m in index.data["stars"]):
+            return None
+        for site, allowed, names_only, on_module in index.data["dynamic"]:
+            if on_module is not None and re.fullmatch(on_module, module, re.S) and (
+                    allowed is None or any(re.fullmatch(allowed, c, re.S) for c in changed)):
+                return None  # getattr(module, name) / vars(module) can read it
+        for name in changed:
+            if index.data["imports"].get(name) or any(
+                    o[0] != path or o[1] != "name" for o in index._occurrences(name)):
+                return None
+        # every load of a changed name must be a def's default: (def, param, slot, method)
+        defaults_at: dict[int, tuple] = {}
+        for node, method in _defs_with_owner(old_tree):
+            a = node.args
+            positional = a.posonlyargs + a.args
+            for i, d in enumerate(a.defaults):
+                p = positional[len(positional) - len(a.defaults) + i]
+                defaults_at[id(d)] = (node, p.arg, positional.index(p), method)
+            for p, d in zip(a.kwonlyargs, a.kw_defaults):
+                if d is not None:
+                    defaults_at[id(d)] = (node, p.arg, None, method)
+        targets = {id(s.targets[0]) for s in old_tree.body if isinstance(s, ast.Assign)}
+        uses = []
+        for node in ast.walk(old_tree):
+            if isinstance(node, ast.Name) and node.id in changed:
+                if id(node) in targets:
+                    continue
+                if id(node) not in defaults_at:
+                    return None
+                uses.append(defaults_at[id(node)])
+            elif isinstance(node, (ast.Global, ast.Nonlocal)) and set(node.names) & changed:
+                return None
+        if not uses:
+            return None
+        out: set[int] = set()
+        whys = []
+        for f, param, slot, method in uses:
+            if f.name.startswith("__") or self.maps.import_time.modules(
+                    path, f.body[0].lineno, f.end_lineno):
+                return None
+            seen = self._observing_calls(path, f.name, {param: slot}, method)
+            if seen is None:
+                return None
+            ran = self.maps.span(path, f.body[0].lineno, f.end_lineno)
+            out |= seen & ran
+            whys.append(f"{f.name}({param})")
+        return out, (f"module {module}: {', '.join(sorted(changed))} read only as the default of "
+                     f"{', '.join(whys)} → {len(out)} via default-observing calls")
 
     def _defaults_unread(self) -> bool:
         """No code in sqlglot/ or tests/ reads a function's defaults (`__defaults__`,
@@ -1950,6 +2040,17 @@ def _literal(node: ast.AST | None):
             return False, None
         return True, v
     return False, None
+
+
+def _defs_with_owner(tree: ast.Module):
+    """(def node, is a method) for every def at module level or anywhere in a class body."""
+    for s in tree.body:
+        if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield s, False
+        elif isinstance(s, ast.ClassDef):
+            for c in ast.walk(s):
+                if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    yield c, True
 
 
 def _default_call_sites(tree: ast.Module, name: str,
