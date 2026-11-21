@@ -10,6 +10,7 @@ here knows which tests any particular edit breaks.
   .py, same syntax tree (or docstrings)  nothing
   .py that does not parse after patch    ALL
   sqlglot/ function body                 tests that ran any line of the function (lines map)
+    … slow tests (≥ SLOW_SECONDS)        only if they ran a touched statement (see below)
     … signature / decorator              + users of the enclosing classes (classes map)
   sqlglot/ class body                    users of the class chain ∪ tests that ran the file
   sqlglot/ module level                  users of the module's classes ∪ tests that ran the file
@@ -27,6 +28,15 @@ here knows which tests any particular edit breaks.
 
 Then: tests no map knows about join every non-empty selection, and a selection that would
 cost nearly as much as ALL becomes ALL (same price, no risk).
+
+Slow tests in function bodies. A test that never executes the statements an edit touches
+runs exactly the code it ran before, so it cannot notice the edit. Cheap tests stay at the
+whole-function rule (they cost almost nothing, and the function span absorbs any line-level
+noise in the map). A slow test (≥ SLOW_SECONDS, from tests.json) is kept only if the lines
+map shows it ran a line of a touched statement: the whole statement for simple statements,
+the header lines for an if / for / while whose header alone changed. The statement view
+exists only for clean in-place edits (classify.touched_statements); otherwise, or when no
+test at all ran the touched statements, slow tests stay at the whole-function rule.
 """
 
 from __future__ import annotations
@@ -53,6 +63,7 @@ DOC_FILES = {"LICENSE", "Makefile", "CHANGELOG", ".gitignore", ".pre-commit-conf
 CONFIG_FILES = {"pyproject.toml", "setup.cfg"}
 ALWAYS_ALL = {"pytest.ini", "tox.ini", "conftest.py", "setup.py"}
 ALL_FRACTION = 0.85  # selection cost ≥ this × ALL cost → just run ALL
+SLOW_SECONDS = 5.0  # tests at least this slow get the statement-level rule in function bodies
 
 
 class AllTests(Exception):
@@ -71,6 +82,7 @@ class Selector:
             self._by_file.setdefault(t["file"], set()).add(t["number"])
             self._id_of[t["number"]] = t["id"]
         self._number_of = {t["id"]: t["number"] for t in tests}
+        self._slow = {t["number"] for t in tests if t["seconds"] >= SLOW_SECONDS}
         self._untraced: set[int] | None = None
         self._sources: dict[str, str] | None = None
 
@@ -208,7 +220,8 @@ class Selector:
         kinds = []
         for r in found:
             if r.kind == "function":
-                got = self.maps.span(path, *r.span)
+                ran = self.maps.span(path, *r.span)
+                got = self._slow_tests_off_statements(path, ran, r)
                 if r.signature:
                     got |= self._class_users(module, r.classes)
                 if not got:
@@ -217,12 +230,27 @@ class Selector:
                     got = self._definition_time(path, module, old_tree, new_tree, r)
                     kinds.append(f"unrun def {'.'.join(r.chain) or '<lambda>'} → definition-time")
                 else:
-                    kinds.append(f"def {'.'.join(r.chain) or '<lambda>'}")
+                    dropped = len(ran - got)
+                    kinds.append(f"def {'.'.join(r.chain) or '<lambda>'}"
+                                 + (f" (-{dropped} slow, off touched statements)" if dropped else ""))
             else:
                 got = self._definition_time(path, module, old_tree, new_tree, r)
                 kinds.append(f"{r.kind} {'.'.join(r.chain) or module}")
             chosen |= got
         return chosen, ", ".join(kinds)
+
+    def _slow_tests_off_statements(self, path: str, ran_function: set[int],
+                                   r: classify.Region) -> set[int]:
+        """Drop the slow tests that ran the function but none of the touched statements."""
+        slow = ran_function & self._slow
+        if not slow or r.statements is None:
+            return ran_function
+        ran_statements: set[int] = set()
+        for first, last in r.statements:
+            ran_statements |= self.maps.span(path, first, last)
+        if not ran_statements:
+            return ran_function  # no test ran them: map blind spot, keep the function rule
+        return ran_function - (slow - ran_statements)
 
     def _definition_time(self, path: str, module: str, old_tree: ast.Module,
                          new_tree: ast.Module, r: classify.Region) -> set[int]:

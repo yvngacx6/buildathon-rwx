@@ -67,6 +67,7 @@ FILES = {
     "sqlglot/third.py": "from sqlglot.other import SHARED\n",
     "sqlglot/fourth.py": "VALUE = 1\n",
     "sqlglot/fifth.py": "from sqlglot.fourth import VALUE\n\n\ndef f():\n    return VALUE\n",
+    "sqlglot/sixth.py": "class P:\n    F = {\n        \"a\": lambda x: (\n            x + 1\n        ),\n    }\n",
     "tests/conftest.py": "import pytest\n",
     "tests/test_lib.py": TEST,
     "tests/helpers.py": HELPERS,
@@ -85,7 +86,7 @@ ALL = set(range(5))
 MAPS = {
     "lines": {"sqlglot/lib.py:10": [C], "sqlglot/lib.py:13": [C], "sqlglot/lib.py:14": [D],
               "sqlglot/other.py:4": [A], "sqlglot/parser.py:5": [B],
-              "sqlglot/fifth.py:5": [B]},
+              "sqlglot/fifth.py:5": [B], "sqlglot/sixth.py:3": [D], "sqlglot/sixth.py:4": [C]},
     "classes": {"sqlglot.lib.Dialect": [A]},
     "reads": {"tests/fixtures/q.sql": [B]},
     "test_imports": {"tests/helpers.py": [A, B]},
@@ -94,6 +95,11 @@ MAPS = {
 
 @pytest.fixture
 def selector(tmp_path: Path) -> Selector:
+    return make_selector(tmp_path)
+
+
+def make_selector(tmp_path: Path, slow: tuple[int, ...] = ()) -> Selector:
+    """The fake repo; tests in `slow` take 30 s (every other test takes 1 s)."""
     repo, maps = tmp_path / "sqlglot", tmp_path / "maps"
     for path, text in FILES.items():
         (repo / path).parent.mkdir(parents=True, exist_ok=True)
@@ -103,7 +109,8 @@ def selector(tmp_path: Path) -> Selector:
         traced = T[:4]  # test U appears in no map
         body = {"tests": traced, "map": mapping}
         (maps / f"{name}.json.gz").write_bytes(gzip.compress(json.dumps(body).encode()))
-    tests = [{"number": i, "id": t, "file": t.split("::")[0], "seconds": 1.0} for i, t in enumerate(T)]
+    tests = [{"number": i, "id": t, "file": t.split("::")[0], "seconds": 30.0 if i in slow else 1.0}
+             for i, t in enumerate(T)]
     return Selector(tests, repo, maps)
 
 
@@ -150,6 +157,39 @@ def test_function_body_uses_whole_function_span(selector):
     # plus the untraced test U, which joins every non-empty selection.
     got = run(selector, edit("sqlglot/lib.py", "len(sql) > LIMIT", "len(sql) >= LIMIT"))
     assert got == {C, D, U}
+
+
+def test_slow_test_off_the_touched_statement_is_dropped(tmp_path):
+    # D (slow) ran the function (line 14) but not the edited `return sql` (line 13).
+    selector = make_selector(tmp_path, slow=(D,))
+    assert run(selector, edit("sqlglot/lib.py", "return sql\n", "return sql[1:]\n")) == {C, U}
+
+
+def test_slow_test_on_another_line_of_the_touched_header_is_kept(tmp_path):
+    # C (slow) ran line 10 of the 3-line `if` header, not the edited line 11.
+    selector = make_selector(tmp_path, slow=(C,))
+    got = run(selector, edit("sqlglot/lib.py", "len(sql) > LIMIT", "len(sql) >= LIMIT"))
+    assert got == {C, D, U}
+
+
+def test_slow_test_kept_when_statements_are_inserted(tmp_path):
+    # A new statement has no old statement to anchor it: whole-function rule.
+    selector = make_selector(tmp_path, slow=(D,))
+    got = run(selector, edit("sqlglot/lib.py", "return sql\n", "sql = sql.strip()\n            return sql\n"))
+    assert got == {C, D, U}
+
+
+def test_slow_test_kept_when_the_edit_changes_name_bindings(tmp_path):
+    # `LIMIT :=` makes LIMIT local to parse(): line 11, which every caller runs, now fails.
+    selector = make_selector(tmp_path, slow=(D,))
+    got = run(selector, edit("sqlglot/lib.py", "return sql\n", "return (LIMIT := sql)\n"))
+    assert got == {C, D, U}
+
+
+def test_slow_test_kept_for_a_lambda_region(tmp_path):
+    # A lambda in a class-level dict has no enclosing def body: whole-lambda rule.
+    selector = make_selector(tmp_path, slow=(D,))
+    assert run(selector, edit("sqlglot/sixth.py", "x + 1", "x + 2")) == {C, D, U}
 
 
 def test_signature_change_adds_class_users(selector):

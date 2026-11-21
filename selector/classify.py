@@ -15,12 +15,15 @@ Rules:
     docstrings) is dropped.
   * Code that runs at class-creation time even though it sits in a def (metaclass methods,
     `__init_subclass__`) is a class-body change: tests never "execute" it under a test context.
+  * A function region also carries the old-file spans of the statements the edit touches,
+    when the edit is a clean in-place statement edit (`touched_statements`). The selector
+    uses them to keep the few slow tests out when they never ran those statements.
 """
 
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 DEFINITION_TIME_METHODS = {"__init_subclass__", "__set_name__", "__class_getitem__"}
 
@@ -33,6 +36,9 @@ class Region:
     signature: bool = False  # function: a decorator / def line changed
     classes: tuple[tuple[str, ...], ...] = ()  # enclosing class chains, innermost last
     via_def: tuple[str, ...] = ()  # class: the definition-time def that put us here
+    # function: OLD-file spans of the statements the edit touches (see touched_statements);
+    # None when the edit is not a clean in-place statement edit.
+    statements: tuple[tuple[int, int], ...] | None = None
 
 
 @dataclass
@@ -198,7 +204,115 @@ def regions(old_tree: ast.Module, new_tree: ast.Module,
         found.setdefault(_region_for_old_line(old, line))
     for line in added:
         found.setdefault(_region_for_new_line(old, new, line))
-    return [r for r in found if not _unchanged(r, old, new)]
+    return [replace(r, statements=touched_statements(r, old, new))
+            for r in found if not _unchanged(r, old, new)]
+
+
+# ── statement-level view of a function edit ──────────────────────────────────
+#
+# A test that never executes any statement the edit touches runs the same bytecode, in the
+# same order, as before: the edited function behaves identically for it. That holds only
+# when the edit is "in place": the function keeps its statement skeleton, binds the same
+# names in the same scopes, and stays (or stays not) a generator. Anything else → None, and
+# the caller keeps the whole-function rule.
+
+_STMT_LISTS = ("body", "orelse", "finalbody")
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda,
+           ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def touched_statements(region: Region, old: Scopes, new: Scopes) -> tuple[tuple[int, int], ...] | None:
+    """OLD-file line spans of the statements an edit touches inside one def, or None.
+
+    Walks the old and new def bodies in parallel. Equal statements are skipped. A touched
+    simple statement gives its full span; a touched compound statement (if / for / while /
+    with) whose header alone changed gives its header span (the lines up to its first body
+    statement), else the walk goes into its bodies. None (no statement view) when:
+      * the region is not exactly one def body (lambda, signature, metaclass method,
+        a name defined twice);
+      * statements were added, removed, split or merged (a body changed length);
+      * a nested def / class header changed (it runs whenever the outer body reaches it);
+      * a touched statement binds different names, has a global / nonlocal, or adds or
+        removes a yield (each of these changes code outside the touched statement).
+    """
+    if region.kind != "function" or region.signature or region.via_def:
+        return None
+    olds = [s for s in old.scopes if s.kind == "def" and s.chain == region.chain]
+    news = [s for s in new.scopes if s.kind == "def" and s.chain == region.chain]
+    if len(olds) != 1 or len(news) != 1 or region.span != (olds[0].body_start, olds[0].end):
+        return None
+    o, n = olds[0].node, news[0].node
+    if _header(o) != _header(n):
+        return None
+    spans: list[tuple[int, int]] = []
+    if not _diff_bodies(o.body, n.body, spans) or not spans:
+        return None
+    return tuple(spans)
+
+
+def _header(node: ast.stmt) -> list[str]:
+    """Every field of a statement except its statement lists, dumped."""
+    return [ast.dump(v) if isinstance(v, ast.AST) else repr(v) if not isinstance(v, list)
+            else repr([ast.dump(x) if isinstance(x, ast.AST) else x for x in v])
+            for k, v in ast.iter_fields(node) if k not in _STMT_LISTS]
+
+
+def _diff_bodies(old: list[ast.stmt], new: list[ast.stmt], spans: list[tuple[int, int]]) -> bool:
+    """Append the spans of touched statements; False when the edit is not in place."""
+    if len(old) != len(new):
+        return False
+    for a, b in zip(old, new):
+        if ast.dump(a) == ast.dump(b):
+            continue
+        if not _same_scoping(a, b):
+            return False
+        lists = [k for k in _STMT_LISTS if isinstance(getattr(a, k, None), list)]
+        if type(a) is not type(b) or not lists:
+            spans.append((a.lineno, a.end_lineno))  # a simple statement, or one replaced
+            continue
+        if _header(a) != _header(b):
+            if isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                return False
+            if any(isinstance(v, list) and v and not isinstance(v[0], ast.expr)
+                   for k, v in ast.iter_fields(a) if k not in _STMT_LISTS):
+                spans.append((a.lineno, a.end_lineno))  # except handlers / match cases
+                continue
+            first_body = min(getattr(a, k)[0].lineno for k in lists if getattr(a, k))
+            spans.append((a.lineno, max(a.lineno, first_body - 1)))
+        for k in lists:
+            if not _diff_bodies(getattr(a, k), getattr(b, k), spans):
+                return False
+    return True
+
+
+def _same_scoping(a: ast.stmt, b: ast.stmt) -> bool:
+    """Same name bindings (per nesting depth), no global/nonlocal, same yield presence."""
+    return _bindings(a) == _bindings(b) and _yields(a) == _yields(b) and not any(
+        isinstance(x, (ast.Global, ast.Nonlocal)) for s in (a, b) for x in ast.walk(s))
+
+
+def _bindings(node: ast.AST, depth: int = 0) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        out.append((depth, node.name))
+    elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+        out.append((depth, node.id))
+    elif isinstance(node, ast.alias):
+        out.append((depth, node.asname or node.name.split(".")[0]))
+    elif isinstance(node, ast.arg):
+        out.append((depth, node.arg))
+    elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+        out.append((depth, node.name))
+    elif isinstance(node, ast.MatchMapping) and node.rest:
+        out.append((depth, node.rest))
+    inner = depth + 1 if isinstance(node, _SCOPES) else depth
+    for child in ast.iter_child_nodes(node):
+        out += _bindings(child, inner)
+    return sorted(out)
+
+
+def _yields(node: ast.AST) -> bool:
+    return any(isinstance(x, (ast.Yield, ast.YieldFrom)) for x in ast.walk(node))
 
 
 def top_level_classes(tree: ast.Module) -> list[str]:
