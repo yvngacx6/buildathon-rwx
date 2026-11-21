@@ -369,6 +369,7 @@ class SubTest:
         meta = self.meta()
         root = str(self.sel.sqlglot)
         _warm(root)
+        _warm_code(root, jobs)
         rfd, wfd = os.pipe()
         t0 = os.times()
         pid = os.fork()
@@ -455,19 +456,28 @@ class SubTest:
         return q["cpu_opt"] if opt else q["cpu_exec"]
 
 
+def _warm_code(root: str, jobs) -> None:
+    """Compile the jobs' pinned and patched files in the parent, once per commit for all the
+    forked verifiers (diffexec replay, subtest, slowverify): see diffexec/replay.py."""
+    try:
+        from diffexec.replay import warm_files
+        warm_files(root, [(path, new_text) for path, new_text, _ in jobs])
+    except Exception:  # noqa: BLE001  (the child compiles them itself)
+        pass
+
+
 def _swap(root: str, jobs) -> str | None:
     """Swap the changed functions' code (as diffexec/replay.py). → bail reason or None."""
     import functools
     import importlib
     import types
     from diffexec import serial
-    from diffexec.replay import _walk
+    from diffexec.replay import _new_code, _old_code, _walk
     swaps = {}
     for path, new_text, _ in jobs:
         filename = os.path.join(root, path)
-        with open(filename, "rb") as fh:
-            old_top = compile(fh.read(), filename, "exec", dont_inherit=True)
-        new_top = compile(new_text.encode(), filename, "exec", dont_inherit=True)
+        old_top = _old_code(filename)  # compiled in the parent before the fork (warm_files)
+        new_top = _new_code(filename, new_text)
         old_codes, new_codes = _walk(old_top), _walk(new_top)
         if old_codes.keys() != new_codes.keys():
             return "functions added / removed"

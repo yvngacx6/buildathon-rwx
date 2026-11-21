@@ -1854,16 +1854,23 @@ def _default_changes(old_tree: ast.Module, new_tree: ast.Module) -> list | None:
     funcs = (ast.FunctionDef, ast.AsyncFunctionDef)
 
     def blank(tree: ast.Module) -> tuple[str, list]:
-        import copy
-        t = copy.deepcopy(tree)
+        # Blank the defaults in place, dump, then put the original lists back (a deep copy
+        # of a whole module tree cost ~1 s of CPU per call on big files).
+        # Same walk as over a copy: blanking while walking, so defaults are never descended.
         found = []
-        for node in ast.walk(t):
-            if isinstance(node, funcs + (ast.Lambda,)):
-                a = node.args
-                found.append((node, list(a.defaults), list(a.kw_defaults)))
-                a.defaults = [ast.Constant(None) for _ in a.defaults]
-                a.kw_defaults = [None if d is None else ast.Constant(None) for d in a.kw_defaults]
-        return ast.dump(t), found
+        try:
+            for node in ast.walk(tree):
+                if isinstance(node, funcs + (ast.Lambda,)):
+                    a = node.args
+                    found.append((node, a.defaults, a.kw_defaults))
+                    a.defaults = [ast.Constant(None) for _ in a.defaults]
+                    a.kw_defaults = [None if d is None else ast.Constant(None)
+                                     for d in a.kw_defaults]
+            dump = ast.dump(tree)
+        finally:
+            for node, od, okw in reversed(found):
+                node.args.defaults, node.args.kw_defaults = od, okw
+        return dump, [(node, list(od), list(okw)) for node, od, okw in found]
 
     old_dump, old_defs = blank(old_tree)
     new_dump, new_defs = blank(new_tree)
