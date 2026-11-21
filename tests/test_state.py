@@ -70,8 +70,22 @@ class Core:
 
 def build(cls):
     return cls.CACHED  # @build
+
+
+class Other:
+    ESC = "o"
+
+    def esc(self):
+        return self.ESC  # @other_esc
 '''
-FILES = {"sqlglot/__init__.py": "", "sqlglot/dialect.py": DIALECT}
+TEST_A = '''\
+from sqlglot.dialect import build
+
+
+def test_build():
+    assert build
+'''
+FILES = {"sqlglot/__init__.py": "", "sqlglot/dialect.py": DIALECT, "tests/test_a.py": TEST_A}
 T = [f"tests/test_a.py::TestA::test_{i}" for i in range(8)]
 TRIE, TRIE_OTHER, PARTS, PARTS_USE, CORE, ESC, KW, BUILD = range(8)
 D = "sqlglot/dialect.py"
@@ -98,6 +112,7 @@ def repo(tmp_path_factory) -> tuple[Path, Path]:
         f"{D}:{line_of('@core')}": [CORE, ESC],
         f"{D}:{line_of('@esc')}": [ESC],
         f"{D}:{line_of('@build')}": [BUILD],
+        f"{D}:{line_of('@other_esc')}": [KW],  # a TSQL holder that reads Other.ESC
     }
     classes = {"sqlglot.dialect.TSQL": TSQL_USERS,
                "sqlglot.dialect.Dialect": list(range(8))}
@@ -179,3 +194,32 @@ def test_diff_reports_derived_values(repo):
     new = DIALECT.replace('"A": 1, "BB": 2}', '"A": 1, "BB": 3, "CC": 4}')
     got = state.diff(root, snapshot, {D: new})
     assert got["changed"] == ["C sqlglot.dialect:TSQL KEYWORDS", "C sqlglot.dialect:TSQL TRIE"]
+
+
+# ── removed / renamed bindings (idea I26) ────────────────────────────────────────────────
+
+
+def test_renamed_method_selects_the_tests_that_ran_it(selector):
+    got, why = run(selector, "def keywords(self):", "def keywords2(self):")
+    assert got == {KW}, why
+    assert "removed Dialect.keywords" in why
+
+
+def test_removed_class_attribute_selects_readers_of_the_inherited_value(selector):
+    # TSQL.ESC removed: TSQL objects now read Dialect.ESC through Core(esc=self.ESC).
+    # `self.ESC` in the unrelated class Other (a line KW ran) cannot reach it.
+    got, why = run(selector, '    ESC = "y"\n    CACHED = 2', "    CACHED = 2")
+    assert got == {ESC}, why
+    assert "removed TSQL.ESC" in why
+
+
+def test_removed_name_imported_by_a_test_module_selects_all(selector):
+    got, why = run(selector, "def build(cls):", "def build2(cls):")
+    assert got == selector.all_numbers(), why
+    assert "imports build at collection" in why
+
+
+def test_removed_name_read_in_cached_code_falls_back(selector):
+    got, why = run(selector, "    CACHED = 2\n", "")
+    assert "cached across tests" in why
+    assert got >= set(TSQL_USERS)

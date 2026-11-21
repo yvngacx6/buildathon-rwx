@@ -286,6 +286,11 @@ class Site:
     lookup: bool = False
     memo: bool = False  # "def" site whose result is cached across tests (not just at import)
     typecheck: bool = False  # the class argument of isinstance / issubclass (not handed on)
+    # `self.NAME` / `cls.NAME` in a method defined directly in this class body (same file),
+    # whose receiver parameter is never rebound: the object is an instance of the class (or
+    # the class) or of a subclass, so the read can only reach NAME as defined on a class
+    # related to this one. None: any receiver.
+    recv: tuple[str, ...] | None = None
     # Where the value read here goes, when it can only be observed further on (run sites):
     #   ("local", ((first, last), ...))  `v = x.NAME` in a def, v bound once: the lines that
     #                                    load v
@@ -301,6 +306,7 @@ class _Ctx:
     deftime: bool
     func: ast.AST | None = None
     memo: bool = False  # inside code whose result is cached across tests
+    recv: tuple[str, tuple[str, ...]] | None = None  # (receiver parameter, class chain)
 
 
 class Index:
@@ -316,6 +322,7 @@ class Index:
         self._dynamic: list[tuple] | None = None
         self._file_facts: dict[str, dict] = {}
         self._parent_maps: dict[str, dict[int, ast.AST]] = {}
+        self._class_attr_reads: set[tuple[str, str]] | None = None
 
     # ── parsing and scopes ───────────────────────────────────────────────
 
@@ -340,13 +347,14 @@ class Index:
             if isinstance(node, ast.stmt):
                 stmt = node
                 if id(node) in memo:  # its value is cached across tests
-                    ctx = _Ctx(ctx.kind, ctx.chain, True, ctx.func, True)
+                    ctx = _Ctx(ctx.kind, ctx.chain, True, ctx.func, True, ctx.recv)
             yield node, ctx, stmt
             # Scopes change the context of their bodies; decorators, default arguments and
             # base classes run in the enclosing context.
             if isinstance(node, funcs):
                 inner = _Ctx("def", ctx.chain + (node.name,), id(node) in deftime, node,
-                             ctx.memo or id(node) in self._memo_defs)
+                             ctx.memo or id(node) in self._memo_defs,
+                             self._receiver(node, ctx.chain) if ctx.kind == "class" else None)
                 stack.extend((b, inner, b) for b in reversed(node.body))
                 stack.extend((d, ctx, stmt) for d in node.decorator_list)
                 stack.extend((d, ctx, stmt) for d in node.args.defaults + node.args.kw_defaults
@@ -362,6 +370,50 @@ class Index:
                              + [k.value for k in node.keywords])
             else:
                 stack.extend((c, ctx, stmt) for c in ast.iter_child_nodes(node))
+
+    def _receiver(self, node: ast.FunctionDef | ast.AsyncFunctionDef,
+                  chain: tuple[str, ...]) -> tuple[str, tuple[str, ...]] | None:
+        """(first parameter, class chain) for a method defined directly in class `chain`
+        that is always called with an object of a class related to it as that parameter:
+        a plain, property or class method (no other decorator), whose first parameter is
+        never rebound, and that no code reads off the class object (`Cls.method` could be
+        stored and called with any object)."""
+        params = node.args.posonlyargs + node.args.args
+        if not params:
+            return None
+        for d in node.decorator_list:
+            if isinstance(d, ast.Name) and d.id in ("property", "classmethod", "cached_property"):
+                continue
+            if (isinstance(d, ast.Attribute) and d.attr in ("setter", "getter", "deleter")
+                    and isinstance(d.value, ast.Name)):
+                continue
+            return None
+        first = params[0].arg
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and n.id == first and not isinstance(n.ctx, ast.Load):
+                return None
+            if isinstance(n, ast.arg) and n.arg == first and n is not params[0]:
+                return None  # a nested scope's own parameter of that name
+        if (chain[-1], node.name) in self._class_reads():
+            return None
+        return first, chain
+
+    def _class_reads(self) -> set[tuple[str, str]]:
+        """(name, attr) of every `Name.attr` and `getattr(Name, "attr")` anywhere."""
+        if self._class_attr_reads is None:
+            out: set[tuple[str, str]] = set()
+            for path in self.sources:
+                for n in ast.walk(self.tree(path)):
+                    if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name):
+                        out.add((n.value.id, n.attr))
+                    elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                          and n.func.id in DYNAMIC_CALLS and len(n.args) >= 2
+                          and isinstance(n.args[0], ast.Name)
+                          and isinstance(n.args[1], ast.Constant)
+                          and isinstance(n.args[1].value, str)):
+                        out.add((n.args[0].id, n.args[1].value))
+            self._class_attr_reads = out
+        return self._class_attr_reads
 
     # ── definition-time and memoized code ────────────────────────────────
 
@@ -589,7 +641,11 @@ class Index:
                 head_end = body[0].lineno - 1 if isinstance(body, list) and body else stmt.end_lineno
                 first, last = min(first, stmt.lineno), max(last, max(stmt.lineno, head_end))
             f = ctx.func
-            return Site(path, (first, last), "run", (f.body[0].lineno, f.end_lineno), what=what)
+            recv = (ctx.recv[1] if ctx.recv is not None and isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name) and node.value.id == ctx.recv[0]
+                    else None)
+            return Site(path, (first, last), "run", (f.body[0].lineno, f.end_lineno), what=what,
+                        recv=recv)
         copy = None
         if ctx.kind in ("class", "module") and stmt is not None and not ctx.func:
             targets = _targets(stmt)
@@ -720,6 +776,7 @@ class Index:
                 for p in ast.walk(self.tree(path)):
                     for c in ast.iter_child_nodes(p):
                         parents[id(c)] = p
+                modules = self._module_aliases(path)
                 for node, ctx, stmt in self.walk(path):
                     found = _dynamic(node, parents)
                     if found is None:
@@ -735,8 +792,47 @@ class Index:
                     site = dataclasses.replace(self._site(path, node, ctx, stmt), dynamic=True,
                                                lookup=lookup)
                     self._dynamic.append((path, node, site, allowed,
-                                          kind == "names", _on_module(node, ctx.func)))
+                                          kind == "names", _on_module(node, ctx.func, modules)))
         return self._dynamic
+
+    def _module_aliases(self, path: str) -> dict[str, str]:
+        """Names a file's top-level imports bind to repo modules (`exp` → sqlglot.expressions)."""
+        known = {q[:-3].replace("/", ".").removesuffix(".__init__") for q in self.sources}
+        out: dict[str, str] = {}
+        for stmt in self.tree(path).body:
+            if isinstance(stmt, ast.Import):
+                for a in stmt.names:
+                    if a.asname and a.name in known:
+                        out[a.asname] = a.name
+                    elif not a.asname and a.name.split(".")[0] in known:
+                        out[a.name.split(".")[0]] = a.name.split(".")[0]
+            elif isinstance(stmt, ast.ImportFrom) and stmt.module and not stmt.level:
+                for a in stmt.names:
+                    if f"{stmt.module}.{a.name}" in known:
+                        out[a.asname or a.name] = f"{stmt.module}.{a.name}"
+        # a name bound anywhere else in the file (a later import, an assignment, a parameter,
+        # a local in some def) may not be the module where it is read
+        top = {id(s) for s in self.tree(path).body if isinstance(s, (ast.Import, ast.ImportFrom))}
+        counts: dict[str, int] = {}
+        for n in ast.walk(self.tree(path)):
+            if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load):
+                out.pop(n.id, None)
+            elif isinstance(n, ast.arg):
+                out.pop(n.arg, None)
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                out.pop(n.name, None)
+            elif isinstance(n, (ast.Global, ast.Nonlocal)):
+                for name in n.names:
+                    out.pop(name, None)
+            elif isinstance(n, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and n.name:
+                out.pop(n.name, None)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                for a in n.names:
+                    bound = a.asname or a.name.split(".")[0]
+                    counts[bound] = counts.get(bound, 0) + 1
+                    if id(n) not in top:
+                        out.pop(bound, None)
+        return {k: v for k, v in out.items() if counts.get(k) == 1}
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────────────────
@@ -778,27 +874,51 @@ def _dotted(node: ast.AST) -> str:
     return ".".join(reversed(parts))
 
 
-def _on_module(node: ast.AST, func: ast.AST | None) -> re.Pattern | None:
-    """When the dynamic access is applied to a module object (`m = import_module(<name>)`),
-    a pattern for the module names it can be; else None."""
+def _on_module(node: ast.AST, func: ast.AST | None,
+               modules: dict[str, str] | None = None) -> re.Pattern | None:
+    """When the dynamic access is applied to a module object, a pattern for the module names
+    it can be; else None. A module object: `import_module(<name>)` / `__import__(<name>)`,
+    a top-level import alias of a repo module (`modules`), or a local of the function that
+    only `name = <one of those>` statements bind."""
     if not (isinstance(node, ast.Call) and node.args):
         return None
     receiver = node.args[0]
-    if isinstance(receiver, ast.Name) and isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        sources = [s.value for s in _own_nodes(func) if isinstance(s, ast.Assign)
+    sources = [receiver]
+    if (isinstance(receiver, ast.Name) and receiver.id not in (modules or {})
+            and isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef))):
+        own = list(_own_nodes(func))
+        sources = [s.value for s in own if isinstance(s, ast.Assign)
                    and any(isinstance(t, ast.Name) and t.id == receiver.id for t in s.targets)]
-        if len(sources) != 1:
+        bare = {id(s.target) for s in own if isinstance(s, ast.AnnAssign) and s.value is None}
+        stores = [n for n in own if isinstance(n, ast.Name) and n.id == receiver.id
+                  and not isinstance(n.ctx, ast.Load) and id(n) not in bare]
+        params = {a.arg for a in func.args.posonlyargs + func.args.args + func.args.kwonlyargs}
+        if (not sources or len(stores) != len(sources) or receiver.id in params
+                or any(isinstance(n, (ast.Global, ast.Nonlocal)) and receiver.id in n.names
+                       for n in own)
+                or any(isinstance(s, ast.Assign) and (len(s.targets) != 1
+                                                      or not isinstance(s.targets[0], ast.Name))
+                       and any(isinstance(t, ast.Name) and t.id == receiver.id
+                               for tgt in s.targets for t in ast.walk(tgt))
+                       for s in own)):
             return None
-        receiver = sources[0]
-    if not (isinstance(receiver, ast.Call) and _last_name(receiver.func) == "import_module"):
-        return None
-    arg = receiver.args[0] if receiver.args else None
-    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-        return re.compile(re.escape(arg.value))
-    if isinstance(arg, ast.JoinedStr):
-        return re.compile("".join(re.escape(v.value) if isinstance(v, ast.Constant) else ".*"
-                                  for v in arg.values), re.S)
-    return re.compile(".*", re.S)
+    parts = []
+    for source in sources:
+        if isinstance(source, ast.Name) and source.id in (modules or {}):
+            parts.append(".*")  # a module also holds what it imports: any module's names
+            continue
+        if not (isinstance(source, ast.Call)
+                and _last_name(source.func) in ("import_module", "__import__")):
+            return None
+        arg = source.args[0] if source.args else None
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            parts.append(re.escape(arg.value))
+        elif isinstance(arg, ast.JoinedStr):
+            parts.append("".join(re.escape(v.value) if isinstance(v, ast.Constant) else ".*"
+                                 for v in arg.values))
+        else:
+            parts.append(".*")
+    return re.compile("|".join(f"(?:{p})" for p in parts), re.S)
 
 
 def _defs(tree: ast.Module):

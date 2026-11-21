@@ -250,3 +250,62 @@ def test_prebuilt_index_is_used_only_for_the_source_it_describes(tmp_path):
     assert {"sqlglot/dialect.py", "tests/test_tsql.py"} <= paths
     (repo / "sqlglot/user.py").write_text(USER + "# edited\n")
     assert nameindex.load(out, repo) is None
+
+
+def test_dynamic_lookup_on_a_module_object_cannot_read_a_class_attribute():
+    """getattr(<module>, name): a module alias of a repo module, or a local bound only to
+    module objects, reads module attributes, never class attributes. Any other local, or an
+    alias the file binds again (here: a parameter), may be any object."""
+    from selector import names
+
+    load = (
+        "import importlib\n"
+        "from sqlglot import expressions as exp\n\n\n"
+        "def by_alias(name):\n"
+        "    return getattr(exp, name)\n\n\n"
+        "def by_local(name, path):\n"
+        "    module = exp\n"
+        "    if path:\n"
+        "        module = importlib.import_module(path)\n"
+        "    return getattr(module, name)\n\n\n"
+        "def by_anything(name, obj):\n"
+        "    return getattr(obj, name)\n")
+    shadow = ("from sqlglot import expressions as exp\n\n\n"
+              "def f(name, exp):\n"
+              "    return getattr(exp, name)\n")
+    sources = {"sqlglot/__init__.py": "", "sqlglot/expressions.py": "class Expr:\n    W = 1\n",
+               "sqlglot/load.py": load, "sqlglot/shadow.py": shadow}
+    found = names.Index(sources)._dynamic_sites()
+    on_module = {(path, site.lines[0]): pattern for path, _, site, _, _, pattern in found}
+    assert on_module[("sqlglot/load.py", 6)] is not None
+    assert on_module[("sqlglot/load.py", 13)] is not None
+    assert on_module[("sqlglot/load.py", 17)] is None
+    assert on_module[("sqlglot/shadow.py", 5)] is None
+
+
+def test_self_read_records_its_receiver_class():
+    """`self.NAME` in a plain method: the object is of that class or a subclass. Not for a
+    static method, a rebound receiver, or a method read off the class object."""
+    from selector import names
+
+    source = ("class A:\n"
+              "    def f(self):\n"
+              "        return self.WEEK\n\n"
+              "    @staticmethod\n"
+              "    def g(x):\n"
+              "        return x.WEEK\n\n"
+              "    def h(self):\n"
+              "        self = make()\n"
+              "        return self.WEEK\n\n\n"
+              "class B:\n"
+              "    def k(self):\n"
+              "        return self.WEEK\n\n\n"
+              "STORED = B.k\n")
+    index = names.Index({"sqlglot/__init__.py": "", "sqlglot/a.py": source})
+    recv = {site.lines[0]: site.recv for node, ctx, stmt in index.walk("sqlglot/a.py")
+            if getattr(node, "attr", None) == "WEEK"
+            for site in [index._site("sqlglot/a.py", node, ctx, stmt)]}
+    assert recv[3] == ("A",)
+    assert recv[7] is None  # static method: any object
+    assert recv[11] is None  # receiver rebound
+    assert recv[16] is None  # B.k is read off the class: may be called with any object

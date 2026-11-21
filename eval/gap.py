@@ -32,6 +32,8 @@ call made while selecting one file is credited with the tests it returned:
   conservative def-time   class / module body, nothing narrower → class users ∪ file runners
   library file readers    tests that read the edited sqlglot/ file as data (reads map)
   import bound            tests that load the module (imports map)
+  removed-binding readers removed / renamed def or assignment → callers, readers of the name
+                          and of every changed import-time value (I26)
   fixture readers         tests/fixtures/** or other data file → reads map
   test-file functions     edited test functions (+ helper functions / names in a test file)
   test-file whole file    test-file setup / helper code → the whole file ∪ importers
@@ -70,7 +72,7 @@ DEFAULT_SETS = ["sample", "private", "private41", "adversarial"]
 # Rule methods whose top-level result is credited to a mechanism.
 WRAPPED = ["_slow_tests_off_statements", "_class_users", "_function_at_import", "_import_time",
            "_definition_time",
-           "_import_bound", "_by_names", "_by_state", "_test_code"]
+           "_import_bound", "_by_names", "_by_state", "_test_code", "_removed_bindings"]
 
 # ALL fallback reasons, grouped for the aggregate table (first match wins).
 ALL_GROUPS = [
@@ -142,6 +144,8 @@ class TracingSelector(Selector):
             self.credits.append((label, got))
         elif name == "_import_bound":
             self.credits.append(("import bound", set(result[0])))
+        elif name == "_removed_bindings":
+            self.credits.append(("removed-binding readers", set(result[0])))
         elif name == "_test_code":
             got, why = result
             label = ("test-file functions" if why.startswith("test functions") else
