@@ -184,6 +184,12 @@ def _diff(o: ast.AST, n: ast.AST, ancestors: list[ast.AST], lam: ast.Lambda | No
     if isinstance(o, ast.Dict) and _unique_keys(o) and _unique_keys(n):
         old_items = {ast.dump(k) if k else f"**{i}": (k, v) for i, (k, v) in
                      enumerate(zip(o.keys, o.values))}
+        new_order = [ast.dump(k) if k else f"**{i}" for i, k in enumerate(n.keys)]
+        if ([k for k in old_items if k in new_order]
+                != [k for k in new_order if k in old_items]):
+            # entries reordered: dict order is observable (`arg_types` order is the
+            # positional order of a function's arguments)
+            yield o, n, ancestors, lam
         for i, (k, v) in enumerate(zip(n.keys, n.values)):
             key = ast.dump(k) if k else f"**{i}"
             if key not in old_items:

@@ -472,6 +472,11 @@ class Selector:
                         _module_of(owner_path), [owner_chain])
             for site in index.sites(name, owner_path, owner_chain, name in change.new_names):
                 n_sites += 1
+                if (site.when == "run" and not site.dynamic and not site.path.startswith("tests/")
+                        and self.maps.import_time.modules(site.path, *site.lines)):
+                    # a def body that also runs at import (`sql_names()` building the
+                    # function tables): what it builds there outlives the read
+                    raise names.Fallback(f"{name} read at import ({site.path}:{site.lines[0]})")
                 if site.path.startswith("tests/") and not site.dynamic:
                     if site.when == "run":
                         in_tests |= self.maps.span(site.path, *site.lines)
