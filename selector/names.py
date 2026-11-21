@@ -274,6 +274,10 @@ class Site:
     copy: tuple[tuple[str, ...], tuple[str, ...]] | None = None  # (owner chain, targets)
     what: str = ""
     dynamic: bool = False  # getattr(x, v) / vars(x) / …: may read any name, of any object
+    # getattr / hasattr / attrgetter (an attribute lookup): on an object it reaches class
+    # attributes only through the object's class. vars() / dir() / __dict__ / getmembers list
+    # a namespace (an object's own dict never holds class attributes): False.
+    lookup: bool = False
     memo: bool = False  # "def" site whose result is cached across tests (not just at import)
     typecheck: bool = False  # the class argument of isinstance / issubclass (not handed on)
     # Where the value read here goes, when it can only be observed further on (run sites):
@@ -720,7 +724,10 @@ class Index:
                         allowed = _name_pattern(name_arg, ctx, node, parents)
                     elif kind == "names":
                         allowed = _loop_filter(node, parents)
-                    site = dataclasses.replace(self._site(path, node, ctx, stmt), dynamic=True)
+                    lookup = (isinstance(node, ast.Call) and isinstance(node.func, (ast.Name, ast.Attribute))
+                              and _last_name(node.func) in DYNAMIC_CALLS)
+                    site = dataclasses.replace(self._site(path, node, ctx, stmt), dynamic=True,
+                                               lookup=lookup)
                     self._dynamic.append((path, node, site, allowed,
                                           kind == "names", _on_module(node, ctx.func)))
         return self._dynamic
