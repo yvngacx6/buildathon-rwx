@@ -172,6 +172,8 @@ class Selector:
         self._jobs: list = []
         self._mixed_py = False
         self._chains: dict[str, list] = {}
+        self._defaults: dict[str, list] = {}
+        self._no_default_readers: bool | None = None
         self._families: dict[tuple, list] = {}  # `_related`: owner class → its family
         self._ancestor_memo: dict[tuple, set | None] = {}
         self._test_imports = None  # testimport.Checker, on first use
@@ -198,6 +200,7 @@ class Selector:
         self._jobs = []  # diffexec: (path, new text, prunable tests) per file
         self._mixed_py = False  # a .py behaviour change diffexec cannot replay
         self._chains = {}  # diffexec: changed function chains per file
+        self._defaults = {}  # diffexec: default-only files → [(name, first line, {param: (old, new)})]
         per_file: list[tuple[str, set[int]]] = []
         try:
             for fp in files:
@@ -535,16 +538,32 @@ class Selector:
         fixed = set(chosen)  # tests diffexec may never drop (readers, definition-time users ...)
         prunable: set[int] = set()
         kinds = []
+        # Every change in the file is a literal default value of a def (`depth: int = 0` →
+        # `= 1`): diffexec replays the old code with the new default where a recorded call
+        # may have used it (diffexec/replay.py "defaults").
+        defaults = (_default_changes(old_tree, new_tree)
+                    if new_text and any(r.kind == "function" and r.signature for r in found)
+                    and self._defaults_unread() else None)
         for r in found:
             if r.kind == "function":
                 ran = self.maps.span(path, *r.span)
                 got = self._slow_tests_off_statements(path, ran, r)
-                if got and not r.signature:
+                if got and r.signature and defaults:
+                    prunable |= got
+                    self._chains.setdefault(path, []).append(r.chain)
+                    self._defaults[path] = defaults
+                elif got and not r.signature:
                     prunable |= got
                     self._chains.setdefault(path, []).append(r.chain)
                 else:
                     self._mixed_py = True
-                if r.signature:
+                if r.signature and path in self._defaults:
+                    # literal defaults only: calls are what can observe them (prunable);
+                    # the class users stay as for any signature edit
+                    users = self._class_users(module, r.classes) - got
+                    got |= users
+                    fixed |= users
+                elif r.signature:
                     got |= self._class_users(module, r.classes)
                     fixed |= got
                 defs = _edited_defs(old_tree, new_tree, r)
@@ -601,8 +620,24 @@ class Selector:
                 fixed |= got
             chosen |= got
         if prunable - fixed and new_text:
-            self._jobs.append((path, new_text, prunable - fixed))
+            # default-only file: the child compiles the old source and swaps defaults
+            self._jobs.append((path, self._source(path) if path in self._defaults else new_text,
+                               prunable - fixed))
         return chosen, ", ".join(kinds)
+
+    def _defaults_unread(self) -> bool:
+        """No code in sqlglot/ or tests/ reads a function's defaults (`__defaults__`,
+        `inspect.signature(f).parameters[p].default`, getcallargs, …): then a call is the only
+        way to observe one."""
+        if self._no_default_readers is None:
+            index = self._index()
+            anywhere = ("__defaults__", "__kwdefaults__", "getcallargs", "kwonlydefaults",
+                        "getargvalues", "bind_partial", "apply_defaults", "__signature__")
+            attrs = ("default", "defaults")  # Parameter.default, FullArgSpec.defaults
+            self._no_default_readers = index is not None and not any(
+                index.mentions(n) for n in anywhere) and not any(
+                o[1] == "attr" for n in attrs for o in index._occurrences(n))
+        return self._no_default_readers
 
     def _slow_tests_off_statements(self, path: str, ran_function: set[int],
                                    r: classify.Region) -> set[int]:
@@ -1501,6 +1536,76 @@ def _in_modules(owner: str, modules: set[str]) -> bool:
 
 _MUTATORS = {"pop", "popitem", "update", "append", "add", "extend", "setdefault", "clear",
              "remove", "discard", "insert"}
+
+
+def _literal(node: ast.AST | None):
+    """(True, value) for a literal default of an immutable scalar type (bool, int, finite
+    float, str, None) that JSON round-trips exactly; (False, None) otherwise."""
+    if node is None:
+        return False, None
+    try:
+        v = ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return False, None
+    if v is None or type(v) in (bool, int, str) or (type(v) is float and v == v
+                                                       and v not in (float("inf"), float("-inf"))):
+        if type(v) is int and abs(v) > 2 ** 53:
+            return False, None
+        return True, v
+    return False, None
+
+
+def _default_changes(old_tree: ast.Module, new_tree: ast.Module) -> list | None:
+    """The edits of a file if all of them change literal default values of defs (not
+    lambdas): [(def name, first line of its code object, {param: (old, new)})]; else None.
+
+    With nothing else different, the old and the new module build the same code objects;
+    each def only gets other `__defaults__` / `__kwdefaults__`, which a call reads only for
+    a parameter it did not pass."""
+    funcs = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+    def blank(tree: ast.Module) -> tuple[str, list]:
+        import copy
+        t = copy.deepcopy(tree)
+        found = []
+        for node in ast.walk(t):
+            if isinstance(node, funcs + (ast.Lambda,)):
+                a = node.args
+                found.append((node, list(a.defaults), list(a.kw_defaults)))
+                a.defaults = [ast.Constant(None) for _ in a.defaults]
+                a.kw_defaults = [None if d is None else ast.Constant(None) for d in a.kw_defaults]
+        return ast.dump(t), found
+
+    old_dump, old_defs = blank(old_tree)
+    new_dump, new_defs = blank(new_tree)
+    if old_dump != new_dump or len(old_defs) != len(new_defs):
+        return None
+    out = []
+    for (o, od, okw), (n, nd, nkw) in zip(old_defs, new_defs):
+        if ast.dump(ast.Tuple(od + [d or ast.Constant(...) for d in okw])) == \
+                ast.dump(ast.Tuple(nd + [d or ast.Constant(...) for d in nkw])):
+            continue
+        if not isinstance(o, funcs):
+            return None  # a lambda's defaults: no named code object to find
+        a = o.args
+        positional = [x.arg for x in a.posonlyargs + a.args]
+        names = positional[len(positional) - len(od):] + [x.arg for x in a.kwonlyargs]
+        params = {}
+        for name, x, y in zip(names, od + okw, nd + nkw):
+            if (x is None and y is None) or (x is not None and y is not None
+                                             and ast.dump(x) == ast.dump(y)):
+                continue
+            ok_x, vx = _literal(x)
+            ok_y, vy = _literal(y)
+            if not (ok_x and ok_y):
+                return None
+            if ast.dump(x) != ast.dump(y):
+                params[name] = (vx, vy)
+        if not params:
+            return None
+        first = min([o.lineno] + [d.lineno for d in o.decorator_list])
+        out.append((o.name, first, params))
+    return out or None
 
 
 def _edited_defs(old_tree: ast.Module, new_tree: ast.Module, r: classify.Region) -> list:

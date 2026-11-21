@@ -166,6 +166,7 @@ def run_request(req: dict) -> dict:
     match_ops = False  # a changed code object uses structural pattern matching
     plan = []  # (key str, store entry, old code, new code, module name)
     swaps = []  # (old code, new code)
+    new_defaults = {}  # (filename, qualname, first line) → {param: new default}
     for f in req["files"]:
         path = f["path"]
         filename = os.path.join(root, path)
@@ -192,7 +193,34 @@ def run_request(req: dict) -> dict:
                 out["bail"] = f"{path}: {o.co_qualname} body (definition time) changed"
                 break
             key = f"{path}::{o.co_qualname}::{o.co_firstlineno}"
-            plan.append((key, index.get((path, o.co_qualname, o.co_firstlineno)), o, n, module))
+            plan.append((key, index.get((path, o.co_qualname, o.co_firstlineno)), o, n, module,
+                         None))
+        if out["bail"]:
+            break
+        # Default-only edits (selector `_default_changes`; new_text is then the old source):
+        # the same code object with other literal defaults. A recorded call holds every
+        # parameter bound; one whose value is not the old default (same type, equal) was
+        # passed by the caller and is unaffected. Otherwise it may have been the default:
+        # the new run gets the new default (if the caller passed it, the old and new code
+        # would really agree, so a difference found here only keeps tests).
+        for d in req.get("defaults", ()):
+            if d["path"] != path or out["bail"]:
+                continue
+            hits = [o for o in old_codes.values()
+                    if o.co_firstlineno == d["line"] and o.co_name == d["name"]
+                    and o.co_flags & 0x01]
+            names = hits[0].co_varnames[:hits[0].co_argcount + hits[0].co_kwonlyargcount] \
+                if len(hits) == 1 else ()
+            if len(hits) != 1 or not set(d["params"]) <= set(names):
+                out["bail"] = f"{path}: default change of {d['name']} not matched"
+                break
+            o = hits[0]
+            key = f"{path}::{o.co_qualname}::{o.co_firstlineno}"
+            subst = {names.index(p): tuple(v) for p, v in d["params"].items()}
+            new_defaults[(filename, o.co_qualname, o.co_firstlineno)] = {
+                p: v[1] for p, v in d["params"].items()}
+            plan.append((key, index.get((path, o.co_qualname, o.co_firstlineno)), o, o, module,
+                         subst))
         if out["bail"]:
             break
     if out["bail"] or not plan:
@@ -200,7 +228,7 @@ def run_request(req: dict) -> dict:
         return out
 
     modules = {}
-    for _, _, _, _, m in plan:
+    for _, _, _, _, m, _ in plan:
         modules[m] = importlib.import_module(m)
     for f in req["files"]:
         importlib.import_module(f["path"][:-3].replace("/", ".").removesuffix(".__init__"))
@@ -210,6 +238,7 @@ def run_request(req: dict) -> dict:
     for filename, o, n in swaps:
         by_key[(filename, o.co_qualname, o.co_firstlineno)] = (o, n)
     live = []  # (function, old live code, new code)
+    live_defaults = []  # (function, old / new __defaults__, old / new __kwdefaults__)
     caches = []
     for obj in gc.get_objects():
         if type(obj) is types.FunctionType:
@@ -217,10 +246,28 @@ def run_request(req: dict) -> dict:
             hit = by_key.get((c.co_filename, c.co_qualname, c.co_firstlineno))
             if hit is not None:
                 live.append((obj, c, hit[1]))
+            params = new_defaults.get((c.co_filename, c.co_qualname, c.co_firstlineno))
+            if params is not None:
+                old_d, old_kw = obj.__defaults__, obj.__kwdefaults__
+                npos = c.co_argcount
+                pos_names = c.co_varnames[npos - len(old_d or ()):npos]
+                new_d = tuple(params.get(nm, v) for nm, v in zip(pos_names, old_d or ()))
+                new_kw = ({k: params.get(k, v) for k, v in old_kw.items()}
+                          if old_kw is not None else None)
+                live_defaults.append((obj, old_d, old_kw, new_d if old_d is not None else None,
+                                      new_kw))
         elif type(obj) is functools._lru_cache_wrapper:
             caches.append(obj)
+    if {(f.__code__.co_filename, f.__code__.co_qualname, f.__code__.co_firstlineno)
+            for f, *_ in live_defaults} != set(new_defaults):
+        out["bail"] = "a default-changed function has no live function object"
+        out["stats"]["cpu_s"] = round(time.process_time() - t_start, 3)
+        return out
 
     def set_mode(new: bool):
+        for fn, old_d, old_kw, new_d, new_kw in live_defaults:
+            fn.__defaults__ = new_d if new else old_d
+            fn.__kwdefaults__ = new_kw if new else old_kw
         for fn, old_c, new_c in live:
             fn.__code__ = new_c if new else old_c
         serial.CODE_OVERRIDE.clear()
@@ -230,7 +277,7 @@ def run_request(req: dict) -> dict:
         for c in caches:
             c.cache_clear()
 
-    def run(code, module, data):
+    def run(code, module, data, subst=None):
         made = serial.MADE[0]
         vals, cells = serial.loads_in(data)
         stubs = serial.MADE[0] > made  # some containers were elided at record time
@@ -252,6 +299,13 @@ def run_request(req: dict) -> dict:
             args.extend(rest.pop(0))
         if code.co_flags & 0x08:
             kwargs.update(rest.pop(0))
+        for i, (old, new) in (subst or {}).items():  # vals keep the old value: same digest
+            cur = args[i] if i < npos else kwargs[names[i]]
+            if type(cur) is type(old) and cur == old:
+                if i < npos:
+                    args[i] = new
+                else:
+                    kwargs[names[i]] = new
         handler = _Logs()
         rootlog = logging.getLogger()
         rootlog.addHandler(handler)
@@ -280,7 +334,7 @@ def run_request(req: dict) -> dict:
         return digest, side, cpu
 
     n_blobs = n_ok = 0
-    for key, entry, old_code, new_code, module in plan:
+    for key, entry, old_code, new_code, module, subst in plan:
         info = {"state": "ok", "phases": {}}
         out["codes"][key] = info
         if entry is None:
@@ -309,7 +363,7 @@ def run_request(req: dict) -> dict:
                     d_old, side_old, cpu_old = run(live_old, module, data)
                 set_mode(True)
                 with _cpu_limit(min(max(0.0, deadline - time.process_time()), 10 * cpu_old + 0.2) + 0.01):
-                    d_new, side_new, cpu_new = run(new_code, module, data)
+                    d_new, side_new, cpu_new = run(new_code, module, data, subst)
                 d_old, d_new = d_old[:len(recorded)], d_new[:len(recorded)]
                 ok = (d_old == recorded == d_new and side_old == side_new
                       and cpu_new <= 5 * cpu_old + 0.05)

@@ -124,6 +124,18 @@ droppable. Effect digests use the C pickler (identity-independent for immutables
 under a global byte budget by lines(f) × (seconds a change of f could save)^1.5 per byte
 (tests.json seconds; no labels).
 
+Round 13 (r13-last): **default-value edits.** When every change in a file is a literal default
+of a def (bool / int / finite float / str / None → another such literal; `select._default_changes`
+compares the two ASTs with all defaults blanked) and no code in sqlglot/ or tests/ reads
+defaults (`__defaults__`, `__kwdefaults__`, `.default`, `.defaults`, getcallargs, … via the
+name index), the def's runners are prunable like a body edit (class users of the signature
+edit stay fixed). The child compiles the *old* source and replays each recorded call with the
+new default substituted for every parameter whose recorded value is the old default (same
+type, equal); the live function objects get the new `__defaults__` / `__kwdefaults__` in the
+new run (recursive and nested calls). A recorded call binds every parameter, so a value other
+than the old default was passed by the caller and is unaffected; one equal to it may have been
+passed explicitly, in which case the substitution can only make the replay keep more.
+
 **Note for judges.** `maps/diffexec.zip` is built only from sqlglot at the pinned commit running
 its own test suite in the pinned image (`mapbuild/diffexec_build.sh`): for every function under
 `sqlglot/`, the deduplicated inputs it was called with while each test ran (capped per function,
@@ -159,4 +171,5 @@ sha256 are in `maps/MANIFEST.json` → `"diffexec"`.
 | r9-removed | 2026-11-21 | I26 removed / renamed bindings → callers ∪ readers ∪ import-state diff readers (was ALL / import bound); `Site.recv` receiver-class filter and module-object `getattr` in the state readers; I25 test-module roots explained by the import-state diff (selector/testimport.py) | 147.9 (gap.py: private 2713.8 → 2576.6, private41 434.5 → 394.8, adversarial 1166.6 → 1153.6, 0 misses; E016) |
 | r4-gap | 2026-11-21 | eval/gap.py; test helper functions / constants by lines map / name readers; base-file class bodies narrowed (no conservative bound); import-time functions with an unchanged import state | 179.9 (private264 2882.7 → 2741.5) |
 | r7-robust2 | 2026-11-21 | Probe round 2 (eval/adversarial2.py, 65 probes, eval/data/adversarial2). Misses on main: a class body that aliases another class's dict instead of copying it and then mutates it (`SINGLE_TOKENS = Tokenizer.SINGLE_TOKENS; SINGLE_TOKENS.pop("%")` in lazily loaded Teradata removes `%` from every later tokenizer in the worker; Redshift, Hive likewise) → bodies that mutate objects or newly alias one get the import-state diff, and a change outside the patched modules is ALL (`_foreign_state`, also when another module stops importing); diffexec kept a def that leaks a class-level table across calls (`_parse_connect_with_prior` without its `.pop("PRIOR")`) → defs that write module / class state (also through local aliases or mutating calls) are never pruned and add the readers of a class table they write. Preventive: classes outside the classes map (enums) add the tests naming them to the conservative set; deleting a one-line `KEY: lambda …` table entry is also a class-body change | 149.0 (private 2713.8, private41 434.5, adversarial 1166.6 → 1168.6, adversarial2 2546.7 s / 6 misses → 994.1 s / 0; d2e0730 had 5 of the 6) |
+| r13-last | 2026-11-21 | eval/reasons.py (rank spend by mechanism on eval/ab.py runs); diffexec replays literal default-value edits (old code, new default where a call may have used it). Measured negatives: resolving dialect.py:332's `Tokenizer` hand-off to sqlglot.tokens.Tokenizer saves 0 s (the next blocker is the Tokenizer metaclass's real import-time read, already handled by the state diff); a 37 % larger diffexec store saves 25 s over 1,600 A/B patches | sample/private/private41/adversarial/adversarial2 unchanged (0 misses); A/B −43.6 s over 1,600 patches |
 | r8-diffexec2 | 2026-11-21 | I12 round 8: elided stand-ins for big container inputs (executor Context), per-(function, test phase) completeness, C-pickler effect digests, LZMA store under a stakes-weighted global budget (13.1 MB), parent-side replay gate | 118.2 (private 2678.4, private41 428.9, adversarial 1168.6, adversarial2 993.8; 0 misses) |
