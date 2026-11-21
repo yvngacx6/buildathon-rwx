@@ -14,7 +14,7 @@ Source refs: `research/FINDINGS.md`, `research/PLAN.md`, `research/agent-reports
 | I05 | Class-use map with MRO for class-body / module-level edits | todo | Fixes 535z-type misses. |
 | I06 | Statement expansion for multi-line conditions | todo | Alternative/complement to I03. |
 | I07 | Fallback table for unseen kinds (test files, helpers, new/deleted, config) | todo | PLAN.md §3. |
-| I08 | Narrow class-body edits by attribute name (attribute-read tracing) | todo | 535z 165→15 tests (report 02). |
+| I08 | Narrow class-body edits by attribute name (attribute-read tracing) | kept? (r1-attrnarrow, E003) | Static name-reader scan (selector/names.py) + lambda call lines. Sample 198.8→185.0, private41 625.8→583.2, 0 misses; CPU +2.5/+3.7 s. Still falls back: `arg_types` (Expr.__init_subclass__), Tokenizer settings (metaclass), TRANSFORMS (memoized `_build_dispatch`), call-valued entries (`_show_parser(...)`). Next: prebuild the name index at image build to cut CPU. |
 | I09 | Line map inside large functions, to keep slow tests out | todo | Phase E. |
 | I10 | Run-time execution of cheap candidate sets | parked | ~4 s gain, risk (report 03). |
 | I11 | Expected-cost rule for slow tests | todo | Only if mapped-in; never drop on guess. |

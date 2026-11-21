@@ -11,8 +11,11 @@ tarfile.open(fileobj=io.BytesIO(data)).extractall('/opt', filter='data')" \
 
 COPY selector /app/selector
 COPY maps /app/maps
-RUN chmod -R a+rX /app /opt/sqlglot
 
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
+# Build-time static scan of the pinned source for name-reader narrowing (selector/nameindex.py).
+# The build is not charged; the run only unpickles what a commit needs.
+RUN python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl \
+ && chmod -R a+rX /app /opt/sqlglot
 CMD ["python", "-m", "selector"]

@@ -2,3 +2,4 @@ output.jsonl
 __pycache__/
 eval/data/
 .claude/
+index/
