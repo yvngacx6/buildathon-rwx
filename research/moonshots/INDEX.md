@@ -6,7 +6,7 @@ new moonshot angle is started in its slot.
 
 | # | Angle | Branch | Status | Verdict / next step |
 |---|---|---|---|---|
-| 01 | Reverse-engineer the leaders | moon-01 | running | |
+| 01 | Reverse-engineer the leaders | moon-01 | done | Practice oracle ≈ 95 s; leaders 10–60 s above it, us ~100 above. Copy: statement-level selection for ALL tests (−10…−25 s), TPC fixture-entry rule (−8 s), CPU 4.9→2 s (−3 s) → R23. |
 | 02 | Warm fork-server: near-free test execution | moon-02 | done | ✗ Works (0 disagreements on 98 labeled) but per-test CPU ≈1.3× recorded secs (≈2.6× on scorer); net ≈ 0 s/40. Not built. |
 | 03 | General semantic equivalence (value profiles) | moon-03 | running | |
 | 04 | Build-time recording beyond the 20 MB repo limit | moon-04 | running | |
@@ -18,3 +18,4 @@ new moonshot angle is started in its slot.
 | 10 | Wildcard ideas | moon-10 | running | |
 | 11 | Assertion-level slicing: verify only the affected assertions of cheap tests | moon-11 | running | |
 | 12 | Compact tree-table input encoding so diffexec can record tpcds/max_nodes callees | moon-12 | running | |
+| 13 | Cut container CPU 4.9 s → <1 s (native/cached hot paths, cheaper state diff) | moon-13 | running | |
