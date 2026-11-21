@@ -68,6 +68,7 @@ import re
 from pathlib import Path, PurePosixPath
 
 from . import classify, diff, nameindex, names, pack, state
+from . import maps as maps_module
 from .maps import ImportTimeMap, Maps
 
 # Class and module bodies of these files shape nearly every test (map gives ~1550 of 1620).
@@ -108,7 +109,7 @@ class Selector:
     def __init__(self, tests: list[dict], sqlglot: Path, maps: Path) -> None:
         self.tests = tests
         self.sqlglot = sqlglot
-        self.maps = Maps(maps, tests)
+        self.maps = Maps(maps, tests, Path(os.environ.get("BR_MAPS_COMPILED", maps_module.COMPILED)))
         self._all = {t["number"] for t in tests}
         self._by_file: dict[str, set[int]] = {}
         self._id_of: dict[int, str] = {}
