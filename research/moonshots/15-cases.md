@@ -2,32 +2,36 @@
 
 ## Verdict and numbers first
 
-**Sound and works, but small. It is not a moonshot.** Prototype: `selector/cases.py` + a 7-line hook in
-`select.py`. It is a fourth run-time pruner after subtest / slowverify, with the same gate (clean
-function-body edits, diffexec jobs, not `_mixed_py`).
+**It is sound and it works, but the gain is small. It is not a moonshot.**
+- The prototype is `selector/cases.py` plus an 8-line hook in `select.py`.
+- It is a fourth run-time pruner after subtest / slowverify, with the same gate: clean function-body edits, diffexec jobs, not `_mixed_py`.
+- c2 is the version on the branch: lazy store, bisect lookup, per-test verdicts in grandchildren, warm-only guard.
+- It was measured on rwx-big in the pinned image (drun, 4 shards), A/B against `BR_CASES=0` on the same box.
 
-| Measured (laptop, version c1 = all-or-nothing verdicts) | P (600 unlabeled) | labeled (566: sample, practice_like, private, private41, adv, adv2) |
+| c2 on rwx-big | P (600 unlabeled) | labeled (566 = sample 30, practice_like 120, private 264, private41 41, adv 46, adv2 65) |
 |---|---|---|
-| Commits where the pruner drops ≥ 1 test | 36 (6 %) | 31 (5.5 %) |
-| Sim seconds saved | 60.5 s = **−4.0 s / 40** | 46.7 s = **−3.3 s / 40** (sample −1.4 s/30; practice_like −15.5 s/120 = −5.2/40) |
-| Commits whose selection reaches `[]` | **0** | **0** |
-| Misses | real pytest on every drop: 36 commits / 150 dropped tests: **all PASS** | **0 new misses**; 489 labeled-failing optimizer tests reached the pruner: all kept; 146 dropped, none failing |
-| Verify child CPU (laptop) | 13.0 s → 1.7 s / 40 at 2x | about 1.6 s / 40 at 2x |
-| Parent CPU (c1: eager 0.37 s store load + naive line scan) | +12.8 s / 600 → +1.7 s / 40 at 2x | noisy |
+| Commits with ≥ 1 test dropped | 39 (6.5 %) | 34 (6 %) |
+| Sim s saved | 68.5 s = **−4.6 s / 40** | 53.6 s = **−3.8 s / 40**: practice_like −17.6 s/120 = −5.9/40; private −24.4/264; private41 −8.6/41; adv2 −3.0/65; adv 0; **sample 0** (laptop c1: −1.4 on bj7g) |
+| Reaches `[]` | **0** | **0** |
+| Misses | P: real pytest of every dropped test in its patched tree (`truth.py`): c1 36/36 commits (150 tests) PASS; c2: TRUTH_C2 | **0 misses.** 490 labeled-failing optimizer tests reached the pruner and all were kept; 198 tests dropped, none labeled failing |
+| Verify-child CPU | 14.9 s per 600 → ×2 scorer = **2.0 s / 40** | ≈ 1.0 s / 40 (practice_like) |
+| Parent CPU (lazy store load 0.37 s + lookup) | +3.3 s per 600 → ×2 = **0.4 s / 40** | +0.4…0.8 s per set |
 
-**Net per 40 practice-style commits, c1: about −4 s sim + 3.4 s CPU ≈ −0.5…−1 s.** That is close to zero.
-The c2 fixes on the branch (lazy store, bisect lookup, one union per case set, per-test verdicts in grandchildren, warm-only guard) should cut the parent CPU to about
-0.4 s (one store load) and add some mixed drops. Expected net c2: **−2…−3 s / 40**. See the EC2 section for the c2 measurement.
+**Net per 40: P ≈ −2.2 s, practice_like ≈ −4.5 s, sample ≈ +0.5 s** (CPU only, nothing dropped).
+The sample is closest to the practice board. Expected practice gain: **≈ −1…−2 s / 40**, about −2…−3 s on the
+60-commit final. Most of the CPU is fixed cost per verification: a fork plus `_swap`'s `gc.get_objects()` walk plus the
+helper namespace, about 0.2 s even for one case. Forking the verifier from the diffexec child, which has already swapped, would cut that roughly in half.
 
-**Why it never reaches `[]`.** Every commit that keeps an optimizer fixture test also keeps a dialect
-test, test_transpile, test_executor, test_scope or the like. The 2 s floor never disappears from this lever
-alone. Of the 36 P drops, about 8 leave a residual of ≤ 2.5 s. Moonshot 10's V1 (run cheap residuals) would turn those into `[]`, so the two compose.
-The 106 P commits ("ceiling 268 s") whose selection lies entirely inside the 23 target tests are mostly
-**fixture edits** (`tests/fixtures/optimizer/*.sql` → readers) or definition-time edits. Every fixture
-commit in the sample fails its test, so case-slicing fixture edits gains nothing (not built).
+**Why it never reaches `[]`.** None of the 39 + 34 commits with drops becomes empty. Something else always stays: dialect tests,
+test_transpile, the TPC tests, test_scope, or optimizer tests whose non-case code is touched. The residual after the drop is ≤ 2.5 s in about 8 P commits.
+Moonshot 10's V1 (run cheap residuals in-process) is what would turn those into `[]`, and the two compose.
+The 106 P commits whose selection lies entirely inside the 23 target tests ("ceiling 268 s") are mostly fixture
+edits (`tests/fixtures/optimizer/*.sql` → readers) and definition-time edits. All 8 fixture commits in the sample fail their
+test, so slicing fixture edits by case gains nothing (not built).
 
-P(works on the board as measured) ≈ 70 %. P(moonshot) ≈ 0 %. Expected gain ≈ 2–3 s per 40 practice commits
-(≈ 3–4 s on the 60-commit final), 0 misses.
+**P(works on the board as measured) ≈ 65 %. P(moonshot) ≈ 0 %. Expected gain ≈ 1–2 s per 40 practice commits, 0 misses.**
+Ship it only if a round has spare capacity. It is cheap to land: the build step is 3 min on 8 jobs (≈ 6 min on the 4-core
+build), the store is 0.76 MB in the image, and nothing goes in the repo.
 
 ## Mechanism
 
@@ -57,13 +61,25 @@ P(works on the board as measured) ≈ 70 %. P(moonshot) ≈ 0 %. Expected gain �
   Cases are independent subTests, so the test fails iff some case or the non-case code fails. Every re-run case
   is checked against exactly what the test asserts.
 
-## Where the candidates go (P, c1)
+## Where the candidates go (P)
 
 63 kept by the gate: mostly test_tpcds (8.7 CPU s for 99 cases) or many annotate_funcs cases hit.
 23 had a failing case (presumed real mutant failures; not spot-checked with pytest).
 15 kept because a touched statement is in non-case code (setUp's `DataType.build` = 424 tokenizer / parser lines;
 test_qualify_columns 12k and test_simplify 7k non-case lines).
 36 dropped: 24 after re-running 1–72 cases (0.1–0.6 s child), 12 with no hit case.
+
+The c2 counts on P are similar. 66 were kept by the gate, 18 because non-case code was touched, 12 were dropped with no hit case and 41 were verified.
+The 41 verified commits produced all of the c2 drops beyond c1: with per-test verdicts, a failing case in test A no longer keeps a passing test B.
+Examples are 73wr (1 of 3 dropped), r007 (4 of 5) and dnc2 (3 of 4).
+
+**Bigger levers inside this design (not built).**
+- **The tpcds gate.** test_tpcds costs 8.7 CPU s for 99 cases, against a recorded 2.2 s, so it is gated out
+  whenever many queries hit. Its average optimize case is ~90 ms.
+- **Non-case code.** Re-running setUp's `DataType.build` calls and comparing the schema would free the 18 commits kept
+  this way. Expect about 1 s / 40.
+- **Dialect `validate_*` and transpile identity.** These need per-statement slicing of the test body. That is where `[]`
+  would actually happen. It is out of scope here and would take about a day.
 
 ## Risks
 
@@ -88,4 +104,4 @@ each ~1 ms. Unmeasured guess: if ~10 % of commits have a residual of only dialec
 
 Laptop scratch `m15/`: `runsel.py` (sharded selector run that keeps the selections), `cmp.py` (A/B), `truth.py`
 (apply patch + real pytest on dropped tests), `miss.py` / `lab2.py` (labeled misses), results `P_*.json`,
-`L_*_{base,c1}.json`, `P_truth.json`.
+`L_*_{base,c1}.json`, `P_truth.json`. c2: rwx-big `~/work/m15/res/` (`P_{base,c2}.json`, `L_*_{base,c2}.json`, `P_truth_c2.json`), driver `ec2run.sh build|P|L`.
