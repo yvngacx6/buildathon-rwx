@@ -23,6 +23,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 def trace(test, work):
     out = os.path.join(work, "attrs", f"{test['number']}.json.gz")
+    if os.path.exists(out):  # resumable
+        return test, 0, out
     with open(os.path.join(work, "attrlogs", f"{test['number']}.log"), "w") as fh:
         rc = subprocess.run([sys.executable, os.path.join(HERE, "trace_attrs.py"), test["id"], out],
                             stdout=fh, stderr=subprocess.STDOUT).returncode
