@@ -340,8 +340,9 @@ class Masked(Snapshot):
     which runs its lines (the lines map has the callers), or by introspection (checked by
     the selector). Per entry, `found`: (location, digest of the function – code always,
     defaults, closure cells, nested functions masked in turn –, digest of what signature
-    introspection sees: name, docstring, argument names and kinds, annotations); `spans`: location → last
-    line; `foreign`: a function from outside the package was reached."""
+    introspection sees: name, docstring, argument names and kinds, annotations);
+    `spans`: location → last line; `foreign`: a function from outside the package was
+    reached."""
 
     def __init__(self, package: str, root: str) -> None:
         super().__init__(package)
