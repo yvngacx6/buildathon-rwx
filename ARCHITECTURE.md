@@ -126,6 +126,21 @@ droppable. Effect digests use the C pickler (identity-independent for immutables
 under a global byte budget by lines(f) × (seconds a change of f could save)^1.5 per byte
 (tests.json seconds; no labels).
 
+Round 19 (r19-importfn): **import-time runs no longer block run-time pruning.** Core
+Parser / Tokenizer functions (`_parse_table`, `_parse_join`, `_scan_number`, …) also run while
+`sqlglot.generators.duckdb` (templates parsed at import) and the dialect test modules import.
+Their body edits were `_mixed_py` (diffexec / subtest / slowverify off) whenever the import-time
+dependents were not cheap to add (STATE_MIN_GAIN counted only the added tests, not the slow
+callers the pruners could drop), so test_max_nodes / test_generator_memory stayed selected.
+Now (1) the gain also counts `slack`: slow prunable callers of the def, so the state diff runs;
+(2) the edited def's own state entry (a def with a closure, e.g. `super()`, is digested with
+its code) is ignored: it is the edit, seen by its callers; (3) diff empty (and every importing
+test module explained, as before) → plain body edit; diff changed and every changed value has a
+seen reader → those readers are kept (`fixed`, never pruned) and the commit stays prunable
+("readers"; dependents of unexplained test modules are kept the same way), even when the
+readers set costs more raw seconds than the dependents if it drops the slow tests; a changed
+value with no seen reader (callers stand in for it) or an import failure → `_mixed_py` as before.
+
 Round 16 (r16-allcut): **import-time edits by state readers.** (1) A function body run while
 modules are imported (`import sqlglot` → was ALL; a module's import → its dependents) now
 takes, when the patched package imports and it is cheaper, the readers of every value the
