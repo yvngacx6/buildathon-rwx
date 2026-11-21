@@ -82,3 +82,25 @@ def test_pattern_matching_in_patched_code_is_detected():
     src = "def f(x):\n    def g(y):\n        match y:\n            case [*_]:\n                return 1\n    return g(x)\n"
     assert replay.uses_match(compile(src, "<t>", "exec"))
     assert not replay.uses_match(compile("def f(x):\n    return len(x)\n", "<t>", "exec"))
+
+
+class _AttrError(Exception):
+    def __init__(self, msg, errors=None):
+        super().__init__(msg)
+        self.errors = errors or []
+
+
+def test_exception_detail_sees_attributes_args_and_cause():
+    # moon-18: the effect digest keeps only type and str() of a raised exception; replay also
+    # compares args, attributes (ParseError.errors) and the cause between the old and new runs.
+    same = replay.exception_detail(_AttrError("m", [{"into": int}]))
+    assert same == replay.exception_detail(_AttrError("m", [{"into": int}]))
+    assert same != replay.exception_detail(_AttrError("m", [{"into": [int]}]))
+    assert replay.exception_detail(ValueError("a")) != replay.exception_detail(ValueError("a", 1))
+
+    def raised(cause):
+        try:
+            raise _AttrError("m") from cause
+        except _AttrError as e:
+            return replay.exception_detail(e)
+    assert raised(ZeroDivisionError("x")) != raised(ValueError("x"))
