@@ -35,6 +35,10 @@ BYTE_CAP = int(float(os.environ.get("DIFFEXEC_BYTE_CAP", "300e3")))  # distinct 
 INPUT_CAP = int(float(os.environ.get("DIFFEXEC_INPUT_CAP", "16e3")))  # one call's input bytes
 # Safety only (worker-dependent): pickling seconds per function per worker. Default: off.
 TIME_CAP = float(os.environ.get("DIFFEXEC_TIME_CAP", "inf"))
+# The effect digest (pure-Python pickler, ~85 % of recording time) is taken for the first
+# EFFECTS_PER_INPUT calls with each distinct input; later calls with the same input only
+# record the use. (Disagreeing digests mark the input "unstable".)
+EFFECTS_PER_INPUT = int(os.environ.get("DIFFEXEC_EFFECTS_PER_INPUT", "2"))
 ROOT = os.path.realpath(os.environ.get("DIFFEXEC_ROOT", os.getcwd())) + "/sqlglot/"
 # Measurement only: record just these "path:qualname" functions (all others are skipped, as
 # if dead). Used to simulate the full recorder on the functions a labeled set changes.
@@ -42,6 +46,13 @@ ONLY = None
 if os.environ.get("DIFFEXEC_ONLY"):
     with open(os.environ["DIFFEXEC_ONLY"]) as _fh:
         ONLY = {line.strip() for line in _fh if line.strip()}
+# Functions whose suite-wide call count (census pass, diffexec_run.py) is over CALL_CAP: they
+# would be dropped after merging anyway, so never pay for recording them.
+SKIP: set = set()
+if os.environ.get("DIFFEXEC_SKIP"):
+    with open(os.environ["DIFFEXEC_SKIP"], "rb") as _fh:
+        SKIP = pickle.load(_fh)
+CENSUS = os.environ.get("DIFFEXEC_CENSUS") == "1"  # count calls only
 GEN_FLAGS = 0x20 | 0x80 | 0x100 | 0x200  # GENERATOR | COROUTINE | ITERABLE_COROUTINE | ASYNC_GENERATOR
 
 mon = sys.monitoring
@@ -68,6 +79,8 @@ class Rec:
             self.dead = "generator"
         elif ONLY is not None and f"{self.key[0]}:{self.key[1]}" not in ONLY:
             self.dead = "skipped"
+        elif self.key in SKIP:
+            self.dead = "calls"
 
 
 recs: dict = {}
@@ -81,6 +94,18 @@ def _kill(rec, why):
     rec.dead = why
     rec.blobs = {}
     rec.uses = {}
+
+
+def _count(code, offset):
+    rec = recs.get(code)
+    if rec is None:
+        if not code.co_filename.startswith(ROOT):
+            return mon.DISABLE
+        rec = recs[code] = Rec(code)
+    rec.calls += 1
+    if rec.calls > CALL_CAP:
+        return mon.DISABLE  # already over the cap: the exact count no longer matters
+    return None
 
 
 def _start(code, offset):
@@ -135,11 +160,12 @@ def _start(code, offset):
             _kill(rec, "bytes")
             mon.set_local_events(TOOL, code, 0)
             return mon.DISABLE
-        rec.blobs[h] = [data, None, "ok"]
+        blob = rec.blobs[h] = [data, None, "ok", 0]
     u = rec.uses.setdefault(phase, set())
     if u is not None:
         u.add(h)
-    stack.append((rec, frame, vals, h, phase))
+    blob[3] += 1
+    stack.append((rec, frame, vals if blob[3] <= EFFECTS_PER_INPUT else None, h, phase))
     stats["recorded"] += 1
     return None
 
@@ -195,10 +221,10 @@ def _unwind(code, offset, exc):
 
 
 mon.use_tool_id(TOOL, "diffexec")
-mon.register_callback(TOOL, E.PY_START, _start)
+mon.register_callback(TOOL, E.PY_START, _count if CENSUS else _start)
 mon.register_callback(TOOL, E.PY_RETURN, _return)
 mon.register_callback(TOOL, E.PY_UNWIND, _unwind)
-mon.set_events(TOOL, E.PY_START | E.PY_UNWIND)
+mon.set_events(TOOL, E.PY_START if CENSUS else E.PY_START | E.PY_UNWIND)
 
 import pytest  # noqa: E402
 from concurrent.futures import Future  # noqa: E402

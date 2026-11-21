@@ -50,7 +50,8 @@ def merge(rec_dir: str) -> tuple[dict, dict, set]:
             if m["dead"]:
                 m["blobs"], m["uses"] = {}, {}
                 continue
-            for h, (data, d, status) in r["blobs"].items():
+            for h, b in r["blobs"].items():
+                data, d, status = b[:3]
                 old = m["blobs"].get(h)
                 if old is None:
                     m["blobs"][h] = [data, d, status]

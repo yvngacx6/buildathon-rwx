@@ -25,7 +25,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 #  * the static name scan for name-reader narrowing (selector/nameindex.py), plus the
 #    import-time state snapshot (selector/state.py) next to it
 RUN python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')" \
-    /opt/sqlglot/sqlglot /app/selector \
+    /opt/sqlglot/sqlglot /app/selector /app/diffexec \
  && python -m selector.maps build /app/maps /app/index/maps \
  && python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl \
  && chmod -R a+rX /app /opt/sqlglot

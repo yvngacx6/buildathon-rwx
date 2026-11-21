@@ -42,20 +42,40 @@ def main() -> None:
     env = dict(os.environ, PYTHONHASHSEED="0", SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1",
                PYTHONPATH=f"{SQLGLOT}:{repo}", DIFFEXEC_OUT=str(work), DIFFEXEC_ROOT=str(SQLGLOT))
 
-    def run(f: str):
+    def run(f: str, out: Path = work, extra: dict | None = None):
         tag = f.replace("/", "_").removesuffix(".py")
         t0 = time.time()
-        if a.resume and (work / f"rec_{tag}.pkl").is_file():
+        if a.resume and (out / f"rec_{tag}.pkl").is_file():
             return f, 0, True, 0.0, "resumed"
         proc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "diffexec.record",
                                "-p", "no:cacheprovider", f],
-                              cwd=SQLGLOT, env=dict(env, DIFFEXEC_TAG=tag),
+                              cwd=SQLGLOT, env=dict(env, DIFFEXEC_TAG=tag, DIFFEXEC_OUT=str(out),
+                                                    **(extra or {})),
                               capture_output=True, text=True)
-        ok = (work / f"rec_{tag}.pkl").is_file()
+        ok = (out / f"rec_{tag}.pkl").is_file()
         return f, proc.returncode, ok, time.time() - t0, proc.stdout[-300:]
 
     start = time.time()
     cpu0 = os.times()
+    # Pass 1 (census, cheap): suite-wide call count per function. A function over the call cap
+    # is dropped after merging anyway, so pass 2 does not record it (same store, far less work).
+    census = work / "census"
+    census.mkdir(parents=True, exist_ok=True)
+    with ThreadPoolExecutor(a.j) as pool:
+        counted = list(pool.map(lambda f: run(f, census, {"DIFFEXEC_CENSUS": "1"}), files))
+    if any(not r[2] for r in counted):
+        sys.exit(f"FATAL: census failed for {[r[0] for r in counted if not r[2]]}")
+    import pickle
+    calls: dict = {}
+    for p in census.glob("rec_*.pkl"):
+        for key, r in pickle.loads(p.read_bytes())["recs"].items():
+            calls[key] = calls.get(key, 0) + r["calls"]
+    cap = int(os.environ.get("DIFFEXEC_CALL_CAP", "50000"))
+    skip = {k for k, n in calls.items() if n > cap}
+    (work / "skip.pkl").write_bytes(pickle.dumps(skip))
+    env["DIFFEXEC_SKIP"] = str(work / "skip.pkl")
+    print(f"census: {len(calls)} functions, {len(skip)} over {cap} calls (not recorded), "
+          f"{time.time() - start:.0f}s", file=sys.stderr)
     with ThreadPoolExecutor(a.j) as pool:
         results = list(pool.map(run, files))
     cpu1 = os.times()
