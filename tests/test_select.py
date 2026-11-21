@@ -111,7 +111,8 @@ def selector(tmp_path: Path) -> Selector:
         (maps / f"{name}.json.gz").write_bytes(gzip.compress(json.dumps(body).encode()))
     # Import-time map: line → modules whose import runs it (root 0 = `import sqlglot`).
     roots = ["sqlglot", "sqlglot.other", "tests.test_lib"]
-    body = {"tests": roots, "map": {"sqlglot/tenth.py:2": [0], "sqlglot/fifth.py:5": [2]}}
+    body = {"tests": roots, "map": {"sqlglot/tenth.py:2": [0], "sqlglot/fifth.py:5": [2],
+                                    "sqlglot/seventh.py:1": [1], "sqlglot/ninth.py:1": [2]}}
     (maps / "import_time.json.gz").write_bytes(gzip.compress(json.dumps(body).encode()))
     tests = [{"number": i, "id": t, "file": t.split("::")[0], "seconds": 1.0} for i, t in enumerate(T)]
     return Selector(tests, repo, maps)
@@ -314,6 +315,11 @@ def test_function_run_while_importing_a_module_selects_its_dependents(selector):
 def test_renamed_function_selects_all(selector):
     # Lost binding guard: importers of `helper` fail at import → ALL.
     assert run(selector, edit("sqlglot/sixth.py", "def helper():", "def helper2():")) == ALL
+
+
+def test_removed_name_imported_during_collection_selects_all(selector):
+    # ninth.py imports DERIVED and is imported by tests/test_lib.py: a collection error.
+    assert run(selector, edit("sqlglot/eighth.py", "DERIVED = list(BASE_NAMES)\n", "")) == ALL
 
 
 def test_derived_module_name_follows_importers(selector):

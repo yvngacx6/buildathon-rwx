@@ -398,6 +398,20 @@ class Selector:
             got |= self._module_dependents(m)
         return got
 
+    def _import_dependents(self, path: str) -> set[int]:
+        """Tests that fail if module `path` cannot be imported: dependents of every module
+        whose import (per the import-time map) runs the module's top-level statements."""
+        tree = ast.parse(self._all_sources()[path])
+        got: set[int] = set()
+        for stmt in tree.body:
+            modules = self.maps.import_time.modules(path, stmt.lineno, stmt.lineno)
+            if any(m == "tests" or m.startswith("tests.") for m in modules):
+                # A test module fails to import: a collection error, which by default
+                # interrupts the whole pytest session.
+                raise AllTests(f"{path} would fail to import while tests are collected")
+            got |= self._import_time(path, stmt.lineno, stmt.lineno)
+        return got
+
     def _module_dependents(self, module: str) -> set[int]:
         """Tests that need `module` to import: its test file, or its users and runners."""
         hit = self._dependents.get(module)
@@ -445,6 +459,10 @@ class Selector:
             for t in targets:
                 names |= {n.id for n in ast.walk(t) if isinstance(n, ast.Name)}
         names = _derived_names(names, old_tree, new_tree)
+        # A name the module no longer defines makes `from <module> import name` fail, so every
+        # module importing it fails to import, and so does everything that imports those.
+        removed = _top_level_names(old_tree) - _top_level_names(new_tree)
+        breaks = re.compile(r"\b(" + "|".join(map(re.escape, sorted(removed))) + r")\b") if removed else None
         got = self._name_readers(path, old_tree, names)
         seen, todo = {path}, [path]
         while todo:  # follow re-imports
@@ -458,6 +476,8 @@ class Selector:
                 if other.startswith("tests/"):
                     got |= self._by_file.get(other, set()) | self.maps.test_imports.get(other)
                     continue
+                if breaks is not None and breaks.search(self._all_sources()[other]):
+                    got |= self._import_dependents(other)
                 users = self.maps.whole_file(other) | self.maps.module_users(
                     _module_of(other), classify.top_level_classes(ast.parse(self._all_sources()[other])))
                 if not users:
@@ -555,3 +575,15 @@ def _derived_names(names: set[str], *trees: ast.Module) -> set[str]:
                             names.add(n.id)
                             grew = True
     return names
+
+
+def _top_level_names(tree: ast.Module) -> set[str]:
+    """Names a module defines at top level (defs, classes, assignment targets)."""
+    out: set[str] = set()
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(stmt.name)
+        elif isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+            out |= {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
+    return out
