@@ -114,6 +114,11 @@ SLOW_SECONDS = 5.0  # tests at least this slow get the statement-level rule in f
 # costs at least this much more than the cheapest selection it could give. r5-tune: 1.2 adds
 # diffs that save ~1.8 s each; ≤1.0 adds diffs that save ~0.5 s (< their CPU).
 STATE_MIN_GAIN = 1.2
+IMPORT_SLOW_SECONDS = 3.0  # `_import_callers` drops only tests at least this slow
+# what reads a function's code or closure without calling it (`_import_callers`)
+INTROSPECTION = ("__code__", "__closure__", "cell_contents", "co_code", "co_consts",
+                 "co_names", "co_varnames", "getclosurevars", "getsource", "getsourcelines",
+                 "__globals__", "dis")
 EXPR_ROOT = "sqlglot.expressions.core:Expr"
 # Site.use values: a read that only uses part of the value. The floor (`_state_floor`) leaves
 # such reads out, since the diff may show that part unchanged.
@@ -689,7 +694,7 @@ class Selector:
                        else f"C {module}:{'.'.join(r.chain[:-1])} {r.chain[-1]}")
                 at_import, same_state = self._function_at_import(path, first + r.is_lambda, last,
                                                                  chosen | got, slack, own)
-                if not got and same_state in ("readers", "readers-unseen"):
+                if not got and same_state in ("readers", "readers-unseen", "callers"):
                     # Never ran under a test; what its runs at import built differently is
                     # read only by the tests in at_import.
                     kinds.append(f"unrun def {'.'.join(r.chain) or '<lambda>'}, runs at import")
@@ -709,8 +714,11 @@ class Selector:
                                  + (f" (-{dropped} slow, off touched statements)" if dropped else ""))
                 if at_import:
                     kinds.append(f"(runs at import: +{len(at_import - got)}"
-                                 + (", readers of changed import state)" if same_state else ")"))
-                    if same_state != "readers":  # (also "readers-unseen")
+                                 + (", import state changed only inside functions: their"
+                                    " callers, no other slow test)" if same_state == "callers"
+                                    else ", readers of changed import state)" if same_state
+                                    else ")"))
+                    if same_state != "readers":  # (also "readers-unseen", "callers")
                         # the import-time runs may have built anything the run-time pruners
                         # cannot see
                         self._mixed_py = True
@@ -1484,6 +1492,10 @@ class Selector:
             found = self._state_diff()
             if found is not None and not [k for k in found["changed"] if k != own]:
                 return set(), True
+            if found is not None and wide is not None:
+                kept = self._import_callers(found, path, first, last, wide, own)
+                if kept is not None:
+                    return kept, "callers"
         if wide is None or self._cost(wide | have) - base >= STATE_MIN_GAIN:
             try:
                 got, _ = self._import_state_users(path, first, last, modules, own)
@@ -1501,6 +1513,51 @@ class Selector:
         if error is not None:
             raise error
         return wide, False
+
+    def _import_callers(self, found: dict, path: str, first: int, last: int,
+                        wide: set[int], own: str | None) -> set[int] | None:
+        """`wide` less the slow tests (≥ IMPORT_SLOW_SECONDS) that cannot see the edit, when
+        the import-state diff shows that the import-time runs built different state only
+        inside function objects (state.Masked: every changed entry equal once each function
+        is reduced to its source location; a factory's closures, a builder's defaults).
+        Such a difference is seen only by calling one of those functions, which runs its
+        lines (the lines map has every test that did), or by introspecting it: defaults
+        (`_defaults_unread`), signatures (no changed one is accepted), code / closure
+        readers (`INTROSPECTION`: in tests/ their runners are kept; in sqlglot/ → None).
+        A body edit (`own`): the edited def's own location is excluded (its callers are the
+        commit's run-time rule, as for `own`). Every other changed value would be in the masked diff.
+        Locations are patched-source lines: only when no hunk changes the line count.
+        None when not applicable or nothing would be dropped (cheap tests are never
+        dropped here)."""
+        fo = found.get("fnonly")
+        dropable = {n for n in wide if self._secs.get(n, 0) >= IMPORT_SLOW_SECONDS}
+        if not fo or not dropable or fo.get("sig"):
+            return None
+        for fp in self._files:
+            if fp.path.endswith(".py"):
+                for h in fp.hunks:
+                    if (sum(l[:1] == "-" for l in h.lines)
+                            != sum(l[:1] == "+" for l in h.lines)):
+                        return None
+        if not self._defaults_unread():
+            return None
+        index = self._index()
+        seen: set[int] = set()
+        for name in INTROSPECTION:
+            for site in index.mentions(name):
+                if not site.path.startswith("tests/"):
+                    return None
+                seen |= self.maps.span(site.path, *(site.func or site.lines))
+        for loc, end in fo["locs"].items():
+            file, _, start = loc.rpartition(":")
+            start = int(start)
+            if own is not None and file == path and start <= first and end == last:
+                continue  # the edited def itself
+            seen |= self.maps.span(file, start, end)
+        drop = dropable - seen
+        if not drop:
+            return None
+        return wide - drop
 
     def _import_state_users(self, path: str, first: int, last: int, modules: set[str],
                             hook: str | None = None) -> tuple[set[int], str]:

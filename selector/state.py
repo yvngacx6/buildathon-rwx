@@ -328,6 +328,79 @@ class Snapshot:
         return out
 
 
+class Masked(Snapshot):
+    """Digests with every function object replaced by its source location (r22).
+
+    An edit to a def that runs at import (a factory: `rename_func("X")`, a builder with a
+    changed default) changes the tables that hold what it returned (`TRANSFORMS`,
+    `FUNCTIONS`), so the plain diff sees those entries changed and the run-time readers of
+    the whole table look affected. When the entries are equal once each function is reduced
+    to `fnloc:<file>:<first line>` (+ its `__dict__`), every difference is inside function
+    objects: code, defaults, closure cells. Those are seen only by calling the function,
+    which runs its lines (the lines map has the callers), or by introspection (checked by
+    the selector). Per entry, `found`: (location, digest of the function – code always,
+    defaults, closure cells, nested functions masked in turn –, digest of what signature
+    introspection sees: argument names and kinds, annotations); `spans`: location → last
+    line; `foreign`: a function from outside the package was reached."""
+
+    def __init__(self, package: str, root: str) -> None:
+        super().__init__(package)
+        self.root = os.path.realpath(root) + os.sep
+        self.found: list[tuple[str, str, str]] = []
+        self.spans: dict[str, int] = {}
+        self.foreign = False
+
+    def _fp(self, v: object, depth: int) -> str:
+        if not isinstance(v, types.FunctionType):
+            return super()._fp(v, depth)
+        code = v.__code__
+        real = os.path.realpath(code.co_filename)
+        if not real.startswith(self.root):
+            self.foreign = True
+            return _h("fn-foreign", v.__module__, v.__qualname__)
+        loc = f"{real[len(self.root):].replace(os.sep, '/')}:{code.co_firstlineno}"
+        f = self.fp
+        cells = []
+        for c in v.__closure__ or ():
+            try:
+                cells.append(f(c.cell_contents))
+            except ValueError:
+                cells.append("<empty>")
+        full = _h("fn", v.__qualname__, self._code(code), f(v.__defaults__),
+                  f(v.__kwdefaults__), cells)
+        nargs = code.co_argcount + code.co_kwonlyargcount
+        sig = _h(code.co_varnames[:nargs + 2], code.co_argcount, code.co_posonlyargcount,
+                 code.co_kwonlyargcount, code.co_flags & 0x0C,
+                 f(dict(getattr(v, "__annotations__", None) or {})))
+        self.found.append((loc, full, sig))
+        self.spans[loc] = max([code.co_firstlineno] + [l for *_, l in code.co_lines() if l])
+        return _h("fnloc", loc, f(dict(v.__dict__)))
+
+    def entry(self, value: object) -> tuple[str, tuple]:
+        """(masked digest, sorted `found`) of one value, with a fresh memo: the functions
+        it reaches are its own, whatever other entries also hold them."""
+        self.memo, self.path, self.keep, self.found = {}, {}, [], []
+        self.low = 1 << 30
+        out = self.fp(value)
+        return out, tuple(sorted(set(self.found)))
+
+
+def masked(snap: Snapshot, root: str, keys) -> tuple[dict, dict, dict, bool]:
+    """`Masked.entry` of some entries: ({key: masked digest}, {key: found}, spans, foreign)."""
+    m = Masked(snap.package, root)
+    m.class_key, m.classes = snap.class_key, snap.classes
+    digests, found = {}, {}
+    for k in keys:
+        try:
+            value = snap.value(k)
+        except (KeyError, ValueError):
+            continue
+        digests[k], locs = m.entry(value)
+        if locs:
+            found[k] = locs
+    return digests, found, m.spans, m.foreign
+
+
 class _PatchedFinder(importlib.abc.MetaPathFinder):
     """Serve the patched source for the files a commit changes."""
 
@@ -408,10 +481,13 @@ def _main(argv: list[str]) -> None:
     cmd, root = argv[0], argv[1]
     if cmd == "snap":  # snap <root> <out>
         snap = take(root, {}, track=True)
-        Path(argv[2]).write_bytes(pickle.dumps(
-            {"entries": snap.entries, "info": snap.info(), "instances": snap.instance_mro(),
-             "holders": snap.holders(), "proj": projections(snap, snap.entries),
-             "unordered": unordered(snap, snap.entries)}, pickle.HIGHEST_PROTOCOL))
+        data = {"entries": snap.entries, "info": snap.info(), "instances": snap.instance_mro(),
+                "holders": snap.holders(), "proj": projections(snap, snap.entries),
+                "unordered": unordered(snap, snap.entries)}
+        if len(argv) > 3 and argv[3] == "masked":
+            digests, found, spans, _ = masked(snap, root, snap.entries)
+            data["masked"] = {"digests": digests, "found": found, "spans": spans}
+        Path(argv[2]).write_bytes(pickle.dumps(data, pickle.HIGHEST_PROTOCOL))
         return
     if cmd == "diff":  # diff <root> <old>; stdin: {"path": patched source}
         old = pickle.loads(Path(argv[2]).read_bytes())
@@ -423,9 +499,45 @@ def _main(argv: list[str]) -> None:
         except Exception as exc:  # noqa: BLE001 - the patched package does not import
             print(json.dumps({"import_error": _failing_file(exc, root)}))
             return
-        print(json.dumps(compare(snap, old, patched)))
+        out = compare(snap, old, patched)
+        if old.get("masked") and out["changed"] and len(out["changed"]) <= MASKED_MAX:
+            out["fnonly"] = fn_only(snap, root, old["masked"], out["changed"])
+        print(json.dumps(out))
         return
     sys.exit("usage: state.py snap <root> <out> | diff <root> <old>")
+
+
+MASKED_MAX = 400  # changed entries re-digested masked (a few factories' tables, not a base class)
+
+
+def fn_only(snap: Snapshot, root: str, old: dict, changed: list[str]) -> dict | None:
+    """Whether every changed entry differs only inside function objects (`Masked`): then
+    {"locs": {changed location: its last line}, "sig": whether some changed location's
+    signature changed}; else None (also for a function from outside the package, or a
+    location only one side has). Locations are lines of the patched source: the selector
+    uses them only when no hunk changes the line count."""
+    digests, found, _, foreign = masked(snap, root, changed)
+    if foreign:
+        return None
+    before: dict[str, set] = {}
+    now: dict[str, set] = {}
+    for k in changed:
+        if k not in digests or k not in old["digests"] or digests[k] != old["digests"][k]:
+            return None
+        for loc, full, sig in old["found"].get(k, ()):
+            before.setdefault(loc, set()).add((full, sig))
+        for loc, full, sig in found.get(k, ()):
+            now.setdefault(loc, set()).add((full, sig))
+    if before.keys() != now.keys():
+        return None
+    locs, sig = {}, False
+    for loc in before:
+        if before[loc] != now[loc]:
+            if loc not in old["spans"]:
+                return None
+            locs[loc] = old["spans"][loc]
+            sig |= {s for _, s in before[loc]} != {s for _, s in now[loc]}
+    return {"locs": locs, "sig": sig}
 
 
 def _failing_file(exc: BaseException, root: str) -> str | None:
@@ -508,7 +620,7 @@ def build(root: Path, out: Path, samples: int = BUILD_SAMPLES) -> bool:
     Rare variation the samples miss is handled in `compare`."""
     runs = []
     for i in range(samples):
-        data = _snap(root, out.with_suffix(f".{i}.tmp"))
+        data = _snap(root, out.with_suffix(f".{i}.tmp"), masked=i == 0)
         if data is None:
             return False
         runs.append(data)
@@ -537,8 +649,8 @@ def source_files(root: Path) -> list[tuple[str, int]]:
                   for p in (root / "sqlglot").rglob("*.py"))
 
 
-def _snap(root: Path, part: Path) -> dict | None:
-    if _run(["snap", str(root), str(part)], None) is None:
+def _snap(root: Path, part: Path, masked: bool = False) -> dict | None:
+    if _run(["snap", str(root), str(part)] + (["masked"] if masked else []), None) is None:
         return None
     data = pickle.loads(part.read_bytes())
     part.unlink()
