@@ -418,10 +418,29 @@ def _main(argv: list[str]) -> None:
         if old.get("files") != source_files(Path(root)):
             sys.exit("the snapshot describes other source")
         patched = json.loads(sys.stdin.read())
-        snap = take(root, patched)
+        try:
+            snap = take(root, patched)
+        except Exception as exc:  # noqa: BLE001 - the patched package does not import
+            print(json.dumps({"import_error": _failing_file(exc, root)}))
+            return
         print(json.dumps(compare(snap, old, patched)))
         return
     sys.exit("usage: state.py snap <root> <out> | diff <root> <old>")
+
+
+def _failing_file(exc: BaseException, root: str) -> str | None:
+    """The package file (repo-relative) whose code raised `exc` while importing, or None."""
+    base = os.path.realpath(root) + os.sep
+    files = [getattr(exc, "filename", None)] if isinstance(exc, SyntaxError) else []
+    tb = exc.__traceback__
+    while tb is not None:
+        files.append(tb.tb_frame.f_code.co_filename)
+        tb = tb.tb_next
+    for f in reversed([f for f in files if f]):
+        real = os.path.realpath(f)
+        if real.startswith(base + "sqlglot" + os.sep):
+            return real[len(base):].replace(os.sep, "/")
+    return None
 
 
 def compare(snap: Snapshot, old: dict, patched: dict[str, str]) -> dict:
@@ -451,14 +470,16 @@ def compare(snap: Snapshot, old: dict, patched: dict[str, str]) -> dict:
     before_proj = old.get("proj") or {}
     now_proj = projections(snap, [k for k in changed if k in new and k in before_proj])
     same = {}
-    for k, (truth, keys) in now_proj.items():
-        was_truth, was_keys = before_proj[k]
+    for k, (truth, members) in now_proj.items():
+        was_truth, was_members = before_proj[k]
         kept = (["truth"] if truth is not None and truth == was_truth else []) + (
-            ["keys"] if keys is not None and keys == was_keys else [])
+            ["keys"] if members is not None and members == was_members else [])
         if kept:
             same[k] = kept
     return {"changed": sorted(changed),
             "same": same,
+            # (old, new) value digests of each changed entry (None: no such entry)
+            "digests": {k: (before.get(k), new.get(k)) for k in changed},
             "info": info,
             "instances": sorted(set(snap.instance_mro()) | set(old["instances"])),
             "holders": None if held is None else {k: held[k] for k in wanted if k in held}}
