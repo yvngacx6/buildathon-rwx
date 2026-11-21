@@ -14,8 +14,11 @@ COPY maps /app/maps
 
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
-# Build-time static scan of the pinned source for name-reader narrowing (selector/nameindex.py).
+# Build-time static scan of the pinned source for name-reader narrowing (selector/nameindex.py),
+# plus the import-time state snapshot (selector/state.py) next to it. The bytecode cache lets the
+# run's patched-import subprocess skip compiling every unpatched module.
 # The build is not charged; the run only unpickles what a commit needs.
-RUN python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl \
+RUN python -m compileall -q /opt/sqlglot/sqlglot \
+ && python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl \
  && chmod -R a+rX /app /opt/sqlglot
 CMD ["python", "-m", "selector"]
