@@ -71,11 +71,12 @@ def run_query(q: dict, schema: dict, tables: dict, opt: bool):
     from sqlglot import find_tables, parse_one, transpile
     from sqlglot.executor import execute
 
-    expr = parse_one(q["sql"])
-    data = pickle.dumps(expr)
     out_exec = out_duck = out_opt = None
+    if not opt:
+        # the pool pickles every submitted expression and the worker unpickles it (even when
+        # mp_execute then returns None)
+        expr = pickle.loads(pickle.dumps(parse_one(q["sql"])))
     if q["execute"] and not opt:
-        expr = pickle.loads(data)
         used = {t.name: tables[t.name] for t in find_tables(expr)}
         res = execute(expr, schema=schema, tables=used)
         res = pickle.loads(pickle.dumps(res))
@@ -177,7 +178,7 @@ def _in_fork(fn):
 def build(root: Path, out: Path) -> None:
     root = root.resolve()
     sys.path.insert(0, str(root))
-    sys.setrecursionlimit(max(sys.getrecursionlimit(), 10000))
+    sys.setrecursionlimit(1000)  # the pool worker's default
     from tests.helpers import TPCDS_SCHEMA, TPCH_SCHEMA, load_sql_fixture_pairs
     import sqlglot  # noqa: F401
     from sqlglot import parse_one, transpile  # noqa: F401
@@ -216,13 +217,12 @@ def build(root: Path, out: Path) -> None:
                 cov = _Cov(prefix)
                 cov.start()
                 expr = parse_one(q["sql"])
-                data = pickle.dumps(expr)
+                e2 = pickle.loads(pickle.dumps(expr))
                 phases["parse"] = cov.stop()
                 outs = {}
                 if q["execute"]:
                     cov = _Cov(prefix)
                     cov.start()
-                    e2 = pickle.loads(data)
                     used = {t.name: tables[suite][t.name] for t in find_tables(e2)}
                     res = execute(e2, schema=schemas[suite], tables=used)
                     res = pickle.loads(pickle.dumps(res))
@@ -251,16 +251,20 @@ def build(root: Path, out: Path) -> None:
                 t2 = time.process_time()
                 return a, b, t1 - t0, t2 - t1
 
-            phases, outs = _in_fork(traced)
-            if suite == "tpch":
-                phases["opt"], duck, outs["opt"] = _in_fork(traced_opt)
-                if duck != outs["duck"]:
-                    raise RuntimeError("duckdb sql differs between runs")
-            a, b, cpu_exec, cpu_opt = _in_fork(timed)
-            # the untraced run must give the same outputs (else: not deterministic → never used)
-            stable = (a[0] == outs.get("exec")) and (a[1] == (outs["duck"] if q["execute"] else None))
-            if b is not None:
-                stable = stable and b[1] == outs["duck"] and b[2] == outs["opt"]
+            try:
+                phases, outs = _in_fork(traced)
+                if suite == "tpch":
+                    phases["opt"], duck, outs["opt"] = _in_fork(traced_opt)
+                    if duck != outs["duck"]:
+                        raise RuntimeError("duckdb sql differs between runs")
+                a, b, cpu_exec, cpu_opt = _in_fork(timed)
+                # the untraced run must give the same outputs (else: not deterministic → never used)
+                stable = (a[0] == outs.get("exec")) and (
+                    a[1] == (outs["duck"] if q["execute"] else None))
+                if b is not None:
+                    stable = stable and b[1] == outs["duck"] and b[2] == outs["opt"]
+            except RuntimeError:  # e.g. RecursionError at the worker's limit: never used
+                phases, outs, cpu_exec, cpu_opt, stable = {}, {}, 0.0, 0.0, False
             q.update(phases=phases, outs=outs, cpu_exec=cpu_exec, cpu_opt=cpu_opt, stable=stable)
             queries.append(q)
             print(f"{suite} {len(queries)} exec={q['execute']} cpu={cpu_exec:.2f}/{cpu_opt:.2f}"
@@ -344,6 +348,8 @@ class SubTest:
             suite, kind = TESTS[self.numbers[n]]
             todo = []
             for i, q in enumerate(meta["suites"][suite]):
+                if not q["stable"]:
+                    return None  # not reproducible at the pinned commit: never verify
                 ph = q["phases"]
                 if kind == "execute":
                     hit = _hit(ph["parse"], spans) or (
@@ -500,7 +506,7 @@ def _swap(root: str, jobs) -> str | None:
 
 def _child(root, jobs, todo, meta, store, budget) -> bool:
     import signal
-    sys.setrecursionlimit(max(sys.getrecursionlimit(), 10000))
+    sys.setrecursionlimit(1000)  # the pool worker's default (this stack is deeper: stricter)
     # CPU cap: SIGPROF's default action ends the child (→ keep the tests)
     signal.signal(signal.SIGPROF, signal.SIG_DFL)
     signal.setitimer(signal.ITIMER_PROF, budget)
