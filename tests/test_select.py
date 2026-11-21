@@ -67,6 +67,14 @@ FILES = {
     "sqlglot/third.py": "from sqlglot.other import SHARED\n",
     "sqlglot/fourth.py": "VALUE = 1\n",
     "sqlglot/fifth.py": "from sqlglot.fourth import VALUE\n\n\ndef f():\n    return VALUE\n",
+    "sqlglot/sixth.py": "def helper():\n    return 1\n",
+    "sqlglot/seventh.py": "from sqlglot.sixth import helper\n\n\ndef g():\n    return helper()\n",
+    "sqlglot/eighth.py": "BASE_NAMES = [1]\nDERIVED = list(BASE_NAMES)\n",
+    "sqlglot/ninth.py": "from sqlglot.eighth import DERIVED\n\n\ndef h():\n    return DERIVED\n",
+    "sqlglot/tenth.py": "def boot():\n    return 1\n",
+    "sqlglot/slow_cache.py": ("_CACHE = {}\n\n\ndef get(key):\n    if key not in _CACHE:\n"
+                           "        _CACHE[key] = key * 2\n    return _CACHE[key]\n"),
+    "sqlglot/slow_lambda.py": "class P:\n    F = {\n        \"a\": lambda x: (\n            x + 1\n        ),\n    }\n",
     "tests/conftest.py": "import pytest\n",
     "tests/test_lib.py": TEST,
     "tests/helpers.py": HELPERS,
@@ -85,7 +93,10 @@ ALL = set(range(5))
 MAPS = {
     "lines": {"sqlglot/lib.py:10": [C], "sqlglot/lib.py:13": [C], "sqlglot/lib.py:14": [D],
               "sqlglot/other.py:4": [A], "sqlglot/parser.py:5": [B],
-              "sqlglot/fifth.py:5": [B]},
+              "sqlglot/fifth.py:5": [B], "sqlglot/sixth.py:2": [C], "sqlglot/seventh.py:5": [D],
+              "sqlglot/ninth.py:5": [A],
+              "sqlglot/slow_lambda.py:3": [D], "sqlglot/slow_lambda.py:4": [C],
+              "sqlglot/slow_cache.py:5": [C, D], "sqlglot/slow_cache.py:6": [C], "sqlglot/slow_cache.py:7": [C, D]},
     "classes": {"sqlglot.lib.Dialect": [A]},
     "reads": {"tests/fixtures/q.sql": [B]},
     "test_imports": {"tests/helpers.py": [A, B]},
@@ -94,6 +105,11 @@ MAPS = {
 
 @pytest.fixture
 def selector(tmp_path: Path) -> Selector:
+    return make_selector(tmp_path)
+
+
+def make_selector(tmp_path: Path, slow: tuple[int, ...] = ()) -> Selector:
+    """The fake repo; tests in `slow` take 30 s (every other test takes 1 s)."""
     repo, maps = tmp_path / "sqlglot", tmp_path / "maps"
     for path, text in FILES.items():
         (repo / path).parent.mkdir(parents=True, exist_ok=True)
@@ -103,7 +119,13 @@ def selector(tmp_path: Path) -> Selector:
         traced = T[:4]  # test U appears in no map
         body = {"tests": traced, "map": mapping}
         (maps / f"{name}.json.gz").write_bytes(gzip.compress(json.dumps(body).encode()))
-    tests = [{"number": i, "id": t, "file": t.split("::")[0], "seconds": 1.0} for i, t in enumerate(T)]
+    # Import-time map: line → modules whose import runs it (root 0 = `import sqlglot`).
+    roots = ["sqlglot", "sqlglot.other", "tests.test_lib"]
+    body = {"tests": roots, "map": {"sqlglot/tenth.py:2": [0], "sqlglot/fifth.py:5": [2],
+                                    "sqlglot/seventh.py:1": [1], "sqlglot/ninth.py:1": [2]}}
+    (maps / "import_time.json.gz").write_bytes(gzip.compress(json.dumps(body).encode()))
+    tests = [{"number": i, "id": t, "file": t.split("::")[0], "seconds": 30.0 if i in slow else 1.0}
+             for i, t in enumerate(T)]
     return Selector(tests, repo, maps)
 
 
@@ -150,6 +172,46 @@ def test_function_body_uses_whole_function_span(selector):
     # plus the untraced test U, which joins every non-empty selection.
     got = run(selector, edit("sqlglot/lib.py", "len(sql) > LIMIT", "len(sql) >= LIMIT"))
     assert got == {C, D, U}
+
+
+def test_slow_test_off_the_touched_statement_is_dropped(tmp_path):
+    # D (slow) ran the function (line 14) but not the edited `return sql` (line 13).
+    selector = make_selector(tmp_path, slow=(D,))
+    assert run(selector, edit("sqlglot/lib.py", "return sql\n", "return sql[1:]\n")) == {C, U}
+
+
+def test_slow_test_on_another_line_of_the_touched_header_is_kept(tmp_path):
+    # C (slow) ran line 10 of the 3-line `if` header, not the edited line 11.
+    selector = make_selector(tmp_path, slow=(C,))
+    got = run(selector, edit("sqlglot/lib.py", "len(sql) > LIMIT", "len(sql) >= LIMIT"))
+    assert got == {C, D, U}
+
+
+def test_slow_test_kept_when_statements_are_inserted(tmp_path):
+    # A new statement has no old statement to anchor it: whole-function rule.
+    selector = make_selector(tmp_path, slow=(D,))
+    got = run(selector, edit("sqlglot/lib.py", "return sql\n", "sql = sql.strip()\n            return sql\n"))
+    assert got == {C, D, U}
+
+
+def test_slow_test_kept_when_the_edit_changes_name_bindings(tmp_path):
+    # `LIMIT :=` makes LIMIT local to parse(): line 11, which every caller runs, now fails.
+    selector = make_selector(tmp_path, slow=(D,))
+    got = run(selector, edit("sqlglot/lib.py", "return sql\n", "return (LIMIT := sql)\n"))
+    assert got == {C, D, U}
+
+
+def test_slow_test_kept_for_a_lambda_region(tmp_path):
+    # A lambda in a class-level dict has no enclosing def body: whole-lambda rule.
+    selector = make_selector(tmp_path, slow=(D,))
+    assert run(selector, edit("sqlglot/slow_lambda.py", "x + 1", "x + 2")) == {C, D, U}
+
+
+def test_slow_test_kept_when_the_function_fills_a_module_cache(tmp_path):
+    # The map credits the cache fill (line 6) to whichever test ran first in the process;
+    # D, which only read the cache in the mapping run, may be the first one in the real run.
+    selector = make_selector(tmp_path, slow=(D,))
+    assert run(selector, edit("sqlglot/slow_cache.py", "key * 2", "key * 3")) == {C, D, U}
 
 
 def test_signature_change_adds_class_users(selector):
@@ -295,8 +357,14 @@ IMPORTS = {"sqlglot/other.py": [A], "sqlglot/lib.py": [A, C, D], "sqlglot/parser
            "sqlglot/fourth.py": [B], "tests/test_lib.py": [A, B], "<isolation-failure>": []}
 
 
-def _with_imports(selector: Selector, tmp_path: Path, mapping: dict) -> Selector:
-    body = {"tests": T[:4], "map": mapping}  # U is untraced: always added
+COLLECTED = ["sqlglot/parser.py", "tests/helpers.py", "tests/test_lib.py"]
+COLLECTED_BY_IMPORT = ["sqlglot/parser.py", "tests/helpers.py"]  # test_lib.py: pytest only
+
+
+def _with_imports(selector: Selector, tmp_path: Path, mapping: dict, **extra) -> Selector:
+    body = {"tests": T[:4], "map": mapping,  # U is untraced: always added
+            "collection": COLLECTED, "collection_imported": COLLECTED_BY_IMPORT, **extra}
+    body = {k: v for k, v in body.items() if v is not None}
     (tmp_path / "maps" / "imports.json.gz").write_bytes(gzip.compress(json.dumps(body).encode()))
     return Selector(selector.tests, selector.sqlglot, tmp_path / "maps")
 
@@ -353,5 +421,58 @@ def test_isolation_failures_join_the_bound(selector, tmp_path):
     assert run(sel, patch("sqlglot/other.py", OTHER, None)) == {A, D, U}
 
 
-def test_test_file_syntax_error_selects_its_loaders(bounded):
-    assert run(bounded, edit("tests/test_lib.py", "assert True", "assert True +")) == {A, B, U}
+def test_syntax_error_in_collected_file_selects_all(bounded):
+    # a collection error: pytest's default interrupts the whole session
+    assert run(bounded, edit("tests/test_lib.py", "assert True", "assert True +")) == ALL
+    assert run(bounded, edit("tests/helpers.py", "return 1", "return 1 +")) == ALL
+
+
+def test_deleted_test_file_nothing_imports_selects_its_tests(bounded):
+    assert run(bounded, patch("tests/test_lib.py", TEST, None)) == {A, B, U}
+
+
+def test_deleted_module_imported_at_collection_selects_all(bounded):
+    assert run(bounded, patch("tests/helpers.py", HELPERS, None)) == ALL
+
+
+def test_map_without_collection_lists_selects_all(selector, tmp_path):
+    sel = _with_imports(selector, tmp_path, IMPORTS, collection=None, collection_imported=None)
+    assert run(sel, patch("sqlglot/other.py", OTHER, None)) == ALL
+
+# ── import-time code, removed names, derived names, hunkless entries ─────────
+
+def test_function_run_by_import_sqlglot_selects_all(selector):
+    assert run(selector, edit("sqlglot/tenth.py", "return 1", "return 2")) == ALL
+
+
+def test_function_run_while_importing_a_module_selects_its_dependents(selector):
+    # fifth.py:5 runs while tests/test_lib.py is imported → that file's tests join line users.
+    got = run(selector, edit("sqlglot/fifth.py", "return VALUE\n", "return VALUE + 1\n"))
+    assert got == {A, B, U}
+
+
+def test_renamed_function_selects_all(selector):
+    # Lost binding guard: importers of `helper` fail at import → ALL.
+    assert run(selector, edit("sqlglot/sixth.py", "def helper():", "def helper2():")) == ALL
+
+
+def test_removed_name_imported_during_collection_selects_all(selector):
+    # ninth.py imports DERIVED and is imported by tests/test_lib.py: a collection error.
+    assert run(selector, edit("sqlglot/eighth.py", "DERIVED = list(BASE_NAMES)\n", "")) == ALL
+
+
+def test_derived_module_name_follows_importers(selector):
+    got = run(selector, edit("sqlglot/eighth.py", "BASE_NAMES = [1]", "BASE_NAMES = [2]"))
+    assert got == {A, U}
+
+
+def test_pure_rename_without_hunks_is_seen(selector):
+    text = ("diff --git a/tests/fixtures/q.sql b/tests/fixtures/q2.sql\nsimilarity index 100%\n"
+            "rename from tests/fixtures/q.sql\nrename to tests/fixtures/q2.sql\n")
+    text += edit("README.md", "hello", "hi")
+    assert run(selector, text) == {B, U}
+
+
+def test_deleted_empty_file_is_seen(selector):
+    text = "diff --git a/tests/helpers.py b/tests/helpers.py\ndeleted file mode 100644\nindex e69de29..0000000\n"
+    assert run(selector, text + edit("README.md", "hello", "hi")) == ALL

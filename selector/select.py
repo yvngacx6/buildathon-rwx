@@ -10,6 +10,7 @@ here knows which tests any particular edit breaks.
   .py, same syntax tree (or docstrings)  nothing
   .py that does not parse after patch    import bound: tests that load the module ∪ read it
   sqlglot/ function body                 tests that ran any line of the function (lines map)
+    … slow tests (≥ SLOW_SECONDS)        only if they ran a touched statement (see below)
     … signature / decorator              + users of the enclosing classes (classes map)
   sqlglot/ class body / module level,    tests that ran a line reading a changed name, ∩ the
     assignments with inert new values    conservative set below; ∪ test-file reads; a changed
@@ -37,9 +38,22 @@ process and every module it loaded was recorded (collection-time closure of its 
 confined to one module can only reach tests that load it or read it as a file; a module
 that fails to import breaks exactly those. Tests that fail when run alone, or that the trace
 does not know, are always added. Without the map, or for a hunk that does not apply: ALL.
+Only for modules loaded lazily at run time: a module loaded while pytest collects the test
+files (`pytest --collect-only tests`, traced at map build) would fail at collection, and
+pytest's default interrupts the whole session → ALL. A deleted / renamed test file that no
+other module imports is not a collection error (its tests just vanish) → import bound.
 
 Then: tests no map knows about join every non-empty selection, and a selection that would
 cost nearly as much as ALL becomes ALL (same price, no risk).
+
+Slow tests in function bodies. A test that never executes the statements an edit touches
+runs exactly the code it ran before, so it cannot notice the edit. Cheap tests stay at the
+whole-function rule (they cost almost nothing, and the function span absorbs any line-level
+noise in the map). A slow test (≥ SLOW_SECONDS, from tests.json) is kept only if the lines
+map shows it ran a line of a touched statement: the whole statement for simple statements,
+the header lines for an if / for / while whose header alone changed. The statement view
+exists only for clean in-place edits (classify.touched_statements); otherwise, or when no
+test at all ran the touched statements, slow tests stay at the whole-function rule.
 """
 
 from __future__ import annotations
@@ -50,7 +64,7 @@ import re
 from pathlib import Path, PurePosixPath
 
 from . import classify, diff, nameindex, names
-from .maps import Maps
+from .maps import ImportTimeMap, Maps
 
 # Class and module bodies of these files shape nearly every test (map gives ~1550 of 1620).
 BASE_FILES = {
@@ -67,6 +81,7 @@ DOC_FILES = {"LICENSE", "Makefile", "CHANGELOG", ".gitignore", ".pre-commit-conf
 CONFIG_FILES = {"pyproject.toml", "setup.cfg"}
 ALWAYS_ALL = {"pytest.ini", "tox.ini", "conftest.py", "setup.py"}
 ALL_FRACTION = 0.85  # selection cost ≥ this × ALL cost → just run ALL
+SLOW_SECONDS = 5.0  # tests at least this slow get the statement-level rule in function bodies
 
 
 class AllTests(Exception):
@@ -86,10 +101,12 @@ class Selector:
             self._id_of[t["number"]] = t["id"]
         self._number_of = {t["id"]: t["number"] for t in tests}
         self._secs = {t["number"]: float(t.get("seconds", 0.0)) for t in tests}
+        self._slow = {n for n, s in self._secs.items() if s >= SLOW_SECONDS}
         self._untraced: set[int] | None = None
         self._sources: dict[str, str] | None = None
         self._name_index: nameindex.NameIndex | None = None
         self.notes: list[str] = []  # why a definition-time region was (not) narrowed
+        self._dependents: dict[str, set[int]] = {}
 
     def all_numbers(self) -> set[int]:
         return set(self._all)
@@ -135,7 +152,7 @@ class Selector:
             if not (new.endswith(".py") and new.startswith(("sqlglot/", "tests/"))
                     and name_of(new) not in ALWAYS_ALL and name_of(new) != "__init__.py"):
                 raise AllTests(f"{fp.old_path} renamed to {new}")
-            return self._import_bound(fp.old_path, f"{fp.old_path} renamed")
+            return self._import_bound(fp.old_path, f"{fp.old_path} renamed", removed=True)
         if name in ALWAYS_ALL:
             raise AllTests(f"{path} is test configuration")
         if path.startswith(DOC_DIRS) or path.endswith(DOC_SUFFIXES) or name in DOC_FILES:
@@ -152,7 +169,7 @@ class Selector:
                 return set(), "new module, nothing imports it"
             raise AllTests(f"{path}: new file outside sqlglot/ and tests/")
         if fp.new_path is None:
-            return self._import_bound(path, f"{path} deleted")
+            return self._import_bound(path, f"{path} deleted", removed=True)
         try:
             return self._python(fp)
         except AllTests as exc:
@@ -161,15 +178,22 @@ class Selector:
             # Every narrower rule gave up: fall back to the import bound of this one module.
             return self._import_bound(path, str(exc))
 
-    def _import_bound(self, path: str, why: str) -> tuple[set[int], str]:
+    def _import_bound(self, path: str, why: str, removed: bool = False) -> tuple[set[int], str]:
         """Every test an edit confined to module `path` can reach: the tests that load it
         (imports map: its import closure, traced per test in a fresh process, lazy loads
-        included) ∪ the tests that read it as a file. If it stops importing, these break."""
+        included) ∪ the tests that read it as a file. If it stops importing, these break.
+
+        Only for modules loaded lazily, after collection: if the module is loaded while
+        pytest collects the test files, a failure there is a collection error, and pytest's
+        default interrupts the whole session → ALL. A removed (deleted / renamed) test file
+        that no other module imports is not a collection error: its tests just vanish."""
         loaders = self.maps.loaders(path)
         if (loaders is None or not path.endswith(".py") or name_of(path) in ALWAYS_ALL
                 or not path.startswith(("sqlglot/", "tests/"))):
             raise AllTests(why)
-        return loaders | self.maps.reads.get(path), f"{why} → tests that load it"
+        if self.maps.collected(path, by_import=removed):
+            raise AllTests(f"{why}; {path} is loaded at collection")
+        return loaders | self.maps.reads.get(path), f"{why} → tests that load it (run time)"
 
     def _config(self, fp: diff.FilePatch) -> tuple[set[int], str]:
         """pyproject.toml / setup.cfg: only pytest sections can change a test run."""
@@ -255,16 +279,29 @@ class Selector:
         kinds = []
         for r in found:
             if r.kind == "function":
-                got = self.maps.span(path, *r.span)
+                ran = self.maps.span(path, *r.span)
+                got = self._slow_tests_off_statements(path, ran, r)
                 if r.signature:
                     got |= self._class_users(module, r.classes)
+                # Called while some module is imported (trie builders, decorator factories,
+                # `X = build()` tables, module __getattr__): every importer depends on it,
+                # which no per-test coverage can show.
+                # A lambda's first line is where it is created (class-body dicts run it at
+                # import); only its later lines are body that can run at import.
+                first, last = r.span
+                at_import = self._import_time(path, first + r.is_lambda, last)
                 if not got:
                     # Never ran under a test: may run only at import or class creation.
                     # Treat it as a change to the scope that defines it.
                     got = self._definition_time(path, module, old_tree, new_tree, r)
                     kinds.append(f"unrun def {'.'.join(r.chain) or '<lambda>'} → definition-time")
                 else:
-                    kinds.append(f"def {'.'.join(r.chain) or '<lambda>'}")
+                    dropped = len(ran - got)
+                    kinds.append(f"def {'.'.join(r.chain) or '<lambda>'}"
+                                 + (f" (-{dropped} slow, off touched statements)" if dropped else ""))
+                if at_import:
+                    kinds.append(f"(runs at import: +{len(at_import - got)})")
+                got |= at_import
             else:
                 self.notes.clear()
                 got = self._definition_time(path, module, old_tree, new_tree, r)
@@ -272,6 +309,19 @@ class Selector:
                 kinds.append(f"{r.kind} {'.'.join(r.chain) or module}{note}")
             chosen |= got
         return chosen, ", ".join(kinds)
+
+    def _slow_tests_off_statements(self, path: str, ran_function: set[int],
+                                   r: classify.Region) -> set[int]:
+        """Drop the slow tests that ran the function but none of the touched statements."""
+        slow = ran_function & self._slow
+        if not slow or r.statements is None:
+            return ran_function
+        ran_statements: set[int] = set()
+        for first, last in r.statements:
+            ran_statements |= self.maps.span(path, first, last)
+        if not ran_statements:
+            return ran_function  # no test ran them: map blind spot, keep the function rule
+        return ran_function - (slow - ran_statements)
 
     def _definition_time(self, path: str, module: str, old_tree: ast.Module,
                          new_tree: ast.Module, r: classify.Region) -> set[int]:
@@ -398,6 +448,58 @@ class Selector:
             self._name_index = nameindex.load(path, self.sqlglot) or nameindex.NameIndex(
                 nameindex.build(self._all_sources(), []))
         return self._name_index
+    def _name_readers(self, path: str, old_tree: ast.Module, names: set[str]) -> set[int]:
+        """Functions of this module that read a changed module-level name changed with it."""
+        got: set[int] = set()
+        if not names:
+            return got
+        for s in classify.Scopes(old_tree).scopes:
+            if s.kind != "def":
+                continue
+            body = s.node.body
+            if any(isinstance(n, ast.Name) and n.id in names for st in body for n in ast.walk(st)):
+                got |= self.maps.span(path, s.body_start, s.end)
+                got |= self._import_time(path, s.body_start, s.end)
+        return got
+
+    def _import_time(self, path: str, first: int, last: int) -> set[int]:
+        """Tests that depend on lines path:first..last having run while modules were imported."""
+        modules = self.maps.import_time.modules(path, first, last)
+        if ImportTimeMap.ROOT in modules:
+            raise AllTests(f"{path}:{first}-{last} runs during `import sqlglot`")
+        got: set[int] = set()
+        for m in modules:
+            got |= self._module_dependents(m)
+        return got
+
+    def _import_dependents(self, path: str) -> set[int]:
+        """Tests that fail if module `path` cannot be imported: dependents of every module
+        whose import (per the import-time map) runs the module's top-level statements."""
+        tree = ast.parse(self._all_sources()[path])
+        got: set[int] = set()
+        for stmt in tree.body:
+            modules = self.maps.import_time.modules(path, stmt.lineno, stmt.lineno)
+            if any(m == "tests" or m.startswith("tests.") for m in modules):
+                # A test module fails to import: a collection error, which by default
+                # interrupts the whole pytest session.
+                raise AllTests(f"{path} would fail to import while tests are collected")
+            got |= self._import_time(path, stmt.lineno, stmt.lineno)
+        return got
+
+    def _module_dependents(self, module: str) -> set[int]:
+        """Tests that need `module` to import: its test file, or its users and runners."""
+        hit = self._dependents.get(module)
+        if hit is None:
+            rel = module.replace(".", "/")
+            path = rel + ".py" if (self.sqlglot / (rel + ".py")).is_file() else rel + "/__init__.py"
+            if path.startswith("tests/"):
+                hit = set(self._by_file.get(path, set())) | self.maps.test_imports.get(path)
+            else:
+                source = self._all_sources().get(path)
+                classes = classify.top_level_classes(ast.parse(source)) if source else []
+                hit = set(self.maps.whole_file(path)) | self.maps.module_users(module, classes)
+            self._dependents[module] = hit
+        return hit
 
     def _class_users(self, module: str, chains) -> set[int]:
         out: set[int] = set()
@@ -416,16 +518,26 @@ class Selector:
         old = {ast.dump(s): s for s in old_tree.body}
         new = {ast.dump(s): s for s in new_tree.body}
         changed = [s for k, s in old.items() if k not in new] + [s for k, s in new.items() if k not in old]
+        defs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        kept = ({s.name for s in old_tree.body if isinstance(s, defs)}
+                & {s.name for s in new_tree.body if isinstance(s, defs)})
         names: set[str] = set()
         for stmt in changed:
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                continue  # handled as function / class regions
+            if isinstance(stmt, defs):
+                if stmt.name not in kept:  # deleted, renamed or new: importers of the name break
+                    names.add(stmt.name)
+                continue  # a body change is handled as a function / class region
             if not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                 raise AllTests(f"{path}: module-level {type(stmt).__name__} changed")
             targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
             for t in targets:
                 names |= {n.id for n in ast.walk(t) if isinstance(n, ast.Name)}
-        got: set[int] = set()
+        names = _derived_names(names, old_tree, new_tree)
+        # A name the module no longer defines makes `from <module> import name` fail, so every
+        # module importing it fails to import, and so does everything that imports those.
+        removed = _top_level_names(old_tree) - _top_level_names(new_tree)
+        breaks = re.compile(r"\b(" + "|".join(map(re.escape, sorted(removed))) + r")\b") if removed else None
+        got = self._name_readers(path, old_tree, names)
         seen, todo = {path}, [path]
         while todo:  # follow re-imports
             source = todo.pop()
@@ -438,6 +550,8 @@ class Selector:
                 if other.startswith("tests/"):
                     got |= self._by_file.get(other, set()) | self.maps.test_imports.get(other)
                     continue
+                if breaks is not None and breaks.search(self._all_sources()[other]):
+                    got |= self._import_dependents(other)
                 users = self.maps.whole_file(other) | self.maps.module_users(
                     _module_of(other), classify.top_level_classes(ast.parse(self._all_sources()[other])))
                 if not users:
@@ -515,4 +629,35 @@ def _bindings(tree: ast.Module) -> set[str]:
                     walk(h.body, prefix)
 
     walk(tree.body, "")
+    return out
+def _derived_names(names: set[str], *trees: ast.Module) -> set[str]:
+    """Close `names` over module-level assignments: `B = f(A)` changes when A does."""
+    names = set(names)
+    grew = True
+    while grew:
+        grew = False
+        for tree in trees:
+            for stmt in tree.body:
+                if not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)) or stmt.value is None:
+                    continue
+                if not any(isinstance(n, ast.Name) and n.id in names for n in ast.walk(stmt.value)):
+                    continue
+                targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+                for t in targets:
+                    for n in ast.walk(t):
+                        if isinstance(n, ast.Name) and n.id not in names:
+                            names.add(n.id)
+                            grew = True
+    return names
+
+
+def _top_level_names(tree: ast.Module) -> set[str]:
+    """Names a module defines at top level (defs, classes, assignment targets)."""
+    out: set[str] = set()
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(stmt.name)
+        elif isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+            out |= {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
     return out

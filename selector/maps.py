@@ -12,7 +12,7 @@ import gzip
 import json
 from pathlib import Path
 
-MAP_FILES = ("lines", "classes", "reads", "test_imports", "imports")
+MAP_FILES = ("lines", "classes", "reads", "test_imports", "import_time", "imports")
 ISOLATION_FAILURE = "<isolation-failure>"  # imports map: tests whose record may be incomplete
 
 
@@ -25,6 +25,7 @@ class Map:
         self._raw: dict[str, list[int]] | None = None
         self._numbers: list[int | None] = []
         self._cache: dict[str, frozenset[int]] = {}
+        self.extra: dict = {}
 
     def _load(self) -> dict[str, list[int]]:
         if self._raw is None:
@@ -35,6 +36,7 @@ class Map:
             self._numbers = [self._number_of.get(t) for t in data["tests"]]
             self._tests = data["tests"]
             self._raw = data["map"]
+            self.extra = {k: v for k, v in data.items() if k not in ("tests", "map")}
         return self._raw
 
     def get(self, key: str) -> frozenset[int]:
@@ -61,6 +63,7 @@ class Maps:
         self.classes = Map(directory / "classes.json.gz", number_of)
         self.reads = Map(directory / "reads.json.gz", number_of)
         self.test_imports = Map(directory / "test_imports.json.gz", number_of)
+        self.import_time = ImportTimeMap(directory / "import_time.json.gz")
         self.imports = Map(directory / "imports.json.gz", number_of)
         self._file_index: dict[str, list[str]] | None = None
         self._unvouched: frozenset[int] | None = None
@@ -106,9 +109,49 @@ class Maps:
                 n for tid, n in self._number_of.items() if tid not in known}
         return set(self.imports.get(path)) | self._unvouched
 
+    def collected(self, path: str, by_import: bool = False) -> bool:
+        """Is module `path` loaded while pytest collects the test files (imports map,
+        `pytest --collect-only tests`)? by_import: loaded by an import statement (or a
+        package), i.e. other collected modules need it, not only pytest itself.
+        True when the map does not say (missing map or field): assume the worst."""
+        self.imports._load()
+        key = "collection_imported" if by_import else "collection"
+        paths = self.imports.extra.get(key)
+        return paths is None or path in paths
+
     def untraced(self) -> set[int]:
         """Tests of this run that appear in no map: we know nothing about them."""
         seen: set[str] = set()
         for m in (self.lines, self.classes, self.reads):
             seen.update(m.traced_ids())
         return {n for tid, n in self._number_of.items() if tid not in seen}
+
+
+class ImportTimeMap:
+    """`import_time.json.gz`: line → modules whose import runs it (mapbuild/import_time.py).
+
+    Root 0 is `sqlglot` itself. Missing file → empty map (nothing known to run at import).
+    """
+
+    ROOT = "sqlglot"
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._roots: list[str] = []
+        self._raw: dict[str, list[int]] | None = None
+
+    def _load(self) -> dict[str, list[int]]:
+        if self._raw is None:
+            data = {"tests": [], "map": {}}
+            if self.path.is_file():
+                data = json.loads(gzip.decompress(self.path.read_bytes()))
+            self._roots, self._raw = data["tests"], data["map"]
+        return self._raw
+
+    def modules(self, path: str, first: int, last: int) -> set[str]:
+        """Modules whose import executes any line in path:first..last."""
+        raw = self._load()
+        out: set[str] = set()
+        for line in range(first, last + 1):
+            out.update(self._roots[i] for i in raw.get(f"{path}:{line}", ()))
+        return out

@@ -10,6 +10,13 @@
   "build_command": "python3 mapbuild/convert_prototype.py sample/tests.json <sqlglot> maps",
   "notes": "lines = union of two coverage runs (test_function contexts, inline process pool with pickle round-trip); import-time ('') contexts dropped. classes track Dialect/Parser/Generator/Tokenizer/Expression hierarchies only. reads made by the first test of a setUpClass class are credited to the whole class. test_imports from a static AST scan.",
   "date": "2026-11-20",
+  "import_time": {
+    "built_by": "python mapbuild/import_time.py <pinned sqlglot> maps 2",
+    "image": "python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 + requirements.lock",
+    "source": "GitHub tarball of eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
+    "stats": "250 roots, 10816 lines run by `import sqlglot`, 27788 lines total; sqlglot.__main__ and tests.gen_fixtures fail to import (expected)",
+    "date": "2026-11-20"
+  },
   "imports": {
     "build_command": "SKIP_INTEGRATION=0 <venv python> mapbuild/import_map.py sample/tests.json <scratch copy of sqlglot@eb11aec> maps -j12",
     "built": "2026-11-20, laptop (python 3.13.12, sqlglot test deps incl. duckdb/pandas), not the pinned image",
