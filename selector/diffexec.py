@@ -45,6 +45,7 @@ class DiffExec:
         self._idx = None
         self._by_name: dict | None = None
         self._warm = False
+        self.why_kept: dict[str, str] = {}
         from .pack import duration_ms
         self.ms_of = {t["number"]: duration_ms(t["seconds"]) for t in selector.tests}
         self._resource_files: dict[str, set[str]] = {}
@@ -219,6 +220,7 @@ class DiffExec:
         if not global_ok:
             return {}, "diffexec: keep all (a call outside tests differs)"
         bad_tests, seen_tests = set(), set()
+        self.why_kept = {}  # test id -> why diffexec kept it (for measurement)
         for c in codes.values():
             for ph, v in c["phases"].items():
                 if "|" not in ph:
@@ -226,16 +228,24 @@ class DiffExec:
                 kind, tid = ph.split("|", 1)
                 seen_tests.add(tid)
                 if v != "ok":
+                    hit = [tid]
                     if kind == "SETUP":  # setUpClass work reaches the whole class
-                        bad_tests.update(self._mates.get(self._class_of.get(tid, tid), [tid]))
-                    bad_tests.add(tid)
+                        hit = self._mates.get(self._class_of.get(tid, tid), [tid])
+                    for t in hit:
+                        bad_tests.add(t)
+                        # "differs" (a replay gave another effect) wins over "incomplete"
+                        if self.why_kept.get(t) != "differs":
+                            self.why_kept[t] = "differs" if v == "bad" else "incomplete"
         dropped: dict[str, set[int]] = {}
         n = 0
         for path, _, numbers in jobs:
             out = set()
             for num in numbers:
                 tid = self.sel._id_of[num]
-                if tid in bad_tests or tid not in seen_tests or self._is_resource(tid):
+                if tid in bad_tests:
+                    continue
+                if tid not in seen_tests or self._is_resource(tid):
+                    self.why_kept[tid] = "unseen" if tid not in seen_tests else "resource"
                     continue
                 # setUpClass of a classmate that ran a changed function must also be ok
                 out.add(num)

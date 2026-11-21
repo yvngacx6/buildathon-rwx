@@ -1,15 +1,21 @@
 """Measure the diffexec pruner on a labeled set (selector in-process, store given by env).
 
-    BR_SQLGLOT=... BR_DIFFEXEC_STORE=... python -m diffexec.measure <set dir>
+    BR_SQLGLOT=... BR_DIFFEXEC_STORE=... PYTHONHASHSEED=0 python -m diffexec.measure <set dir>
 
-Per commit where the replay ran: candidates diffexec could drop, how many of them fail
-(labels), how many were dropped, and the cost before / after. A dropped failing test is a
-miss caused by diffexec (must be 0). "failing candidates kept" counts the failing tests that
-diffexec examined and correctly kept: the evidence that it discriminates.
+Per commit with diffexec candidates: candidates, how many fail (labels), how many were
+dropped, cost before / after. A dropped failing test is a miss caused by diffexec (must be 0).
+Failing candidates that were kept are split by reason:
+  differs     a replay of the patched function gave another effect (the comparison worked)
+  incomplete  a phase had unpicklable inputs
+  unseen      no recorded call in the test's own phases
+  resource    the test measures time / memory / gc
+  no-data     the whole commit was kept before the comparison (function dead, no calls,
+              precheck, bail, mixed edit, budget) – the recorder could not help
 """
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import resource
@@ -29,44 +35,48 @@ def main() -> None:
     sel = Selector(tests, Path(os.environ["BR_SQLGLOT"]), Path(__file__).resolve().parent.parent / "maps")
     de = sel.diffexec
     assert de is not None, "no store"
-    tot = {"ran": 0, "cands": 0, "fail_cands": 0, "dropped": 0, "bad_drops": 0, "saved_ms": 0,
-           "child_cpu": 0.0}
+    tot = collections.Counter()
+    kept_why = collections.Counter()
     seen_prune = []
     orig = de.prune
 
     def spy(jobs, benefit_ms=1):
+        de.why_kept = {}
         dropped, note = orig(jobs, benefit_ms)
-        seen_prune.append((jobs, dropped, note))
+        seen_prune.append((jobs, dropped, note, dict(de.why_kept)))
         return dropped, note
 
     de.prune = spy
+    child = 0.0
     for p in sorted((data / "commits").glob("*.patch")):
         seen_prune.clear()
-        c0 = resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime
+        c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
         nums, why = sel.select(p.read_text(errors="replace"))
-        tot["child_cpu"] += resource.getrusage(resource.RUSAGE_CHILDREN).ru_utime - c0
+        c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        child += (c1.ru_utime - c0.ru_utime) + (c1.ru_stime - c0.ru_stime)
         if not seen_prune:
             continue
-        jobs, dropped, note = seen_prune[0]
-        if "dropped" not in note:
-            continue
+        jobs, dropped, note, why_kept = seen_prune[0]
         failing = set(answers[p.stem]["failing"])
         cands = set().union(*(n for _, _, n in jobs))
         drop = set().union(*dropped.values()) if dropped else set()
         before = nums | drop
         cost_b = pack.cost_ms(pack.pack(before, ms_of), ms_of)
         cost_a = pack.cost_ms(pack.pack(nums, ms_of), ms_of)
-        tot["ran"] += 1
+        tot["commits_with_candidates"] += 1
+        tot["replayed"] += "dropped" in note
         tot["cands"] += len(cands)
         tot["fail_cands"] += len(cands & failing)
         tot["dropped"] += len(drop)
         tot["bad_drops"] += len((failing & drop) - nums)
         tot["saved_ms"] += cost_b - cost_a
-        print(f"{p.stem:14s} cands={len(cands):4d} failing_cands={len(cands & failing):3d} "
-              f"dropped={len(drop):4d} failing_dropped={len(failing & drop - nums)} "
-              f"cost {cost_b / 1000:.1f}->{cost_a / 1000:.1f}s :: {note[:80]}")
-    tot["child_cpu"] = round(tot["child_cpu"], 2)
-    print(json.dumps(tot))
+        for n in (cands & failing) - drop:
+            kept_why[why_kept.get(sel._id_of[n], "no-data") if "dropped" in note else "no-data"] += 1
+        if drop or cands & failing or cost_b > 3000:
+            print(f"{p.stem:14s} cands={len(cands):4d} failing={len(cands & failing):3d} "
+                  f"dropped={len(drop):4d} cost {cost_b / 1000:5.1f}->{cost_a / 1000:5.1f}s :: {note[:90]}")
+    tot["child_cpu_s"] = round(child, 2)
+    print(json.dumps(dict(tot)), "failing kept by reason:", dict(kept_why))
 
 
 if __name__ == "__main__":
