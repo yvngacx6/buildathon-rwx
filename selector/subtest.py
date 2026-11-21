@@ -368,6 +368,7 @@ class SubTest:
         """Run the queries in a forked child with the changed code swapped in."""
         meta = self.meta()
         root = str(self.sel.sqlglot)
+        _warm(root)
         rfd, wfd = os.pipe()
         t0 = os.times()
         pid = os.fork()
@@ -428,7 +429,7 @@ class SubTest:
         chosen, todo, est = set(), [], 0.0
         for n in sorted(per, key=lambda n: sum(self._cpu(x) for x in per[n])):
             qs = [x for x in per[n] if x not in todo]
-            c = sum(self._cpu(x) for x in qs) + (0.6 if qs and not todo else 0.0)  # fork, imports
+            c = sum(self._cpu(x) for x in qs) + (0.3 if qs and not todo else 0.0)  # fork, swap, tables
             trial = chosen | {n}
             spend = SCORER_SLOWDOWN * (est + c)
             gain = benefit_of(trial)
@@ -504,12 +505,8 @@ def _swap(root: str, jobs) -> str | None:
     return None
 
 
-def _child(root, jobs, todo, meta, store, budget) -> bool:
-    import signal
-    sys.setrecursionlimit(1000)  # the pool worker's default (this stack is deeper: stricter)
-    # CPU cap: SIGPROF's default action ends the child (→ keep the tests)
-    signal.signal(signal.SIGPROF, signal.SIG_DFL)
-    signal.setitimer(signal.ITIMER_PROF, budget)
+def _warm(root: str) -> None:
+    """Import what the queries use (the selector does it once, before the first fork)."""
     if root not in sys.path:
         sys.path.insert(0, root)
     if str(REPO) not in sys.path:
@@ -520,6 +517,16 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
     import sqlglot.optimizer  # noqa: F401
     import sqlglot.planner  # noqa: F401
     import sqlglot.dialects.duckdb  # noqa: F401
+    from diffexec import replay, serial  # noqa: F401
+
+
+def _child(root, jobs, todo, meta, store, budget) -> bool:
+    import signal
+    sys.setrecursionlimit(1000)  # the pool worker's default (this stack is deeper: stricter)
+    # CPU cap: SIGPROF's default action ends the child (→ keep the tests)
+    signal.signal(signal.SIGPROF, signal.SIG_DFL)
+    signal.setitimer(signal.ITIMER_PROF, budget)
+    _warm(root)
     from sqlglot.executor.table import Table
     why = _swap(root, jobs)
     if why:
