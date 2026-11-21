@@ -67,10 +67,12 @@ test_qualify_columns 12k and test_simplify 7k non-case lines).
 
 ## Risks
 
-- **Cache-hit paths (fixed in c2, not yet measured on P).** A cold fork misses branches a warm pool worker takes.
-  A mutant on a memo-hit line could change a warm case without any cold case running it. The `warm_only` guard
-  closes the same-order version of this. Pool scheduling order across tests is nondeterministic, so the
-  guard is approximate. No observed miss either way.
+- **Cache-hit paths: checked empirically, none found.** A cold fork could miss branches a warm pool worker takes, so
+  a mutant on a memo-hit line might change a warm case without any cold case running it. The warm pass on EC2
+  ran all 4497 cases twice in one process and found **0 warm-only lines**. A separate check ran 400 cases × 2 rounds
+  and saw 1.9 M lines, 0 of them new. Each cold case already hits its own caches, because lookups repeat within one
+  query. The guard stays in as a build-time tripwire. Cross-test order effects in the shared pool remain
+  theoretically possible.
 - **Pool vs fork.** Cases run in spawned workers. The child is forked from the selector, where sqlglot is imported and nothing has run, and its
   recursion limit is set to 1000 as subtest does. Logger patches (`@patch("sqlglot.generator.logger")`) only touch logging.
 - **Store fingerprint.** It covers sqlglot/**.py, fixtures/optimizer/**, tests/helpers.py and tests/test_optimizer.py.
