@@ -29,7 +29,8 @@ name = sys.argv[1]
 selfile = sys.argv[2] if len(sys.argv) > 2 else f"{O}/{name}.out"
 rows = {json.loads(l)["commit"]: json.loads(l) for l in open(selfile)}
 sl = {}
-for f in glob.glob(f"{M}/sl_{name}_*.json"):
+import os
+for f in glob.glob(os.environ.get("SLDIR", M) + f"/sl_{name}_*.json"):
     sl.update(json.load(open(f)))
 ans = None
 if name in ANS:

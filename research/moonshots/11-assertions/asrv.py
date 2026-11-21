@@ -524,6 +524,7 @@ def _on_line(code, line):
 
 
 LTOOL = 4
+LINE_ONLY_STORE = "--line-only-store" in sys.argv
 
 
 def _on_start(code, offset):
@@ -819,6 +820,11 @@ def sliced_child(commit, patch_text, numbers, store):
         for kk, oc in ot.items():
             if own_sig(oc) != own_sig(nt[kk]) and not (oc.co_flags & 0x1):  # CO_OPTIMIZED: a function
                 info["fallback"] = f"module/class body changed: {oc.co_qualname}"
+                return info
+            # a store recorded with LINE events only has no event for a code object's first
+            # line (one-line lambdas / defs): such an edit is not sliceable with that store
+            if LINE_ONLY_STORE and (oc.co_flags & 0x1) and oc.co_firstlineno in st:
+                info["fallback"] = f"edit on first line of {oc.co_qualname}"
                 return info
         modname = p[:-3].replace("/", ".")
         if modname.endswith(".__init__"):
