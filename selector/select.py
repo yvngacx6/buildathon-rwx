@@ -73,6 +73,14 @@ class Selector:
         self._number_of = {t["id"]: t["number"] for t in tests}
         self._untraced: set[int] | None = None
         self._sources: dict[str, str] | None = None
+        self._jobs: list = []
+        self._mixed_py = False
+        self.diffexec = None
+        try:
+            from .diffexec import DiffExec
+            self.diffexec = DiffExec.create(self)
+        except Exception:  # noqa: BLE001  (diffexec is an optional pruner)
+            self.diffexec = None
 
     def all_numbers(self) -> set[int]:
         return set(self._all)
@@ -86,18 +94,39 @@ class Selector:
             return self.all_numbers(), "ALL (no files parsed)"
         chosen: set[int] = set()
         reasons = []
+        self._jobs = []  # diffexec: (path, new text, prunable tests) per file
+        self._mixed_py = False  # a .py behaviour change diffexec cannot replay
+        self._chains: dict[str, list] = {}  # diffexec: changed function chains per file
+        per_file: list[tuple[str, set[int]]] = []
         try:
             for fp in files:
                 got, why = self._select_file(fp)
-                chosen |= got
+                per_file.append((fp.path, got))
                 reasons.append(f"{fp.path}: {why} [{len(got)}]")
         except AllTests as exc:
             return self.all_numbers(), f"ALL ({exc})"
+        if self._jobs and self.diffexec is not None:
+            dropped, note = self.diffexec.prune(self._jobs, self._benefit(per_file))
+            if note:
+                reasons.append(note)
+            per_file = [(p, got - dropped.get(p, set())) for p, got in per_file]
+        for _, got in per_file:
+            chosen |= got
         if chosen:
             if self._untraced is None:
                 self._untraced = self.maps.untraced()
             chosen |= self._untraced
         return chosen & self._all, "; ".join(reasons)
+
+    def _benefit(self, per_file) -> int:
+        """Cost saved (ms) if diffexec dropped every prunable test: 0 → do not run it."""
+        from . import pack
+        ms_of = self.diffexec.ms_of
+        everything = set().union(*(got for _, got in per_file))
+        prunable = {p: nums for p, _, nums in self._jobs}
+        rest = set().union(*(got - prunable.get(p, set()) for p, got in per_file))
+        return (pack.cost_ms(pack.pack(everything, ms_of), ms_of)
+                - pack.cost_ms(pack.pack(rest, ms_of), ms_of))
 
     # ── one file ──────────────────────────────────────────────────────────────
 
@@ -168,9 +197,10 @@ class Selector:
         if not found:
             return set(), "no behaviour-changing region"
         if path.startswith("tests/"):
+            self._mixed_py = True
             return self._test_code(path, found)
         if path.startswith("sqlglot/"):
-            return self._library(path, old_tree, new_tree, found)
+            return self._library(path, old_tree, new_tree, found, new_text)
         raise AllTests(f"{path}: .py outside sqlglot/ and tests/")
 
     # ── tests/*.py ────────────────────────────────────────────────────────────
@@ -202,26 +232,39 @@ class Selector:
     # ── sqlglot/*.py ──────────────────────────────────────────────────────────
 
     def _library(self, path: str, old_tree: ast.Module, new_tree: ast.Module,
-                 found: list[classify.Region]) -> tuple[set[int], str]:
+                 found: list[classify.Region], new_text: str = "") -> tuple[set[int], str]:
         module = _module_of(path)
         chosen: set[int] = set(self.maps.reads.get(path))
+        fixed = set(chosen)  # tests diffexec may never drop (readers, definition-time users ...)
+        prunable: set[int] = set()
         kinds = []
         for r in found:
             if r.kind == "function":
                 got = self.maps.span(path, *r.span)
+                if got and not r.signature:
+                    prunable |= got
+                    self._chains.setdefault(path, []).append(r.chain)
+                else:
+                    self._mixed_py = True
                 if r.signature:
                     got |= self._class_users(module, r.classes)
+                    fixed |= got
                 if not got:
                     # Never ran under a test: may run only at import or class creation.
                     # Treat it as a change to the scope that defines it.
                     got = self._definition_time(path, module, old_tree, new_tree, r)
+                    fixed |= got
                     kinds.append(f"unrun def {'.'.join(r.chain) or '<lambda>'} → definition-time")
                 else:
                     kinds.append(f"def {'.'.join(r.chain) or '<lambda>'}")
             else:
+                self._mixed_py = True
                 got = self._definition_time(path, module, old_tree, new_tree, r)
+                fixed |= got
                 kinds.append(f"{r.kind} {'.'.join(r.chain) or module}")
             chosen |= got
+        if prunable - fixed and new_text:
+            self._jobs.append((path, new_text, prunable - fixed))
         return chosen, ", ".join(kinds)
 
     def _definition_time(self, path: str, module: str, old_tree: ast.Module,
