@@ -193,6 +193,12 @@ def check(root: str, patched: dict[str, str], everything: bool) -> dict:
     importlib.import_module("sqlglot")
     from sqlglot.dialects.dialect import Dialect, Dialects
 
+    # A patched module `import sqlglot` does not load (optimizer/, executor/, …) is loaded
+    # in the worker by collection: run its patched import too.
+    for p in sorted(patched):
+        if not is_family(module_of(p)):
+            importlib.import_module(module_of(p))
+
     files = {os.path.realpath(os.path.join(root, p)) for p in patched}
     patched_mods = {module_of(p) for p in patched}
     memo: dict = {}
