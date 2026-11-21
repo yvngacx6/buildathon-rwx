@@ -145,3 +145,16 @@ def test_sigterm_prints_finished_lines_and_all_for_the_rest(env, tmp_path):
     got = lines_of(out)
     assert got["a1"] == set() and got['b "2\nx'] == ALL and got["c3"] == ALL
     assert _dead(int(pidfile.read_text()))
+
+
+def test_child_wall_guard_is_generous_but_bounded_by_the_run_deadline(monkeypatch):
+    """moon-17: a verification child's wall timeout never decides at normal load (≥ 4x its CPU
+    budget + 30 s) but never outlasts the run's ALL_PHASE deadline."""
+    from selector import diffexec
+    monkeypatch.setattr(diffexec, "WALL_END", None)
+    assert diffexec.wall_guard(5) == 50
+    assert diffexec.wall_guard(5, cap=180) == 180
+    monkeypatch.setattr(diffexec, "WALL_END", time.monotonic() + 10)
+    assert 9 < diffexec.wall_guard(5) <= 10
+    monkeypatch.setattr(diffexec, "WALL_END", time.monotonic() - 5)
+    assert diffexec.wall_guard(5) == 0.5
