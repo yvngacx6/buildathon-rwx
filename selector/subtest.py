@@ -139,6 +139,7 @@ class _Cov:
 
         mon.register_callback(self.TOOL, mon.events.LINE, line)
         mon.set_events(self.TOOL, mon.events.LINE)
+        mon.restart_events()  # locations DISABLEd by an earlier phase report again
 
     def stop(self):
         mon = sys.monitoring
@@ -231,12 +232,16 @@ def build(root: Path, out: Path) -> None:
                 cov.start()
                 outs["duck"] = transpile(q["sql"], write="duckdb")[0]
                 phases["duck"] = cov.stop()
-                if suite == "tpch":
-                    cov = _Cov(prefix)
-                    cov.start()
-                    outs["opt"] = transpile(q["optimized"], write="duckdb")[0]
-                    phases["opt"] = cov.stop()
                 return phases, outs
+
+            def traced_opt(q=q):
+                # test_optimized_tpch alone: both transpiles in one fresh process
+                from sqlglot import transpile
+                cov = _Cov(prefix)
+                cov.start()
+                duck = transpile(q["sql"], write="duckdb")[0]
+                opt = transpile(q["optimized"], write="duckdb")[0]
+                return cov.stop(), duck, opt
 
             def timed(q=q):
                 t0 = time.process_time()
@@ -247,6 +252,10 @@ def build(root: Path, out: Path) -> None:
                 return a, b, t1 - t0, t2 - t1
 
             phases, outs = _in_fork(traced)
+            if suite == "tpch":
+                phases["opt"], duck, outs["opt"] = _in_fork(traced_opt)
+                if duck != outs["duck"]:
+                    raise RuntimeError("duckdb sql differs between runs")
             a, b, cpu_exec, cpu_opt = _in_fork(timed)
             # the untraced run must give the same outputs (else: not deterministic → never used)
             stable = (a[0] == outs.get("exec")) and (a[1] == (outs["duck"] if q["execute"] else None))
@@ -340,7 +349,7 @@ class SubTest:
                     hit = _hit(ph["parse"], spans) or (
                         q["execute"] and (_hit(ph["exec"], spans) or _hit(ph["duck"], spans)))
                 else:
-                    hit = _hit(ph["duck"], spans) or _hit(ph["opt"], spans)
+                    hit = _hit(ph["opt"], spans)
                 if hit:
                     if not q["stable"]:
                         return None
@@ -423,14 +432,14 @@ class SubTest:
         if not chosen:
             return set(), f"subtest: keep (est {cpu:.1f}s CPU for {sum(map(len, per.values()))} queries)"
         if not todo:
-            return chosen, f"subtest: {len(chosen)} dropped (no query runs a touched statement)"
+            return chosen, f"subtest: {sorted(chosen)} dropped (no query runs a touched statement)"
         try:
             ok = self.verify(jobs, todo, min(BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0))
         except Exception as e:  # noqa: BLE001
             return set(), f"subtest: keep ({type(e).__name__})"
         if not ok:
             return set(), f"subtest: keep (verification of {len(todo)} queries failed, {self.last_child:.2f}s)"
-        return chosen, (f"subtest: {len(chosen)} dropped ({len(todo)} queries re-run,"
+        return chosen, (f"subtest: {sorted(chosen)} dropped ({len(todo)} queries re-run,"
                         f" {self.last_child:.2f}s)")
 
     def _cpu(self, x):
