@@ -52,19 +52,51 @@ def parse(text: str) -> list[FilePatch]:
     current: FilePatch | None = None
     hunk: Hunk | None = None
     pending_old: str | None = None
+    header: dict | None = None  # a `diff --git` entry not yet followed by ---/+++ lines
+
+    def flush() -> None:
+        # A git entry with no ---/+++ (pure rename, empty file added or deleted, mode change)
+        # still changes the tree: keep it as a FilePatch without hunks.
+        if header is not None and not header["seen"]:
+            old_p = None if header["new"] else header.get("from", header["a"])
+            new_p = None if header["deleted"] else header.get("to", header["b"])
+            patches.append(FilePatch(old_p, new_p))
+
     for line in text.splitlines(keepends=True):
         if line.startswith("diff --git "):
+            flush()
             current, hunk, pending_old = None, None, None
+            m = re.match(r"diff --git a/(.+?) b/(.+?)\s*$", line)
+            header = None
+            if m:
+                header = {"a": m.group(1), "b": m.group(2), "new": False, "deleted": False,
+                          "seen": False}
             continue
+        if header is not None and not header["seen"] and current is None and hunk is None:
+            if line.startswith("new file mode"):
+                header["new"] = True
+            elif line.startswith("deleted file mode"):
+                header["deleted"] = True
+            elif line.startswith("rename from "):
+                header["from"] = line[len("rename from "):].strip()
+            elif line.startswith("rename to "):
+                header["to"] = line[len("rename to "):].strip()
         if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
             m = re.match(r"Binary files (\S+) and (\S+) differ", line)
             fp = FilePatch(_strip_prefix(m.group(1)) if m else None,
                            _strip_prefix(m.group(2)) if m else None, is_binary=True)
             patches.append(fp)
             current, hunk = None, None
+            if header is not None:
+                header["seen"] = True
             continue
         if line.startswith("--- ") and hunk_done(hunk):
             pending_old = line[4:]
+            if header is not None and not header["seen"]:
+                named = {header["a"], header["b"], header.get("from"), header.get("to")}
+                if (_strip_prefix(pending_old) or header["a"]) not in named:
+                    flush()  # these ---/+++ lines belong to a file without a git header
+                header["seen"] = True
             continue
         if line.startswith("+++ ") and pending_old is not None:
             current = FilePatch(_strip_prefix(pending_old), _strip_prefix(line[4:]))
@@ -84,6 +116,7 @@ def parse(text: str) -> list[FilePatch]:
             # "\ No newline at end of file": strip the newline from the previous line.
             if hunk.lines:
                 hunk.lines[-1] = hunk.lines[-1].rstrip("\n")
+    flush()
     return patches
 
 

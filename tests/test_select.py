@@ -67,9 +67,14 @@ FILES = {
     "sqlglot/third.py": "from sqlglot.other import SHARED\n",
     "sqlglot/fourth.py": "VALUE = 1\n",
     "sqlglot/fifth.py": "from sqlglot.fourth import VALUE\n\n\ndef f():\n    return VALUE\n",
-    "sqlglot/seventh.py": ("_CACHE = {}\n\n\ndef get(key):\n    if key not in _CACHE:\n"
+    "sqlglot/sixth.py": "def helper():\n    return 1\n",
+    "sqlglot/seventh.py": "from sqlglot.sixth import helper\n\n\ndef g():\n    return helper()\n",
+    "sqlglot/eighth.py": "BASE_NAMES = [1]\nDERIVED = list(BASE_NAMES)\n",
+    "sqlglot/ninth.py": "from sqlglot.eighth import DERIVED\n\n\ndef h():\n    return DERIVED\n",
+    "sqlglot/tenth.py": "def boot():\n    return 1\n",
+    "sqlglot/slow_cache.py": ("_CACHE = {}\n\n\ndef get(key):\n    if key not in _CACHE:\n"
                            "        _CACHE[key] = key * 2\n    return _CACHE[key]\n"),
-    "sqlglot/sixth.py": "class P:\n    F = {\n        \"a\": lambda x: (\n            x + 1\n        ),\n    }\n",
+    "sqlglot/slow_lambda.py": "class P:\n    F = {\n        \"a\": lambda x: (\n            x + 1\n        ),\n    }\n",
     "tests/conftest.py": "import pytest\n",
     "tests/test_lib.py": TEST,
     "tests/helpers.py": HELPERS,
@@ -88,8 +93,10 @@ ALL = set(range(5))
 MAPS = {
     "lines": {"sqlglot/lib.py:10": [C], "sqlglot/lib.py:13": [C], "sqlglot/lib.py:14": [D],
               "sqlglot/other.py:4": [A], "sqlglot/parser.py:5": [B],
-              "sqlglot/fifth.py:5": [B], "sqlglot/sixth.py:3": [D], "sqlglot/sixth.py:4": [C],
-              "sqlglot/seventh.py:5": [C, D], "sqlglot/seventh.py:6": [C], "sqlglot/seventh.py:7": [C, D]},
+              "sqlglot/fifth.py:5": [B], "sqlglot/sixth.py:2": [C], "sqlglot/seventh.py:5": [D],
+              "sqlglot/ninth.py:5": [A],
+              "sqlglot/slow_lambda.py:3": [D], "sqlglot/slow_lambda.py:4": [C],
+              "sqlglot/slow_cache.py:5": [C, D], "sqlglot/slow_cache.py:6": [C], "sqlglot/slow_cache.py:7": [C, D]},
     "classes": {"sqlglot.lib.Dialect": [A]},
     "reads": {"tests/fixtures/q.sql": [B]},
     "test_imports": {"tests/helpers.py": [A, B]},
@@ -112,6 +119,11 @@ def make_selector(tmp_path: Path, slow: tuple[int, ...] = ()) -> Selector:
         traced = T[:4]  # test U appears in no map
         body = {"tests": traced, "map": mapping}
         (maps / f"{name}.json.gz").write_bytes(gzip.compress(json.dumps(body).encode()))
+    # Import-time map: line → modules whose import runs it (root 0 = `import sqlglot`).
+    roots = ["sqlglot", "sqlglot.other", "tests.test_lib"]
+    body = {"tests": roots, "map": {"sqlglot/tenth.py:2": [0], "sqlglot/fifth.py:5": [2],
+                                    "sqlglot/seventh.py:1": [1], "sqlglot/ninth.py:1": [2]}}
+    (maps / "import_time.json.gz").write_bytes(gzip.compress(json.dumps(body).encode()))
     tests = [{"number": i, "id": t, "file": t.split("::")[0], "seconds": 30.0 if i in slow else 1.0}
              for i, t in enumerate(T)]
     return Selector(tests, repo, maps)
@@ -192,14 +204,14 @@ def test_slow_test_kept_when_the_edit_changes_name_bindings(tmp_path):
 def test_slow_test_kept_for_a_lambda_region(tmp_path):
     # A lambda in a class-level dict has no enclosing def body: whole-lambda rule.
     selector = make_selector(tmp_path, slow=(D,))
-    assert run(selector, edit("sqlglot/sixth.py", "x + 1", "x + 2")) == {C, D, U}
+    assert run(selector, edit("sqlglot/slow_lambda.py", "x + 1", "x + 2")) == {C, D, U}
 
 
 def test_slow_test_kept_when_the_function_fills_a_module_cache(tmp_path):
     # The map credits the cache fill (line 6) to whichever test ran first in the process;
     # D, which only read the cache in the mapping run, may be the first one in the real run.
     selector = make_selector(tmp_path, slow=(D,))
-    assert run(selector, edit("sqlglot/seventh.py", "key * 2", "key * 3")) == {C, D, U}
+    assert run(selector, edit("sqlglot/slow_cache.py", "key * 2", "key * 3")) == {C, D, U}
 
 
 def test_signature_change_adds_class_users(selector):
@@ -337,3 +349,42 @@ def test_bindings_detects_removed_names():
     old = _ast.parse("def record(): pass\nclass A:\n    X = 1\n    def f(self): pass\n")
     new = _ast.parse("def record2(): pass\nclass A:\n    X = 1\n    def g(self): pass\n")
     assert _bindings(old) - _bindings(new) == {"record", "A.f"}
+
+
+# ── import-time code, removed names, derived names, hunkless entries ─────────
+
+def test_function_run_by_import_sqlglot_selects_all(selector):
+    assert run(selector, edit("sqlglot/tenth.py", "return 1", "return 2")) == ALL
+
+
+def test_function_run_while_importing_a_module_selects_its_dependents(selector):
+    # fifth.py:5 runs while tests/test_lib.py is imported → that file's tests join line users.
+    got = run(selector, edit("sqlglot/fifth.py", "return VALUE\n", "return VALUE + 1\n"))
+    assert got == {A, B, U}
+
+
+def test_renamed_function_selects_all(selector):
+    # Lost binding guard: importers of `helper` fail at import → ALL.
+    assert run(selector, edit("sqlglot/sixth.py", "def helper():", "def helper2():")) == ALL
+
+
+def test_removed_name_imported_during_collection_selects_all(selector):
+    # ninth.py imports DERIVED and is imported by tests/test_lib.py: a collection error.
+    assert run(selector, edit("sqlglot/eighth.py", "DERIVED = list(BASE_NAMES)\n", "")) == ALL
+
+
+def test_derived_module_name_follows_importers(selector):
+    got = run(selector, edit("sqlglot/eighth.py", "BASE_NAMES = [1]", "BASE_NAMES = [2]"))
+    assert got == {A, U}
+
+
+def test_pure_rename_without_hunks_is_seen(selector):
+    text = ("diff --git a/tests/fixtures/q.sql b/tests/fixtures/q2.sql\nsimilarity index 100%\n"
+            "rename from tests/fixtures/q.sql\nrename to tests/fixtures/q2.sql\n")
+    text += edit("README.md", "hello", "hi")
+    assert run(selector, text) == {B, U}
+
+
+def test_deleted_empty_file_is_seen(selector):
+    text = "diff --git a/tests/helpers.py b/tests/helpers.py\ndeleted file mode 100644\nindex e69de29..0000000\n"
+    assert run(selector, text + edit("README.md", "hello", "hi")) == ALL
