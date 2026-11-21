@@ -278,3 +278,12 @@ def test_multi_file_patch_is_the_union(selector):
     text = edit("tests/fixtures/q.sql", "SELECT 1", "SELECT 2") + edit(
         "sqlglot/lib.py", "LIMIT = 10\n", "LIMIT = 10  # cap\n")
     assert run(selector, text) == {B, U}
+
+
+def test_bindings_detects_removed_names():
+    """A renamed def or class attribute must be reported as a lost binding."""
+    import ast as _ast
+    from selector.select import _bindings
+    old = _ast.parse("def record(): pass\nclass A:\n    X = 1\n    def f(self): pass\n")
+    new = _ast.parse("def record2(): pass\nclass A:\n    X = 1\n    def g(self): pass\n")
+    assert _bindings(old) - _bindings(new) == {"record", "A.f"}

@@ -170,6 +170,11 @@ class Selector:
         classify.strip_docstrings(new_tree)
         if ast.dump(old_tree) == ast.dump(new_tree):
             return set(), "same syntax tree (ignoring comments and docstrings)"
+        lost = _bindings(old_tree) - _bindings(new_tree)
+        if lost:
+            # A removed/renamed module- or class-level name breaks every importer or caller
+            # (ImportError at collection, AttributeError at call) – far beyond its own tests.
+            raise AllTests(f"{path}: binding removed ({', '.join(sorted(lost)[:3])})")
         removed, added = diff.changed_lines(fp)
         found = classify.regions(old_tree, new_tree, removed, added)
         if not found:
@@ -445,3 +450,34 @@ def _module_of(path: str) -> str:
 
 def name_of(path: str) -> str:
     return PurePosixPath(path).name
+
+
+def _bindings(tree: ast.Module) -> set[str]:
+    """Names bound at module level and in class bodies (nested classes included), as
+    dotted paths: `func`, `Class`, `Class.attr`, `Class.method`. Function bodies are skipped."""
+    out: set[str] = set()
+
+    def walk(body: list[ast.stmt], prefix: str) -> None:
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.add(prefix + node.name)
+            elif isinstance(node, ast.ClassDef):
+                out.add(prefix + node.name)
+                walk(node.body, f"{prefix}{node.name}.")
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for t in targets:
+                    for n in ast.walk(t):
+                        if isinstance(n, ast.Name):
+                            out.add(prefix + n.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for a in node.names:
+                    out.add(prefix + (a.asname or a.name).split(".")[0])
+            elif isinstance(node, (ast.If, ast.Try, ast.With)):
+                for field in ("body", "orelse", "finalbody"):
+                    walk(getattr(node, field, []) or [], prefix)
+                for h in getattr(node, "handlers", []) or []:
+                    walk(h.body, prefix)
+
+    walk(tree.body, "")
+    return out
