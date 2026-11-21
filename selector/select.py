@@ -251,7 +251,8 @@ class Selector:
             raise AllTests(f"{path}: {type(exc).__name__}") from None
         classify.strip_docstrings(old_tree)
         classify.strip_docstrings(new_tree)
-        if ast.dump(old_tree) == ast.dump(new_tree):
+        same = classify.SameAst(old_text, new_text)
+        if same(old_tree, new_tree):
             return set(), "same syntax tree (ignoring comments and docstrings)"
         lost = _bindings(old_tree) - _bindings(new_tree)
         if lost:
@@ -259,7 +260,7 @@ class Selector:
             # (ImportError at collection, AttributeError at call) – far beyond its own tests.
             raise AllTests(f"{path}: binding removed ({', '.join(sorted(lost)[:3])})")
         removed, added = diff.changed_lines(fp)
-        found = classify.regions(old_tree, new_tree, removed, added)
+        found = classify.regions(old_tree, new_tree, removed, added, same)
         if not found:
             return set(), "no behaviour-changing region"
         if path.startswith("tests/"):

@@ -23,6 +23,7 @@ Rules:
 from __future__ import annotations
 
 import ast
+import bisect
 from dataclasses import dataclass, field, replace
 
 DEFINITION_TIME_METHODS = {"__init_subclass__", "__set_name__", "__class_getitem__"}
@@ -65,13 +66,23 @@ def strip_docstrings(tree: ast.AST) -> ast.AST:
 
     Docstrings are not behaviour (no doctests run under pytest). Keeping a placeholder
     statement keeps every body non-empty and every line number where it was.
+    Defs and classes are statements, so only statement lists are walked (expressions
+    cannot hold one).
     """
-    for node in ast.walk(tree):
+    todo = [tree]
+    while todo:
+        node = todo.pop()
         body = getattr(node, "body", None)
         if (isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
                 and body and _is_docstring(body[0])):
             body[0] = ast.copy_location(ast.Pass(), body[0])
+        for name in _NESTED_STMTS:
+            todo.extend(getattr(node, name, None) or ())
     return tree
+
+
+# Fields that hold statements (or handlers / match cases, which hold statements).
+_NESTED_STMTS = ("body", "orelse", "finalbody", "handlers", "cases")
 
 
 def _is_metaclass(node: ast.ClassDef) -> bool:
@@ -82,34 +93,120 @@ def _is_metaclass(node: ast.ClassDef) -> bool:
     return False
 
 
+class SameAst:
+    """`ast.dump(a) == ast.dump(b)` for a node `a` of the old file and `b` of the new one.
+
+    Compares field by field, as the dump would, but skips a statement when both cover
+    identical source lines at the same columns: a statement's syntax tree depends on its
+    own text only (docstring stripping also on its place in its body, and callers pair
+    statements by place). The text shortcut is off when the texts have a carriage return
+    (line numbering) or different first two lines (a coding cookie changes how text decodes).
+    """
+
+    _MISSING = object()
+
+    def __init__(self, old_text: str | None = None, new_text: str | None = None) -> None:
+        self.old = self.new = None
+        if old_text is not None and new_text is not None and "\r" not in old_text + new_text:
+            old, new = old_text.split("\n"), new_text.split("\n")
+            if old[:2] == new[:2]:
+                self.old, self.new = old, new
+
+    def __call__(self, a: ast.AST, b: ast.AST) -> bool:
+        if type(a) is not type(b):
+            return False
+        if self.old is not None and isinstance(a, ast.stmt) and self._same_text(a, b):
+            return True
+        for name in a._fields:
+            x, y = getattr(a, name, self._MISSING), getattr(b, name, self._MISSING)
+            if isinstance(x, list) and isinstance(y, list):
+                if len(x) != len(y) or not all(map(self._same_value, x, y)):
+                    return False
+            elif not self._same_value(x, y):
+                return False
+        return True
+
+    def _same_value(self, x: object, y: object) -> bool:
+        if isinstance(x, ast.AST) or isinstance(y, ast.AST):
+            return isinstance(x, ast.AST) and isinstance(y, ast.AST) and self(x, y)
+        return repr(x) == repr(y)
+
+    def _same_text(self, a: ast.stmt, b: ast.stmt) -> bool:
+        first_a, first_b = _first_line(a), _first_line(b)  # decorators come before `def`
+        return (a.col_offset == b.col_offset and a.end_col_offset == b.end_col_offset
+                and a.lineno - first_a == b.lineno - first_b
+                and a.end_lineno - first_a == b.end_lineno - first_b
+                and self.old[first_a - 1:a.end_lineno] == self.new[first_b - 1:b.end_lineno])
+
+
+def _first_line(node: ast.AST) -> int:
+    """First line of a node's source (a def or class starts at its first decorator)."""
+    return min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", ())])
+
+
+# Leaves for `Scopes`: nodes that cannot contain a def, class or lambda.
+_NO_SCOPES = (ast.Name, ast.Constant, ast.expr_context, ast.operator, ast.boolop, ast.cmpop,
+              ast.unaryop, ast.alias)
+
+
 class Scopes:
     """Every def, class and lambda of one parsed file, with line spans."""
 
-    def __init__(self, tree: ast.Module) -> None:
+    def __init__(self, tree: ast.Module, lines: list[str] | None = None) -> None:
+        """`lines`: the source lines (no carriage returns). With them, the walk skips the
+        expressions of any node none of whose lines says `lambda`."""
         self.tree = tree
         self.scopes: list[_Scope] = []
         self.by_chain: dict[tuple[str, ...], _Scope] = {}
-        self._walk(tree, (), (), 0, False)
+        self._lambda_lines = None
+        if lines is not None:
+            self._lambda_lines = [i for i, text in enumerate(lines, 1) if "lambda" in text]
+        self._walk(tree)
 
-    def _walk(self, node: ast.AST, chain, classes, depth: int, in_meta: bool) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                first = min([child.lineno] + [d.lineno for d in child.decorator_list])
-                c = chain + (child.name,)
-                is_class = isinstance(child, ast.ClassDef)
-                scope = _Scope("class" if is_class else "def", c, child, first, child.end_lineno,
-                               child.body[0].lineno, depth + 1, classes,
+    def _children(self, node: ast.AST) -> list[ast.AST]:
+        """`ast.iter_child_nodes(node)` as a list, minus nodes that cannot hold a scope: the
+        leaves in `_NO_SCOPES` and, when no line of `node` has a lambda, all but statements
+        (defs and classes are statements)."""
+        fields = node._fields
+        if self._lambda_lines is not None and hasattr(node, "end_lineno"):
+            i = bisect.bisect_left(self._lambda_lines, _first_line(node))
+            if i == len(self._lambda_lines) or self._lambda_lines[i] > node.end_lineno:
+                fields = [f for f in fields if f in _NESTED_STMTS]
+        out = []
+        for name in fields:
+            value = getattr(node, name, None)
+            if isinstance(value, list):
+                out.extend(v for v in value
+                           if isinstance(v, ast.AST) and not isinstance(v, _NO_SCOPES))
+            elif isinstance(value, ast.AST) and not isinstance(value, _NO_SCOPES):
+                out.append(value)
+        return out
+
+    def _walk(self, tree: ast.Module) -> None:
+        """Depth-first, children in field order (the order of `ast.iter_child_nodes`): the
+        order of `scopes` decides ties in `innermost` and which scope `by_chain` keeps."""
+        todo = [(tree, (), (), 0, False)]
+        while todo:
+            node, chain, classes, depth, in_meta = todo.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                first = min([node.lineno] + [d.lineno for d in node.decorator_list])
+                chain = chain + (node.name,)
+                is_class = isinstance(node, ast.ClassDef)
+                scope = _Scope("class" if is_class else "def", chain, node, first,
+                               node.end_lineno, node.body[0].lineno, depth + 1, classes,
                                metaclass=in_meta and not is_class)
                 self.scopes.append(scope)
-                self.by_chain.setdefault(c, scope)
-                self._walk(child, c, classes + (c,) if is_class else classes, depth + 1,
-                           is_class and _is_metaclass(child))
-            elif isinstance(child, ast.Lambda):
-                self.scopes.append(_Scope("lambda", chain, child, child.lineno, child.end_lineno,
-                                          child.lineno, depth + 1, classes))
-                self._walk(child, chain, classes, depth + 1, False)
-            else:
-                self._walk(child, chain, classes, depth, in_meta)
+                self.by_chain.setdefault(chain, scope)
+                depth += 1
+                classes = classes + (chain,) if is_class else classes
+                in_meta = is_class and _is_metaclass(node)
+            elif isinstance(node, ast.Lambda):
+                self.scopes.append(_Scope("lambda", chain, node, node.lineno, node.end_lineno,
+                                          node.lineno, depth + 1, classes))
+                depth += 1
+                in_meta = False
+            todo.extend((child, chain, classes, depth, in_meta)
+                        for child in reversed(self._children(node)))
 
     def innermost(self, line: int) -> _Scope | None:
         best = None
@@ -197,48 +294,53 @@ def _named_parent(scopes: Scopes, s: _Scope) -> _Scope | None:
     return scopes.by_chain.get(s.chain) if s.chain else None
 
 
-def _shell(body: list[ast.stmt]) -> list[str]:
-    """A scope's own statements; nested defs and classes appear by name only."""
-    out = []
-    for stmt in body:
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            out.append(f"{type(stmt).__name__}:{stmt.name}")
-        else:
-            out.append(ast.dump(stmt))
-    return out
+def _same_shell(old: list[ast.stmt], new: list[ast.stmt], same: SameAst) -> bool:
+    """Same own statements in a scope's body; nested defs and classes compare by name only."""
+    if len(old) != len(new):
+        return False
+    defs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    for a, b in zip(old, new):
+        if isinstance(a, defs) or isinstance(b, defs):
+            if type(a) is not type(b) or a.name != b.name:
+                return False
+        elif not same(a, b):
+            return False
+    return True
 
 
-def _class_shell(node: ast.ClassDef) -> list[str]:
-    head = [ast.dump(x) for x in node.bases + node.keywords + node.decorator_list]
-    return head + _shell(node.body)
+def _class_head(node: ast.ClassDef) -> list[str]:
+    return [ast.dump(x) for x in node.bases + node.keywords + node.decorator_list]
 
 
-def _unchanged(region: Region, old: Scopes, new: Scopes) -> bool:
+def _unchanged(region: Region, old: Scopes, new: Scopes, same: SameAst) -> bool:
     """True when the region's scope has the same syntax tree before and after."""
     if region.kind == "module":
-        return _shell(old.tree.body) == _shell(new.tree.body)
+        return _same_shell(old.tree.body, new.tree.body, same)
     chain = region.via_def or region.chain
     o, n = old.by_chain.get(chain), new.by_chain.get(chain)
     if o is None or n is None or o.kind != n.kind:
         return False
     if region.kind == "class" and not region.via_def:
-        return _class_shell(o.node) == _class_shell(n.node)
+        return (_class_head(o.node) == _class_head(n.node)
+                and _same_shell(o.node.body, n.node.body, same))
     if o.kind == "def" and (region.via_def or region.span[0] == o.body_start):  # the def itself
-        return ast.dump(o.node) == ast.dump(n.node)
+        return same(o.node, n.node)
     return False  # a lambda inside a named scope: no cheap way to match it
 
 
-def regions(old_tree: ast.Module, new_tree: ast.Module,
-            removed: list[int], added: list[int]) -> list[Region]:
-    """Behaviour-changing regions of one file. Pass trees through `strip_docstrings` first."""
-    old, new = Scopes(old_tree), Scopes(new_tree)
+def regions(old_tree: ast.Module, new_tree: ast.Module, removed: list[int], added: list[int],
+            same: SameAst | None = None) -> list[Region]:
+    """Behaviour-changing regions of one file. Pass trees through `strip_docstrings` first.
+    `same`: the trees' SameAst, if the caller has one (else nodes are compared by dump)."""
+    same = same or SameAst()
+    old, new = Scopes(old_tree, same.old), Scopes(new_tree, same.new)
     found: dict[Region, None] = {}
     for line in removed:
         found.setdefault(_region_for_old_line(old, line))
     for line in added:
         found.setdefault(_region_for_new_line(old, new, line))
-    return [replace(r, statements=touched_statements(r, old, new))
-            for r in found if not _unchanged(r, old, new)]
+    return [replace(r, statements=touched_statements(r, old, new, same))
+            for r in found if not _unchanged(r, old, new, same)]
 
 
 # ── statement-level view of a function edit ──────────────────────────────────
@@ -254,7 +356,8 @@ _SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda,
            ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
-def touched_statements(region: Region, old: Scopes, new: Scopes) -> tuple[tuple[int, int], ...] | None:
+def touched_statements(region: Region, old: Scopes, new: Scopes,
+                       same: SameAst | None = None) -> tuple[tuple[int, int], ...] | None:
     """OLD-file line spans of the statements an edit touches inside one def, or None.
 
     Walks the old and new def bodies in parallel. Equal statements are skipped. A touched
@@ -281,7 +384,7 @@ def touched_statements(region: Region, old: Scopes, new: Scopes) -> tuple[tuple[
     if _header(o) != _header(n) or _writes_shared_state(o) or _writes_shared_state(n):
         return None
     spans: list[tuple[int, int]] = []
-    if not _diff_bodies(o.body, n.body, spans) or not spans:
+    if not _diff_bodies(o.body, n.body, spans, same or SameAst()) or not spans:
         return None
     return tuple(spans)
 
@@ -293,12 +396,13 @@ def _header(node: ast.stmt) -> list[str]:
             for k, v in ast.iter_fields(node) if k not in _STMT_LISTS]
 
 
-def _diff_bodies(old: list[ast.stmt], new: list[ast.stmt], spans: list[tuple[int, int]]) -> bool:
+def _diff_bodies(old: list[ast.stmt], new: list[ast.stmt], spans: list[tuple[int, int]],
+                 same: SameAst) -> bool:
     """Append the spans of touched statements; False when the edit is not in place."""
     if len(old) != len(new):
         return False
     for a, b in zip(old, new):
-        if ast.dump(a) == ast.dump(b):
+        if same(a, b):
             continue
         if not _same_scoping(a, b):
             return False
@@ -316,7 +420,7 @@ def _diff_bodies(old: list[ast.stmt], new: list[ast.stmt], spans: list[tuple[int
             first_body = min(getattr(a, k)[0].lineno for k in lists if getattr(a, k))
             spans.append((a.lineno, max(a.lineno, first_body - 1)))
         for k in lists:
-            if not _diff_bodies(getattr(a, k), getattr(b, k), spans):
+            if not _diff_bodies(getattr(a, k), getattr(b, k), spans, same):
                 return False
     return True
 
