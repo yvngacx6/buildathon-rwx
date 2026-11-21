@@ -46,6 +46,7 @@ import os
 import pickle
 import sys
 import zipfile
+import zlib
 
 CALL_CAP = int(os.environ.get("DIFFEXEC_CALL_CAP", "50000"))
 STORE_BUDGET = float(os.environ.get("DIFFEXEC_STORE_BUDGET", "13.5e6"))
@@ -69,6 +70,9 @@ def _records(path: str):
                 item = pickle.load(fh)
                 if item is None:
                     return
+                if head.get("zlib"):
+                    for b in item[1]["blobs"].values():
+                        b[0] = zlib.decompress(b[0])
                 yield item
     return head, gen()
 

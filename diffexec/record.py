@@ -22,6 +22,7 @@ import os
 import pickle
 import sys
 import time
+import zlib
 import tracemalloc as _tracemalloc
 
 from diffexec import serial
@@ -39,6 +40,8 @@ INPUT_CAP = int(float(os.environ.get("DIFFEXEC_INPUT_CAP", "16e3")))  # one call
 # An input over INPUT_CAP is pickled again with every list / dict / set of more than ELIDE_K
 # items replaced by a length-only stand-in (serial.Elided). Still over: phase incomplete.
 ELIDE_K = int(os.environ.get("DIFFEXEC_ELIDE_K", "32"))
+# Keep stored inputs zlib-compressed in memory (the recorder of a big test file holds GBs).
+REC_ZLIB = os.environ.get("DIFFEXEC_REC_ZLIB", "1") == "1"
 _ETK = os.environ.get("DIFFEXEC_ELIDE_TUPLE_K", "")  # elide long tuples too (default: off)
 ELIDE_TUPLE_K = int(_ETK) if _ETK else None
 # Safety only (worker-dependent): pickling seconds per function per worker. Default: off.
@@ -178,7 +181,7 @@ def _start(code, offset):
         blob = rec.blobs.get(h)
         if blob is None and rec.nbytes + len(data) <= BYTE_CAP:
             rec.nbytes += len(data)
-            blob = rec.blobs[h] = [data, None, "ok", 0]
+            blob = rec.blobs[h] = [zlib.compress(data, 1) if REC_ZLIB else data, None, "ok", 0]
             stats["elided"] += elided is not None
     if h is None or blob is None:
         # unpicklable, too big even with elision, or over this function's byte budget: the
@@ -331,7 +334,8 @@ def pytest_sessionfinish(session):
     # header {"stats", "failed", "format": 2}, then one (key, record) per function, then None.
     wid = os.environ.get("DIFFEXEC_TAG") or os.environ.get("PYTEST_XDIST_WORKER", "main")
     with open(os.path.join(OUT, f"rec_{wid}.pkl"), "wb") as fh:
-        pickle.dump({"stats": stats, "failed": sorted(failed_tests), "format": 2}, fh, protocol=5)
+        pickle.dump({"stats": stats, "failed": sorted(failed_tests), "format": 2, "zlib": REC_ZLIB},
+                    fh, protocol=5)
         for rec in recs.values():
             pickle.dump((rec.key, {"dead": rec.dead, "calls": rec.calls, "secs": rec.secs,
                                    "nbytes": rec.nbytes, "blobs": rec.blobs, "uses": rec.uses}),
