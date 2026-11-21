@@ -62,8 +62,9 @@ if pid == 0:
     run = sum(p[2] for p in per)
     bad = [p[0] for p in per if not p[4]]
     print(f"child total {tot:.2f}s (load tables {load:.2f}, queries {run:.2f}); mismatches {bad}")
-    for p in sorted(per, key=lambda p: -p[2])[:12]:
+    for p in sorted(per, key=lambda p: -p[2])[:60]:
         print(f"  q{p[0]}: load {p[1]:.3f} run {p[2]:.3f} est {p[3]:.3f}")
+    sys.stdout.flush()
     os._exit(0)
 t1 = os.times()
 os.waitpid(pid, 0)
