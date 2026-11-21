@@ -428,17 +428,26 @@ class SubTest:
         if got is None:
             return set(), "subtest: keep (set-up touched / unknown / unstable)"
         per, cpu = got
-        # cheapest first: drop the tests whose verification pays off
-        chosen, todo, est = set(), [], 0.0
-        for n in sorted(per, key=lambda n: sum(self._cpu(x) for x in per[n])):
-            qs = [x for x in per[n] if x not in todo]
-            c = sum(self._cpu(x) for x in qs) + (0.3 if qs and not todo else 0.0)  # fork, swap, tables
-            trial = chosen | {n}
-            spend = SCORER_SLOWDOWN * (est + c)
-            gain = benefit_of(trial)
-            if gain > 0 and spend <= min(BUDGET_S, SHARE * gain / 1000):
-                chosen, est = trial, est + c
-                todo.extend(qs)
+        # r26: every subset of the (at most 3) candidates, best net saving. Greedy cheapest-
+        # first never dropped test_execute_tpch / test_optimized_tpch next to tpcds: alone
+        # they save nothing (tpcds is the long pole), and they were not reconsidered once
+        # tpcds was chosen.
+        import itertools
+        best = (0.0, set(), [], 0.0)
+        nums = sorted(per)
+        for r in range(1, len(nums) + 1):
+            for subset in itertools.combinations(nums, r):
+                todo = []
+                for n in subset:
+                    todo.extend(x for x in per[n] if x not in todo)
+                est = sum(self._cpu(x) for x in todo) + (0.3 if todo else 0.0)  # fork, swap, tables
+                spend = SCORER_SLOWDOWN * est
+                gain = benefit_of(set(subset))
+                if gain > 0 and spend <= min(BUDGET_S, SHARE * gain / 1000):
+                    net = gain / 1000 - spend
+                    if net > best[0]:
+                        best = (net, set(subset), todo, est)
+        _, chosen, todo, est = best
         if not chosen:
             return set(), f"subtest: keep (est {cpu:.1f}s CPU for {sum(map(len, per.values()))} queries)"
         if not todo:
