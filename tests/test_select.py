@@ -287,3 +287,70 @@ def test_bindings_detects_removed_names():
     old = _ast.parse("def record(): pass\nclass A:\n    X = 1\n    def f(self): pass\n")
     new = _ast.parse("def record2(): pass\nclass A:\n    X = 1\n    def g(self): pass\n")
     assert _bindings(old) - _bindings(new) == {"record", "A.f"}
+
+
+# ── import bound (imports map) ───────────────────────────────────────────────
+
+IMPORTS = {"sqlglot/other.py": [A], "sqlglot/lib.py": [A, C, D], "sqlglot/parser.py": [A, B, C, D],
+           "sqlglot/fourth.py": [B], "tests/test_lib.py": [A, B], "<isolation-failure>": []}
+
+
+def _with_imports(selector: Selector, tmp_path: Path, mapping: dict) -> Selector:
+    body = {"tests": T[:4], "map": mapping}  # U is untraced: always added
+    (tmp_path / "maps" / "imports.json.gz").write_bytes(gzip.compress(json.dumps(body).encode()))
+    return Selector(selector.tests, selector.sqlglot, tmp_path / "maps")
+
+
+@pytest.fixture
+def bounded(selector: Selector, tmp_path: Path) -> Selector:
+    return _with_imports(selector, tmp_path, IMPORTS)
+
+
+def test_syntax_error_selects_tests_that_load_the_module(bounded):
+    assert run(bounded, edit("sqlglot/lib.py", "return sql\n", "return sql +\n")) == {A, C, D, U}
+
+
+def test_deleted_module_selects_tests_that_load_it(bounded):
+    assert run(bounded, patch("sqlglot/other.py", OTHER, None)) == {A, U}
+
+
+def test_renamed_module_selects_tests_that_load_the_old_path(bounded):
+    text = ("--- a/sqlglot/other.py\n+++ b/sqlglot/moved.py\n@@ -1 +1 @@\n"
+            "-from sqlglot.lib import Dialect\n+from sqlglot.lib import Dialect\n")
+    assert run(bounded, text) == {A, U}
+
+
+def test_rule_that_gives_up_falls_back_to_import_bound(bounded):
+    # module-level import change and base-class body were ALL
+    assert run(bounded, edit("sqlglot/other.py", "from sqlglot.lib import Dialect",
+                             "from sqlglot.lib import Dialect, LIMIT")) == {A, U}
+    assert run(bounded, edit("sqlglot/parser.py", "STRICT = False", "STRICT = True")) == ALL
+
+
+def test_hunk_that_does_not_apply_still_selects_all(bounded):
+    assert run(bounded, patch("sqlglot/lib.py", "nothing like the file\n", "x\n")) == ALL
+
+
+def test_removed_binding_selects_tests_that_load_the_module(bounded):
+    # Dialect is imported by other.py → the removal is visible → import bound of lib.py
+    assert run(bounded, edit("sqlglot/lib.py", "class Dialect:", "class Dialect2:")) == {A, C, D, U}
+
+
+def test_unreferenced_removed_function_uses_normal_rules(bounded):
+    old = FILES["sqlglot/fifth.py"]
+    new = old.replace("def f():", "def g():")  # nothing else names f
+    assert run(bounded, patch("sqlglot/fifth.py", old, new)) == {B, U}
+
+
+def test_module_nothing_loads_selects_only_unknown_tests(bounded):
+    # only the untraced test U, which the map cannot vouch for
+    assert run(bounded, patch("sqlglot/third.py", FILES["sqlglot/third.py"], None)) == {U}
+
+
+def test_isolation_failures_join_the_bound(selector, tmp_path):
+    sel = _with_imports(selector, tmp_path, {**IMPORTS, "<isolation-failure>": [D]})
+    assert run(sel, patch("sqlglot/other.py", OTHER, None)) == {A, D, U}
+
+
+def test_test_file_syntax_error_selects_its_loaders(bounded):
+    assert run(bounded, edit("tests/test_lib.py", "assert True", "assert True +")) == {A, B, U}

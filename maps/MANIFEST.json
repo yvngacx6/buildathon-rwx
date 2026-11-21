@@ -9,5 +9,10 @@
   ],
   "build_command": "python3 mapbuild/convert_prototype.py sample/tests.json <sqlglot> maps",
   "notes": "lines = union of two coverage runs (test_function contexts, inline process pool with pickle round-trip); import-time ('') contexts dropped. classes track Dialect/Parser/Generator/Tokenizer/Expression hierarchies only. reads made by the first test of a setUpClass class are credited to the whole class. test_imports from a static AST scan.",
-  "date": "2026-11-20"
+  "date": "2026-11-20",
+  "imports": {
+    "build_command": "SKIP_INTEGRATION=0 <venv python> mapbuild/import_map.py sample/tests.json <scratch copy of sqlglot@eb11aec> maps -j12",
+    "built": "2026-11-20, laptop (python 3.13.12, sqlglot test deps incl. duckdb/pandas), not the pinned image",
+    "facts": "1620 tests each run alone (187 s at -j12), 244 modules, 0 isolation failures; lines-map whole-file sets and classes-map sets are subsets of it (0 violations). No labeled patch used."
+  }
 }

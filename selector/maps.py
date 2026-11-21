@@ -12,7 +12,8 @@ import gzip
 import json
 from pathlib import Path
 
-MAP_FILES = ("lines", "classes", "reads", "test_imports")
+MAP_FILES = ("lines", "classes", "reads", "test_imports", "imports")
+ISOLATION_FAILURE = "<isolation-failure>"  # imports map: tests whose record may be incomplete
 
 
 class Map:
@@ -60,7 +61,9 @@ class Maps:
         self.classes = Map(directory / "classes.json.gz", number_of)
         self.reads = Map(directory / "reads.json.gz", number_of)
         self.test_imports = Map(directory / "test_imports.json.gz", number_of)
+        self.imports = Map(directory / "imports.json.gz", number_of)
         self._file_index: dict[str, list[str]] | None = None
+        self._unvouched: frozenset[int] | None = None
         self._file_cache: dict[str, frozenset[int]] = {}
 
     def span(self, path: str, first: int, last: int) -> set[int]:
@@ -91,6 +94,17 @@ class Maps:
         for name in class_names:
             out |= self.classes.get(f"{module}.{name}")
         return out
+
+    def loaders(self, path: str) -> set[int] | None:
+        """Tests that load module `path` (imports map), plus every test the map cannot vouch
+        for (failed when run alone, or absent from the trace). None: no imports map."""
+        if not self.imports.path.is_file():
+            return None
+        if self._unvouched is None:
+            known = set(self.imports.traced_ids())
+            self._unvouched = self.imports.get(ISOLATION_FAILURE) | {
+                n for tid, n in self._number_of.items() if tid not in known}
+        return set(self.imports.get(path)) | self._unvouched
 
     def untraced(self) -> set[int]:
         """Tests of this run that appear in no map: we know nothing about them."""

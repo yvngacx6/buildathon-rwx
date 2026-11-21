@@ -8,7 +8,7 @@ here knows which tests any particular edit breaks.
   file                                   selection
   ─────────────────────────────────────  ───────────────────────────────────────────────
   .py, same syntax tree (or docstrings)  nothing
-  .py that does not parse after patch    ALL
+  .py that does not parse after patch    import bound: tests that load the module ∪ read it
   sqlglot/ function body                 tests that ran any line of the function (lines map)
     … signature / decorator              + users of the enclosing classes (classes map)
   sqlglot/ class body / module level,    tests that ran a line reading a changed name, ∩ the
@@ -23,10 +23,20 @@ here knows which tests any particular edit breaks.
   tests/ helper module                   importers (test_imports map)
   tests/fixtures/**                      tests that read the file (reads map); never AST-filtered
   new .py file (not conftest)            nothing: nothing at the pinned commit imports it
-  deleted / renamed .py file             ALL
+  deleted / renamed .py file             import bound of the old path
+  any rule above that gives up (removed  import bound of the module (instead of ALL)
+    binding, changed import, no known
+    users, base-class body, …)
   docs, *.md, benchmarks/, posts/        nothing
   pyproject.toml / setup.cfg             nothing, unless a pytest section changes → ALL
   anything else, or a hunk that fails    ALL
+
+Import bound (imports map, mapbuild/import_map.py): each test was run alone in a fresh
+process and every module it loaded was recorded (collection-time closure of its file, eager
+`import sqlglot` set, lazy dialect loads, function-level imports, subprocesses). An edit
+confined to one module can only reach tests that load it or read it as a file; a module
+that fails to import breaks exactly those. Tests that fail when run alone, or that the trace
+does not know, are always added. Without the map, or for a hunk that does not apply: ALL.
 
 Then: tests no map knows about join every non-empty selection, and a selection that would
 cost nearly as much as ALL becomes ALL (same price, no risk).
@@ -119,7 +129,8 @@ class Selector:
                 readers |= self.maps.reads.get(p)
             return readers, "fixture → readers"
         if fp.old_path and fp.new_path and fp.old_path != fp.new_path:
-            raise AllTests(f"{path} renamed")
+            # The old module is gone; nothing at the pinned commit imports the new path.
+            return self._import_bound(fp.old_path, f"{fp.old_path} renamed")
         if name in ALWAYS_ALL:
             raise AllTests(f"{path} is test configuration")
         if path.startswith(DOC_DIRS) or path.endswith(DOC_SUFFIXES) or name in DOC_FILES:
@@ -136,8 +147,24 @@ class Selector:
                 return set(), "new module, nothing imports it"
             raise AllTests(f"{path}: new file outside sqlglot/ and tests/")
         if fp.new_path is None:
-            raise AllTests(f"{path} deleted")
-        return self._python(fp)
+            return self._import_bound(path, f"{path} deleted")
+        try:
+            return self._python(fp)
+        except AllTests as exc:
+            if str(exc).startswith(f"{path}: hunk"):
+                raise
+            # Every narrower rule gave up: fall back to the import bound of this one module.
+            return self._import_bound(path, str(exc))
+
+    def _import_bound(self, path: str, why: str) -> tuple[set[int], str]:
+        """Every test an edit confined to module `path` can reach: the tests that load it
+        (imports map: its import closure, traced per test in a fresh process, lazy loads
+        included) ∪ the tests that read it as a file. If it stops importing, these break."""
+        loaders = self.maps.loaders(path)
+        if (loaders is None or not path.endswith(".py") or name_of(path) in ALWAYS_ALL
+                or not path.startswith(("sqlglot/", "tests/"))):
+            raise AllTests(why)
+        return loaders | self.maps.reads.get(path), f"{why} → tests that load it"
 
     def _config(self, fp: diff.FilePatch) -> tuple[set[int], str]:
         """pyproject.toml / setup.cfg: only pytest sections can change a test run."""
@@ -161,17 +188,20 @@ class Selector:
         try:
             old_text = old_bytes.decode("utf-8")
             new_text = diff.apply(old_text, fp)
+        except (diff.PatchError, UnicodeDecodeError) as exc:
+            raise AllTests(f"{path}: hunk does not apply ({type(exc).__name__})") from None
+        try:
             old_tree = ast.parse(old_bytes)
             new_tree = ast.parse(new_text.encode("utf-8"))
             compile(new_tree, path, "exec")
-        except (diff.PatchError, SyntaxError, ValueError, UnicodeDecodeError) as exc:
+        except (SyntaxError, ValueError) as exc:  # the module no longer imports
             raise AllTests(f"{path}: {type(exc).__name__}") from None
         classify.strip_docstrings(old_tree)
         classify.strip_docstrings(new_tree)
         if ast.dump(old_tree) == ast.dump(new_tree):
             return set(), "same syntax tree (ignoring comments and docstrings)"
         lost = _bindings(old_tree) - _bindings(new_tree)
-        if lost:
+        if lost and not self._unreferenced(path, lost, new_text):
             # A removed/renamed module- or class-level name breaks every importer or caller
             # (ImportError at collection, AttributeError at call) – far beyond its own tests.
             raise AllTests(f"{path}: binding removed ({', '.join(sorted(lost)[:3])})")
@@ -184,6 +214,24 @@ class Selector:
         if path.startswith("sqlglot/"):
             return self._library(path, old_tree, new_tree, found)
         raise AllTests(f"{path}: .py outside sqlglot/ and tests/")
+
+    def _unreferenced(self, path: str, lost: set[str], new_text: str) -> bool:
+        """True when every removed binding is a plain module-level name (not a class member,
+        not a dunder) that nothing can still reach by name: neither the new module text nor
+        any other file under sqlglot/ or tests/ mentions it (as code or as a string). Then
+        the removal itself is invisible and the edit's other regions decide.
+        """
+        if path.startswith("tests/") or name_of(path) == "__init__.py":
+            return False
+        if any("." in n or n.startswith("__") for n in lost):
+            return False
+        mentions = re.compile(r"\b(" + "|".join(map(re.escape, sorted(lost))) + r")\b")
+        if mentions.search(new_text):
+            return False
+        try:
+            return not self._importers(path, lost)
+        except AllTests:  # star-imported
+            return False
 
     # ── tests/*.py ────────────────────────────────────────────────────────────
 

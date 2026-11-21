@@ -29,16 +29,25 @@ Every rule is about code structure; no rule names an edit kind as harmless or ma
 | `selector/nameindex.py` | Build-time step (`python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl`, in the Dockerfile) that stores the `names.py` scan as tables; run time loads it lazily (only class/module edits) and checks a source fingerprint, else builds in memory. For local eval run the same command with your `BR_SQLGLOT` and `index/names.pkl` (gitignored). |
 | `selector/maps.py` | Lazy gz map loading (maps/SCHEMA.md), id → number via the run's tests.json. |
 | `selector/pack.py` | Choose worker count and split tests (scorer cost model). |
+| `mapbuild/import_map.py` | Builds `maps/imports.json.gz`: runs every test alone in a fresh pytest process with `mapbuild/importtrace/sitecustomize.py` on PYTHONPATH (audit "import" hook, also in subprocesses / spawned pool workers) and records each module it loads. Selector use: the import bound (below). |
 | `mapbuild/convert_prototype.py` | INTERIM: convert the laptop prototype maps (research reports 02 and 05) into the SCHEMA format. |
 | `maps/` | `lines`, `classes`, `reads`, `test_imports` (.json.gz) + `MANIFEST.json`. |
 | `eval/evaluate.py` | Score the selector on `sample/` and the private set, without Docker. |
 | `tests/test_select.py` | One unit test per rule, on a tiny fake repo (`python -m pytest tests/`). |
 | `tests/test_names.py` | The I08 narrowing and each of its fallbacks. |
 
-Safety nets: hunk does not apply / does not parse → ALL; definition-time change with no known
-users → ALL; module-level non-assignment change → ALL; base-class bodies (`BASE_FILES`) → ALL;
+Import bound (r2-importclosure): an edit confined to one module can only reach tests that load
+that module (imports map) or read it as a file (reads map); if the module stops importing,
+exactly those tests error. Used for: new text that does not parse, deleted / renamed .py
+files (old path), removed bindings, and every rule below that would otherwise answer ALL.
+A removed plain module-level name that no other file mentions goes through the normal rules.
+
+Safety nets: hunk does not apply → ALL; does not parse → import bound; definition-time change
+with no known users → import bound; module-level non-assignment change → import bound;
+base-class bodies (`BASE_FILES`) → import bound (≈ ALL: 1617 tests load them);
 a function no test ran is treated as definition-time code (it may run only at import);
-tests that no map knows join every non-empty selection.
+tests that no map knows join every non-empty selection. Without the imports map, every
+"import bound" above is ALL.
 
 ## History
 
@@ -47,3 +56,4 @@ tests that no map knows join every non-empty selection.
 | v0 | 2026-11-20 | No-op filter + ALL + optimal packing | 994.1 |
 | v1 | 2026-11-20 | PLAN §3 table on interim prototype maps (function / class / module regions, reads, test imports) | 198.8 |
 | r1-attrnarrow | 2026-11-20 | I08: name-reader narrowing of class / module assignments; lambda call lines | 185.0 |
+| r2-importclosure | 2026-11-20 | I16: import bound (traced per-test import closure) instead of ALL | 185.0 (private264 3453.9 → 2873.9) |

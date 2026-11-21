@@ -17,6 +17,7 @@ Test ids are pytest node ids exactly as in `tests.json` `"id"` (for example
 | `classes.json.gz` | `"<module>.<Qualname>"`, e.g. `"sqlglot.dialects.tsql.TSQL"` | instantiated that class or a subclass of it (MRO), or used it as a dialect |
 | `reads.json.gz` | `"<repo path>"`, e.g. `"tests/fixtures/optimizer/simplify.sql"` | opened that file for reading |
 | `test_imports.json.gz` | `"<repo path of a module under tests/>"` | live in a test file that imports it (directly or transitively) |
+| `imports.json.gz` | `"<repo path of a module>"`, e.g. `"sqlglot/dialects/duckdb.py"`; plus `"<isolation-failure>"` | loaded that module when run alone in a fresh pytest process (its file's collection-time import closure + run-time lazy loads, subprocesses and pool workers included). `<isolation-failure>`: tests that failed alone (their record may be incomplete). Built by `mapbuild/import_map.py`. |
 | `MANIFEST.json` | — | sqlglot sha, image digest, number of tests traced, build command, date |
 
 The selector derives function-level sets at run time: tests of a function = union of
