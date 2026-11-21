@@ -125,6 +125,22 @@ droppable. Effect digests use the C pickler (identity-independent for immutables
 under a global byte budget by lines(f) × (seconds a change of f could save)^1.5 per byte
 (tests.json seconds; no labels).
 
+Round 16 (r16-allcut): **import-time edits by state readers.** (1) A function body run while
+modules are imported (`import sqlglot` → was ALL; a module's import → its dependents) now
+takes, when the patched package imports and it is cheaper, the readers of every value the
+import-state diff shows changed (`_import_state_users`, `_state_readers` unbounded as in
+`_removed_bindings`) ∪ its run-time runners ∪ the dependents of every test module whose own
+import runs sqlglot code (testimport: not explained; all test modules when the map collapsed
+the lines to `import sqlglot`). A changed value nobody is seen reading is accepted only when
+the lines also run under tests. (2) Class-creation hooks (`__init_subclass__`, metaclass
+methods; base files were ALL) use the same rule over the hook's lines (`_class_hook`); the
+hook's own entry is skipped; a class table it mutates in place adds the tests naming it,
+unless the hook first binds it to a fresh object (`_fresh_tables`). (3) A class / module body
+with "no known users" tries the unbounded import-state narrowing before ALL; TypedDict key sets
+(`__total__`, `__required_keys__`, …) are data: their readers are the tests that ran a line
+naming the class (subclassing at run time), Fallback if any code spells the dunder or holds
+the class at import.
+
 Round 13 (r13-last): **default-value edits.** When every change in a file is a literal default
 of a def (bool / int / finite float / str / None → another such literal; `select._default_changes`
 compares the two ASTs with all defaults blanked) and no code in sqlglot/ or tests/ reads

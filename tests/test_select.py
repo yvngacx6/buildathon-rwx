@@ -482,7 +482,27 @@ def test_function_run_by_import_sqlglot_with_unchanged_import_state(selector):
 
 
 def test_function_run_by_import_sqlglot_with_changed_import_state_selects_all(selector):
-    selector._state_diff = lambda: {"changed": ["M sqlglot.tenth VALUE"]}
+    # A changed value no test is seen reading, and the function never runs under a test:
+    # the name index may be blind to the reader → ALL.
+    selector._state_diff = lambda: {"changed": ["M sqlglot.tenth NOBODY_READS"], "info": {},
+                                    "instances": []}
+    assert run(selector, edit("sqlglot/tenth.py", "return 1", "return 2")) == ALL
+
+
+def test_function_run_by_import_sqlglot_selects_readers_of_changed_state(selector):
+    # What boot() built at import differs only in fourth.VALUE: its run-time readers
+    # (fifth.py:5, run by B) can see the edit. The fake test modules count as running
+    # sqlglot code at import (testimport): their dependents (A, B) join.
+    selector._state_diff = lambda: {"changed": ["M sqlglot.fourth VALUE"], "info": {},
+                                    "instances": []}
+    assert run(selector, edit("sqlglot/tenth.py", "return 1", "return 2")) == {A, B, U}
+    selector._test_imports = type("Explained", (), {"explained_for": lambda *a: True})()
+    selector._state = False
+    assert run(selector, edit("sqlglot/tenth.py", "return 1", "return 2")) == {B, U}
+
+
+def test_function_run_by_import_sqlglot_unimportable_selects_all(selector):
+    selector._state_diff = lambda: None
     assert run(selector, edit("sqlglot/tenth.py", "return 1", "return 2")) == ALL
 
 
