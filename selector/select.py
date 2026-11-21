@@ -791,6 +791,9 @@ class Selector:
         readers = self._code_readers()
         if readers is None:
             return None
+        loaders = self.maps.loaders(path)  # a code object is reachable only once loaded
+        if loaders is not None:
+            readers &= loaders
         return readers, f"{what} never ran under a test nor at import"
 
     def _code_readers(self) -> set[int] | None:
