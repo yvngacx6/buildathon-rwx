@@ -70,6 +70,7 @@ MON.set_events(TOOL, MON.events.PY_START)
 import builtins  # noqa: E402
 import io  # noqa: E402
 _real_open = io.open
+_REAL_FORK = os.fork
 warm_opened: set = set()
 patched_files: dict = {}  # abs path -> new text (non-.py files), child only
 
@@ -666,7 +667,7 @@ def _cf_case(self, to, meta, sql, expected, title, func, pretty, execute, kwargs
 def fork_call(fn):
     """Run fn() in a forked child; return its picklable result (None if it died)."""
     r, w = os.pipe()
-    pid = os.fork()
+    pid = _REAL_FORK()
     if pid == 0:
         os.close(r)
         try:
@@ -708,6 +709,7 @@ def record_test(n):
 
     def enum():
         U.mode, U.occ, U.log = "enum", Counter(), []
+        untrusted_flag[0] = False
         c0 = cpu()
         failed = run_one_test(n)
         return {"failed": failed, "units": U.log, "cpu": cpu() - c0, "untrusted": untrusted_flag[0]}
@@ -807,44 +809,63 @@ def sliced_child(commit, patch_text, numbers, store):
         apply_swaps(f, s)
     install_units()
     info["prep_cpu"] = cpu() - t0
-    res = {}
+    res, plans = {}, []
     for n in numbers:
         rec = store['tests'].get(n)
-        if rec is None or rec.get("failed") or rec.get("untrusted") or "units" not in rec:
+        if rec is None or rec.get("failed") or "units" not in rec:
             res[n] = {"v": "nostore"}
             continue
-        skip, sigs, aff = set(), {}, 0
+        skip, sigs, aff, pred = set(), {}, 0, 0.0
         for key, disc, sig, ucpu, ok, lines in rec["units"]:
             key = tuple(key)
-            if not disc or ok is not True:
-                continue  # not skippable / not recorded cleanly: runs for real
-            if not changed.isdisjoint(lines):
+            if not disc or ok is not True or not changed.isdisjoint(lines):
                 aff += 1
+                pred += ucpu
                 continue
             skip.add(key)
             sigs[key] = sig
+        plans.append((n, skip, sigs, aff, pred, len(rec["units"])))
 
-        def go(n=n, skip=skip, sigs=sigs):
+    def go_all():
+        out, setup = {}, {}
+        signal.signal(signal.SIGPROF, _alarm)
+        for n, skip, sigs, aff, pred, nu in plans:
+            cls, meth = resolve(by_num[n]["id"])
+            ck = f"{cls.__module__}.{cls.__qualname__}"
+            if ck not in setup:
+                c0 = cpu()
+                try:
+                    if hasattr(cls, "setUpClass"):
+                        cls.setUpClass()
+                    setup[ck] = cpu() - c0
+                except BaseException:  # noqa: BLE001
+                    setup[ck] = None
             U.mode, U.occ, U.skip, U.sigs = "run", Counter(), skip, sigs
             U.n_skipped = U.n_ran = U.mismatch = 0
+            untrusted_flag[0] = False
             c0 = cpu()
-            cap = max(2.0, 10 * by_num[n]["seconds"])
-            signal.signal(signal.SIGPROF, _alarm)
-            signal.setitimer(signal.ITIMER_PROF, cap, 0.05)
-            try:
-                failed = run_one_test(n)
-            except Timeout:
-                failed = True
-            finally:
-                signal.setitimer(signal.ITIMER_PROF, 0)
-            return {"failed": bool(failed), "cpu": cpu() - c0, "skipped": U.n_skipped, "ran": U.n_ran,
-                    "mismatch": U.mismatch, "untrusted": untrusted_flag[0]}
+            failed = setup[ck] is None
+            if not failed:
+                signal.setitimer(signal.ITIMER_PROF, max(2.0, 10 * by_num[n]["seconds"]), 0.05)
+                try:
+                    result = Result()
+                    cls(meth).run(result)
+                    failed = bool(result.failed or result.errors or result.failures)
+                except Timeout:
+                    failed = True
+                finally:
+                    signal.setitimer(signal.ITIMER_PROF, 0)
+            out[n] = {"failed": failed, "cpu": cpu() - c0, "skipped": U.n_skipped, "ran": U.n_ran,
+                      "mismatch": U.mismatch, "untrusted": untrusted_flag[0], "affected": aff,
+                      "pred": pred, "n_units": nu, "cls": ck}
+        return {"tests": out, "setup": setup}
 
-        r = fork_call(go) or {"failed": True, "died": True}
-        r["affected"] = aff
-        r["n_units"] = len(rec["units"])
-        r["v"] = "fail" if (r.get("failed") or r.get("untrusted") or r.get("crash")) else "pass"
-        res[n] = r
+    r = fork_call(go_all) or {"tests": {}, "setup": {}, "died": True}
+    for n, skip, sigs, aff, pred, nu in plans:
+        t = r["tests"].get(n, {"failed": True, "died": True})
+        t["v"] = "fail" if (t.get("failed") or t.get("untrusted") or t.get("died")) else "pass"
+        res[n] = t
+    info["setup"] = r.get("setup", {})
     info["tests"] = res
     info["run_cpu"] = cpu() - t0
     return info
