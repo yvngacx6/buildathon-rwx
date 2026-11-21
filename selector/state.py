@@ -19,8 +19,9 @@ function region, handled by the line map), objects by class and attributes. A cl
 is a reference; its own entries are compared separately.
 
 The old snapshot is built at image build (`python -m selector.nameindex build` writes it next
-to the name index); the patched one runs in a subprocess at run time (~0.3 s CPU with the
-build-time bytecode cache). Any import error, timeout or surprise → None (caller falls back).
+to the name index); the patched one runs in a subprocess at run time (~0.8 s container CPU on
+the loaded EC2 box, ~0.35 s on a laptop, with the build-time bytecode cache: about 1/3 import,
+1/2 digest). Any import error, timeout or surprise → None (caller falls back).
 
 Runs in a fresh interpreter, so the selector process never imports sqlglot (`_run`):
     PYTHONHASHSEED=0 python -P -s -S selector/state.py snap <sqlglot root> <out.pkl>

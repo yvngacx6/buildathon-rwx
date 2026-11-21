@@ -87,8 +87,9 @@ CONFIG_FILES = {"pyproject.toml", "setup.cfg"}
 ALWAYS_ALL = {"pytest.ini", "tox.ini", "conftest.py", "setup.py"}
 ALL_FRACTION = 0.85  # selection cost ≥ this × ALL cost → just run ALL
 SLOW_SECONDS = 5.0  # tests at least this slow get the statement-level rule in function bodies
-# An import-state diff costs ~1.2 s of container CPU (EC2, pinned image). Run it only when the
-# wide set costs at least this much more than the cheapest selection it could give.
+# An import-state diff cost ~1.2 s of container CPU when this gate was set (now ~0.8 s on a
+# loaded EC2 box, r3-cpu). Run it only when the wide set costs at least this much more than
+# the cheapest selection it could give.
 STATE_MIN_GAIN = 2.0
 # Class hierarchies the classes map records (maps/MANIFEST.json notes): a test that made an
 # instance of one of these classes (or used it as a dialect) is credited to it and its bases.
