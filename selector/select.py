@@ -42,7 +42,8 @@ here knows which tests any particular edit breaks.
   tests/ module-level assignment         readers of the changed names (as for sqlglot/)
   tests/ other test-file code            the file's tests ∪ importers (test_imports map)
   tests/ helper module (otherwise)       importers (test_imports map)
-  tests/fixtures/**                      tests that read the file (reads map); never AST-filtered
+  tests/fixtures/**                      tests that read the file (reads map), minus readers whose consumed
+                                         loader view is unchanged (r27, selector/fixtures.py); never AST-filtered
   new .py file (not conftest)            nothing: nothing at the pinned commit imports it
   deleted / renamed .py file             import bound of the old path
   any rule above that gives up (removed  import bound of the module (instead of ALL)
@@ -319,6 +320,32 @@ class Selector:
 
     # ── one file ──────────────────────────────────────────────────────────────
 
+    def _fixture_views(self, fp: diff.FilePatch, readers: set[int]) -> tuple[set[int], str]:
+        """r27: drop the readers whose consumed part of the pinned loader output is unchanged
+        (selector/fixtures.py). Anything unusual → every reader."""
+        plain = (readers, "fixture → readers")
+        path = fp.path
+        if (not readers or fp.is_binary or fp.old_path != fp.new_path or not path.endswith(".sql")
+                or os.environ.get("BR_FIXTURE_VIEWS", "1") == "0"):
+            return plain
+        # The consumer table is read from the pinned test code: any other test-code edit in
+        # the commit (helpers, test modules, conftest) → plain rule.
+        if any(f.path.startswith("tests/") and not f.path.startswith("tests/fixtures/")
+               for f in self._files):
+            return plain
+        try:
+            from .fixtures import FixtureRule
+            if getattr(self, "_fixture_rule", None) is None:
+                self._fixture_rule = FixtureRule(self.sqlglot)
+            old = (self.sqlglot / path).read_bytes()
+            new = diff.apply(old.decode("utf-8"), fp).encode("utf-8")
+            pinned_code = not any(f.path.endswith(".py") for f in self._files)
+            ids = {self._id_of[n]: n for n in readers}
+            kept, note = self._fixture_rule.narrow(path, old, new, sorted(ids), pinned_code)
+        except Exception as e:  # noqa: BLE001
+            return readers, f"fixture → readers (views: {type(e).__name__})"
+        return {ids[t] for t in kept}, f"fixture → readers, {note}"
+
     def _select_file(self, fp: diff.FilePatch) -> tuple[set[int], str]:
         path = fp.path
         name = PurePosixPath(path).name
@@ -328,7 +355,7 @@ class Selector:
             readers = set()
             for p in {fp.old_path, fp.new_path} - {None}:
                 readers |= self.maps.reads.get(p)
-            return readers, "fixture → readers"
+            return self._fixture_views(fp, set(readers))
         if fp.old_path and fp.new_path and fp.old_path != fp.new_path:
             # The old module is gone; nothing at the pinned commit imports the new path –
             # unless the new path is one pytest or Python picks up by itself.
