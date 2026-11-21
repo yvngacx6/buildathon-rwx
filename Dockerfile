@@ -27,12 +27,14 @@ ENV PYTHONDONTWRITEBYTECODE=1
 #  * the per-query line coverage and pinned outputs of the TPC executor tests
 #    (selector/subtest.py, ~30 s)
 #  * the phase lines and errors.py frontier calls of test_max_nodes (selector/slowverify.py)
+#  * which test classes probe resources (selector/diffexec.py `_is_resource`)
 RUN python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')" \
     /opt/sqlglot/sqlglot /app/selector /app/diffexec \
  && python -m selector.maps build /app/maps /app/index/maps \
  && python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl \
  && PYTHONHASHSEED=0 python -m selector.subtest build /opt/sqlglot /app/index/subtest.zip \
  && PYTHONHASHSEED=0 python -m selector.slowverify build /opt/sqlglot /app/index/slowverify.pkl \
+ && python -m selector.diffexec resources /opt/sqlglot /app/index/resources.pkl \
  && chmod -R a+rX /app /opt/sqlglot
 # -S: no site module (the selector needs only the standard library).
 CMD ["python", "-S", "-m", "selector"]

@@ -150,6 +150,54 @@ def main() -> None:
     print(json.dumps(run_request(json.load(sys.stdin))))
 
 
+_META: dict = {}  # store path → its index.pkl (see `warm`)
+_OLD_CODE: dict = {}  # file → compiled pinned source
+_NEW_CODE: dict = {}  # (file, patched text) → compiled patched source
+
+
+def _store_meta(store: zipfile.ZipFile, path: str) -> dict:
+    meta = _META.get(path)
+    if meta is None:
+        meta = _META[path] = pickle.loads(store.read("index.pkl"))
+    return meta
+
+
+def _old_code(filename: str):
+    code = _OLD_CODE.get(filename)
+    if code is None:
+        with open(filename, "rb") as fh:
+            code = _OLD_CODE[filename] = compile(fh.read(), filename, "exec", dont_inherit=True)
+    return code
+
+
+def _new_code(filename: str, text: str):
+    key = (filename, text)
+    code = _NEW_CODE.get(key)
+    if code is None:
+        if len(_NEW_CODE) > 8:  # one commit's files at a time, roughly
+            _NEW_CODE.clear()
+        code = _NEW_CODE[key] = compile(text.encode(), filename, "exec", dont_inherit=True)
+    return code
+
+
+def warm_files(root: str, files) -> None:
+    """Compile the pinned and the patched source of (path, new text) pairs into the caches."""
+    root = os.path.realpath(root)
+    for path, text in files:
+        filename = os.path.join(root, path)
+        _old_code(filename)
+        _new_code(filename, text)
+
+
+def warm(req: dict) -> None:
+    """In a parent that forks one replay per commit: load the store index and compile the
+    pinned files of this request once, so that every child inherits them (same objects the
+    child would build: read-only from here on)."""
+    with zipfile.ZipFile(req["store"]) as store:
+        _store_meta(store, req["store"])
+    warm_files(req["root"], [(f["path"], f["new_text"]) for f in req["files"]])
+
+
 def run_request(req: dict) -> dict:
     t_start = time.process_time()
     deadline = t_start + float(req.get("deadline_s", 20))
@@ -160,7 +208,7 @@ def run_request(req: dict) -> dict:
 
     out = {"bail": None, "codes": {}, "stats": {}}
     store = zipfile.ZipFile(req["store"])
-    meta = pickle.loads(store.read("index.pkl"))
+    meta = _store_meta(store, req["store"])
     index, tests = meta["functions"], meta.get("tests", ())
 
     match_ops = False  # a changed code object uses structural pattern matching
@@ -170,9 +218,8 @@ def run_request(req: dict) -> dict:
     for f in req["files"]:
         path = f["path"]
         filename = os.path.join(root, path)
-        with open(filename, "rb") as fh:
-            old_top = compile(fh.read(), filename, "exec", dont_inherit=True)
-        new_top = compile(f["new_text"].encode(), filename, "exec", dont_inherit=True)
+        old_top = _old_code(filename)
+        new_top = _new_code(filename, f["new_text"])
         old_codes, new_codes = _walk(old_top), _walk(new_top)
         if old_codes.keys() != new_codes.keys():
             out["bail"] = f"{path}: functions added, removed or reordered"

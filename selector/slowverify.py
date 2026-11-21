@@ -43,7 +43,7 @@ import time
 import zlib
 from pathlib import Path
 
-from .subtest import SCORER_SLOWDOWN, _Cov, _hit, _in_fork, _swap
+from .subtest import SCORER_SLOWDOWN, _Cov, _hit, _in_fork, _swap, _warm_code
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_STORE = REPO / "index" / "slowverify.pkl"
@@ -326,6 +326,7 @@ class SlowVerify:
         from .subtest import _warm
         root = str(self.sel.sqlglot)
         _warm(root)
+        _warm_code(root, jobs)
         budget = BUDGET_S / SCORER_SLOWDOWN
         rfd, wfd = os.pipe()
         t0 = os.times()
