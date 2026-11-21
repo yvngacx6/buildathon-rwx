@@ -90,7 +90,7 @@ def main() -> None:
             if key not in base:
                 table.setdefault(key, []).append(i)
     out.mkdir(parents=True, exist_ok=True)
-    data = {"tests": roots, "map": table}
+    data = {"tests": roots, "map": dict(sorted(table.items()))}  # sorted: byte-deterministic
     (out / "import_time.json.gz").write_bytes(
         gzip.compress(json.dumps(data, separators=(",", ":")).encode(), mtime=0))
     print(f"{len(roots)} roots, {len(base)} lines at `import sqlglot`, {len(table)} lines total; "
