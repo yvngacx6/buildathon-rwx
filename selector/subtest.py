@@ -52,6 +52,7 @@ SUITES = {"tpch": "optimizer/tpc-h/", "tpcds": "optimizer/tpc-ds/"}
 SCORER_SLOWDOWN = 2.0
 BUDGET_S = float(os.environ.get("BR_SUBTEST_S", "12"))
 SHARE = 0.6  # spend at most this share of what dropping saves
+FALLBACK_S = 1.5  # r26: pinned CPU of the queries re-run in full after a checkpoint mismatch
 
 
 # ── shared: what the test does for one query ─────────────────────────────────
@@ -777,6 +778,7 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
         return False
     import contextlib
     tables: dict = {}
+    fallback = 0.0
     with zipfile.ZipFile(store) as zf:
         for suite, i, opt, mode in todo:
             q = meta["suites"][suite][i]
@@ -801,6 +803,18 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
             want = (q["outs"].get("ck" if mode == "ck" else "exec") if not opt else None,
                     (q["outs"]["duck"] if (q["execute"] or opt) else None),
                     q["outs"].get("opt") if opt else None)
+            if (mode == "ck" and got != want and got[1:] == want[1:]
+                    and fallback + q["cpu_exec"] <= FALLBACK_S):
+                # the optimized tree differs: run this query in full (its result may still be
+                # the pinned one), within a small CPU allowance
+                fallback += q["cpu_exec"]
+                signal.setitimer(signal.ITIMER_PROF, 3 * q["cpu_exec"] + 0.8)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        got = run_query(q, meta["schemas"][suite], tabs, opt, "full")
+                    except Exception:  # noqa: BLE001
+                        return False
+                want = (q["outs"]["exec"], q["outs"]["duck"], None)
             if got != want:
                 if os.environ.get("SUBTEST_DEBUG"):
                     print("subtest diff:", suite, i, opt, file=sys.stderr)
