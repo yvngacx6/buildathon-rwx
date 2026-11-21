@@ -78,7 +78,11 @@ class DiffExec:
         if budget < 0.05:
             return None
         req = {"root": str(self.sel.sqlglot), "store": str(self.store), "deadline_s": budget,
-               "files": [{"path": p, "new_text": text} for p, text, _ in jobs]}
+               "files": [{"path": p, "new_text": text} for p, text, _ in jobs],
+               "defaults": [{"path": p, "name": name, "line": line,
+                             "params": {k: list(v) for k, v in params.items()}}
+                            for p, _, _ in jobs
+                            for name, line, params in getattr(self.sel, "_defaults", {}).get(p, ())]}
         if os.environ.get("PYTHONHASHSEED") == "0" and hasattr(os, "fork"):
             return self._replay_fork(req, budget)
         env = dict(os.environ, PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1")
