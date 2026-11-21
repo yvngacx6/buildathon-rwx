@@ -109,6 +109,21 @@ def _watch_calls(on: bool) -> None:
         _MON.set_events(_MON_TOOL, 0)
 
 
+_MATCH_OPS = {"MATCH_SEQUENCE", "MATCH_MAPPING", "MATCH_CLASS", "MATCH_KEYS"}
+
+
+def uses_match(code) -> bool:
+    """Does this code object, or one nested in it, use structural pattern matching?"""
+    import dis
+    todo = [code]
+    while todo:
+        c = todo.pop()
+        if any(i.opname in _MATCH_OPS for i in dis.get_instructions(c)):
+            return True
+        todo.extend(k for k in c.co_consts if isinstance(k, types.CodeType))
+    return False
+
+
 _KINDS = ("SETUP", "CALL", "TEARDOWN")
 
 
@@ -148,6 +163,7 @@ def run_request(req: dict) -> dict:
     meta = pickle.loads(store.read("index.pkl"))
     index, tests = meta["functions"], meta.get("tests", ())
 
+    match_ops = False  # a changed code object uses structural pattern matching
     plan = []  # (key str, store entry, old code, new code, module name)
     swaps = []  # (old code, new code)
     for f in req["files"]:
@@ -166,6 +182,7 @@ def run_request(req: dict) -> dict:
             if serial.code_digest(o) == serial.code_digest(n):
                 continue
             swaps.append((filename, o, n))
+            match_ops = match_ops or uses_match(n)
             if o.co_freevars != n.co_freevars or o.co_cellvars != n.co_cellvars:
                 out["bail"] = f"{path}: {o.co_qualname} changes its closure layout"
                 break
@@ -217,6 +234,11 @@ def run_request(req: dict) -> dict:
         made = serial.MADE[0]
         vals, cells = serial.loads_in(data)
         stubs = serial.MADE[0] > made  # some containers were elided at record time
+        if stubs and match_ops:
+            # MATCH_SEQUENCE / MATCH_MAPPING test the type's flags directly (no dunder, no
+            # CALL event): a stand-in would fail to match silently. The pinned sqlglot has no
+            # `match` statement, so only patched code can bring one.
+            raise serial.ElidedAccess()
         closure = tuple(types.CellType() if c == serial._EMPTY else types.CellType(c)
                         for c in cells) or None
         fn = types.FunctionType(code, modules[module].__dict__, code.co_name, None, closure)

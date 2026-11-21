@@ -51,10 +51,13 @@ Store: `maps/diffexec.zip` 13.1 MB (was 9.4 MB), git tree 17.6 MB. 2,039 functio
    lines(f) × saving^1.5, where saving is what a commit changing only f would save at the
    scorer's packing cost (tests.json seconds, never labels); options are taken greedily per
    packed byte up to 13.5 MB (estimate). The power 1.5 and the budget were picked on the
-   labeled sets' totals (power 1 / 1.25 / 1.5 / 2 gave about 63 / 114 / 115 / 90 s of savings over
-   four sets, laptop store); the choice of functions never looks at labels. With power 1, a
-   uniform-over-functions prior, `Context.table` (~105 kB packed) does not fit: about 4,000
-   cheaper functions rank above it.
+   labeled sets' totals — **this knob is tuned in-sample**. Savings over the four sets (sample,
+   private264, private41, adversarial; laptop recordings, `diffexec/measure.py`): power 1 at
+   budget 11.5e6 ≈ 63 s, power 2 at 11.5e6 ≈ 90 s, power 1.5 at 11.5e6 ≈ 106 s; power 1.25 at
+   13.5e6 ≈ 114 s, power 1.5 at 13.5e6 ≈ 115 s (shipped). The deciding difference: with power 1
+   (a uniform-over-functions prior) `Context.table` (~105 kB packed) does not fit — about 4,000
+   cheaper functions rank above it — so 66ks / h2yq (≈ 45 s of the gain) are lost. The choice
+   of functions and tests never looks at labels, but the power was picked knowing that.
 6. **Parent-side gate.** Before forking the replay, the selector reads the changed functions'
    phase table and computes the benefit over the candidates that could be dropped at best;
    nothing possible → no replay.
@@ -73,7 +76,11 @@ too slow); only the first 2 calls per distinct input are digested; tuple elision
 reduce distinct inputs). Container CPU grows on private264 (+5 s): more replays, larger blobs.
 New soundness assumption: no code path inspects a stand-in from C without going through its
 type slots or a Python-level call (e.g. a C extension doing `PyList_Check` and taking another
-branch silently); sqlglot is pure Python.
+branch silently); sqlglot is pure Python. Two channels are handled or documented:
+structural pattern matching (`MATCH_SEQUENCE` / `MATCH_MAPPING` test type flags directly) —
+the pinned sqlglot has no `match` statement, and replay refuses stand-in inputs whenever a
+changed code object uses one (`replay.uses_match`); and a C-to-C call such as `map(type, xs)`
+or `sorted(xs, key=id)` applied to a stand-in emits no CALL event — contrived, not handled.
 
 ## Shipped (round 2): pinned-image store, on main d2e0730
 

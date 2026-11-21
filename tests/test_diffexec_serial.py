@@ -74,3 +74,11 @@ def test_digest_ignores_interning_but_sees_mutable_sharing():
     assert serial.digest_cmp((lst, lst)) != serial.digest_cmp((lst, [1]))
     assert serial.digest_cmp(("x",)) != serial.digest_cmp((b"x",))
     assert serial.digest_cmp((("x",),)) != serial.digest_cmp((frozenset({"x"}),))
+
+
+def test_pattern_matching_in_patched_code_is_detected():
+    # MATCH_SEQUENCE / MATCH_MAPPING read type flags without any hook a stand-in could see, so
+    # replay refuses stand-in inputs when changed code uses `match` (diffexec/replay.py).
+    src = "def f(x):\n    def g(y):\n        match y:\n            case [*_]:\n                return 1\n    return g(x)\n"
+    assert replay.uses_match(compile(src, "<t>", "exec"))
+    assert not replay.uses_match(compile("def f(x):\n    return len(x)\n", "<t>", "exec"))
