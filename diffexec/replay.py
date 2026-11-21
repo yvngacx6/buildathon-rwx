@@ -77,6 +77,38 @@ def _cpu_limit(seconds: float):
         signal.signal(signal.SIGPROF, old)
 
 
+from diffexec.serial import TOUCHED as _TOUCHED, Elided  # noqa: E402
+
+_OWN = {Elided.__len__.__code__, Elided.__bool__.__code__}  # the stand-in reading itself
+_MON = sys.monitoring
+_MON_TOOL = 4
+_PY_CALLABLES = (types.FunctionType,)
+
+
+def _on_call(code, offset, callee, arg0):
+    """CALL event while a replayed input holds elided stand-ins: a builtin, class or other
+    non-Python callable applied to a stand-in (type(), id(), isinstance(), list(), a slot
+    wrapper ...) may look at it without going through its methods, so count it as a use.
+    len() and bool() are answered exactly by the stand-in. Python functions are fine: what
+    their bodies do with the stand-in is watched in turn."""
+    if type(arg0) is Elided and callee is not len and callee is not bool and code not in _OWN:
+        f = getattr(callee, "__func__", callee) if type(callee) is types.MethodType else callee
+        if type(f) not in _PY_CALLABLES:
+            _TOUCHED[0] = True
+            if DEBUG:
+                print(f"[diffexec] touch: {callee!r} at {code.co_qualname}:{offset}", file=sys.stderr)
+
+
+def _watch_calls(on: bool) -> None:
+    if on:
+        if _MON.get_tool(_MON_TOOL) is None:
+            _MON.use_tool_id(_MON_TOOL, "diffexec-replay")
+            _MON.register_callback(_MON_TOOL, _MON.events.CALL, _on_call)
+        _MON.set_events(_MON_TOOL, _MON.events.CALL)
+    else:
+        _MON.set_events(_MON_TOOL, 0)
+
+
 def phase_name(p) -> str:
     return p if isinstance(p, str) else f"{p[0]}|{p[1]}"
 
@@ -175,7 +207,9 @@ def run_request(req: dict) -> dict:
             c.cache_clear()
 
     def run(code, module, data):
-        vals, cells = pickle.loads(data)
+        made = serial.MADE[0]
+        vals, cells = serial.loads_in(data)
+        stubs = serial.MADE[0] > made  # some containers were elided at record time
         closure = tuple(types.CellType() if c == serial._EMPTY else types.CellType(c)
                         for c in cells) or None
         fn = types.FunctionType(code, modules[module].__dict__, code.co_name, None, closure)
@@ -197,12 +231,20 @@ def run_request(req: dict) -> dict:
         try:
             with warnings.catch_warnings(record=True) as warned, contextlib.redirect_stdout(stdout):
                 warnings.simplefilter("always")
+                serial.TOUCHED[0] = False
+                if stubs:
+                    _watch_calls(True)
                 try:
                     outcome = ("ret", fn(*args, **kwargs))
                 except Exception as e:  # noqa: BLE001
                     outcome = ("exc", type(e).__module__, type(e).__qualname__, str(e))
+                finally:
+                    if stubs:
+                        _watch_calls(False)
         finally:
             rootlog.removeHandler(handler)
+        if serial.TOUCHED[0]:
+            raise serial.ElidedAccess()  # an elided container was used: the call is not ok
         cpu = time.process_time() - t0
         digest = serial.digest_cmp((tuple(vals), outcome))
         side = (handler.got, [(w.category.__name__, str(w.message)) for w in warned], stdout.getvalue())
@@ -247,6 +289,9 @@ def run_request(req: dict) -> dict:
             except BaseException as e:  # noqa: BLE001  (includes RecursionError, unpicklable output)
                 if DEBUG:
                     print(f"[diffexec] {key}: error {type(e).__name__}: {e}", file=sys.stderr)
+                    if os.environ.get("DIFFEXEC_DEBUG_TB"):
+                        import traceback
+                        traceback.print_exc(limit=-3)
                 ok = False
                 overtime = isinstance(e, _OverTime)  # likely a loop that never ends: stop here
             finally:

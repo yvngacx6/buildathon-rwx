@@ -36,9 +36,119 @@ class Unrecordable(Exception):
     pass
 
 
+# ── elided containers (inputs too big to snapshot) ─────────────────────────────────────────
+# When a call's input is over the size cap, `dumps_in(..., elide=K)` writes every list / dict /
+# set (exact type) with more than K items as an `Elided` stand-in that only knows its length.
+# A stand-in answers len() and bool() like the real container did at the call. ANY other use
+# (item access, iteration, comparison, hashing, attribute lookup incl. __class__, arithmetic,
+# builtins called on it such as type()/id()/isinstance() (replay watches CALL events), pickling
+# ...) sets TOUCHED and raises ElidedAccess (a BaseException: `except Exception` cannot swallow
+# it, and TOUCHED is checked even if something does). The replay rejects a call whose old or
+# new run TOUCHED a stand-in. So an accepted call observed the elided containers only through
+# len / bool / identity, which the stand-in reproduces, and the recorded run (real containers)
+# took the same path. The effect digest writes those containers as (kind, length, ordinal) on
+# both sides (record side: by id, see `elided` in dumps_in / digest_cmp).
+TOUCHED = [False]
+
+
+class ElidedAccess(BaseException):
+    pass
+
+
+def _touch(*_a, **_k):
+    TOUCHED[0] = True
+    raise ElidedAccess()
+
+
+class Elided:
+    __slots__ = ("_kind", "_n", "_k")
+
+    def __len__(self):
+        return object.__getattribute__(self, "_n")
+
+    def __bool__(self):
+        return object.__getattribute__(self, "_n") > 0
+
+
+for _name in ("__hash__", "__getattribute__", "__getattr__", "__setattr__", "__delattr__",
+              "__dir__", "__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__",
+              "__contains__", "__getitem__", "__setitem__", "__delitem__", "__iter__",
+              "__reversed__", "__call__", "__index__", "__int__", "__float__", "__complex__",
+              "__bytes__", "__str__", "__repr__", "__format__", "__enter__", "__exit__",
+              "__await__", "__aiter__", "__anext__", "__next__", "__round__", "__trunc__",
+              "__floor__", "__ceil__", "__sizeof__", "__reduce__", "__reduce_ex__",
+              "__length_hint__", "__buffer__", "__release_buffer__", "__add__", "__radd__",
+              "__iadd__", "__sub__", "__rsub__", "__isub__", "__mul__", "__rmul__", "__imul__",
+              "__matmul__", "__rmatmul__", "__imatmul__", "__truediv__", "__rtruediv__",
+              "__itruediv__", "__floordiv__", "__rfloordiv__", "__ifloordiv__", "__mod__",
+              "__rmod__", "__imod__", "__divmod__", "__rdivmod__", "__pow__", "__rpow__",
+              "__ipow__", "__lshift__", "__rlshift__", "__ilshift__", "__rshift__",
+              "__rrshift__", "__irshift__", "__and__", "__rand__", "__iand__", "__xor__",
+              "__rxor__", "__ixor__", "__or__", "__ror__", "__ior__", "__neg__", "__pos__",
+              "__abs__", "__invert__", "__get__", "__set__", "__delete__", "__copy__",
+              "__deepcopy__", "__getstate__", "__setstate__", "__getnewargs__",
+              "__getnewargs_ex__", "__fspath__", "__missing__", "__class_getitem__",
+              "__mro_entries__", "__instancecheck__", "__subclasscheck__"):
+    setattr(Elided, _name, _touch)
+
+
+MADE = [0]  # stand-ins created so far (replay: does this input contain any?)
+
+
+def make_elided(kind, n, k):
+    MADE[0] += 1
+    e = object.__new__(Elided)
+    object.__setattr__(e, "_kind", kind)
+    object.__setattr__(e, "_n", n)
+    object.__setattr__(e, "_k", k)
+    return e
+
+
+def elided_key(e) -> tuple:
+    g = object.__getattribute__
+    return (g(e, "_kind"), g(e, "_n"), g(e, "_k"))
+
+
+_ELIDE_TYPES = {list: "list", dict: "dict", set: "set"}
+
+
+def import_module(name):
+    return importlib.import_module(name)
+
+
 def _expr_base():
     mod = sys.modules.get("sqlglot.expressions.core")
     return getattr(mod, "Expr", None) if mod else None
+
+
+def _generator_state(obj):
+    """A sqlglot Generator whose `_dispatch` is the shared per-class table that __init__ put
+    there (generator._DISPATCH_CACHE[cls]): written without that table (hundreds of entries)
+    and rebuilt with it, the way __init__ does. Anything else: None (pickled as usual)."""
+    mod = sys.modules.get("sqlglot.generator")
+    gen = getattr(mod, "Generator", None) if mod else None
+    if gen is None or not isinstance(obj, gen):
+        return None
+    cache = getattr(mod, "_DISPATCH_CACHE", None)
+    try:
+        dispatch = object.__getattribute__(obj, "_dispatch")
+    except AttributeError:
+        return None
+    if cache is None or cache.get(type(obj)) is not dispatch:
+        return None
+    d, slots = _slot_state(obj)
+    slots = {k: v for k, v in (slots or {}).items() if k != "_dispatch"}
+    return (new_generator, (type(obj),), (d, slots or None))
+
+
+def new_generator(cls):
+    import sqlglot.generator as g
+    obj = cls.__new__(cls)
+    dispatch = g._DISPATCH_CACHE.get(cls)
+    if dispatch is None:
+        dispatch = g._DISPATCH_CACHE[cls] = g._build_dispatch(cls)
+    obj._dispatch = dispatch
+    return obj
 
 
 def _slot_state(obj):
@@ -144,10 +254,23 @@ def code_digest(code: types.CodeType, shallow: bool = False) -> bytes:
 
 
 class InPickler(pickle.Pickler):
+    elide = None  # None, or the item count above which list / dict / set are elided
+    elided = None  # id -> (obj, (kind, n, ordinal)) of the elided containers
+
     def reducer_override(self, obj):
+        t = type(obj)
+        if t is Elided:
+            raise Unrecordable("Elided")
+        if t is types.ModuleType:
+            if sys.modules.get(obj.__name__) is not obj:
+                raise Unrecordable("module not in sys.modules")
+            return (import_module, (obj.__name__,))
         base = _expr_base()
         if base is not None and isinstance(obj, base):
             return (new_object, (type(obj),), _slot_state(obj))
+        gen = _generator_state(obj)
+        if gen is not None:
+            return gen
         if type(obj) is types.FunctionType and not _by_reference(obj):
             c = obj.__code__
             return (rebuild_function, (obj.__module__, c.co_filename, c.co_qualname, c.co_firstlineno,
@@ -165,10 +288,50 @@ def _cmp_function(module, qualname, digest, cells, defaults):
 _IMMUTABLE = (str, bytes, int, float, complex, tuple, frozenset, type(None), bool)
 
 
+class _ElidingInPickler(InPickler):
+    """InPickler that writes big list / dict / set as persistent ids (the C pickler does not
+    offer exact lists / dicts / sets to reducer_override). The same container always gets the
+    same id, and loads_in() returns one stand-in per id, so aliasing survives."""
+
+    def persistent_id(self, obj):
+        t = type(obj)
+        if t in _ELIDE_TYPES and len(obj) > self.elide:
+            hit = self.elided.get(id(obj))
+            if hit is None:
+                hit = self.elided[id(obj)] = (obj, (_ELIDE_TYPES[t], len(obj), len(self.elided)))
+            return ("elided",) + hit[1]
+        return None
+
+
+class _InUnpickler(pickle.Unpickler):
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self._stubs = {}
+
+    def persistent_load(self, pid):
+        if pid[0] != "elided":
+            raise pickle.UnpicklingError(f"unknown persistent id {pid!r}")
+        got = self._stubs.get(pid)
+        if got is None:
+            got = self._stubs[pid] = make_elided(*pid[1:])
+        return got
+
+
+def loads_in(data: bytes):
+    """Load a call input written by dumps_in (with or without elided containers)."""
+    return _InUnpickler(io.BytesIO(data)).load()
+
+
 class CmpPickler(pickle._Pickler):
     """Pure-Python pickler for digests. Immutable values are never memoized, so the bytes do
     not depend on whether two equal strings / tuples happen to be one object (interning);
-    mutable objects and Expr nodes are memoized, so their sharing is part of the bytes."""
+    mutable objects and Expr nodes are memoized, so their sharing is part of the bytes.
+
+    `elided` (record side): id -> (obj, key) of the containers the input pickle elided; they
+    are written as their stand-in key, exactly like a replayed `Elided` stand-in."""
+
+    elide = None
+    elided = None
 
     def memoize(self, obj):
         if type(obj) in _IMMUTABLE:
@@ -178,6 +341,49 @@ class CmpPickler(pickle._Pickler):
     def reducer_override(self, obj):
         if type(obj) in _IMMUTABLE:
             return NotImplemented
+        if type(obj) is Elided:
+            return (make_elided, elided_key(obj))
+        if self.elided:
+            hit = self.elided.get(id(obj))
+            if hit is not None and hit[0] is obj:
+                return (make_elided, hit[1])
+        if type(obj) is types.FunctionType and obj.__module__ != __name__:
+            return (_cmp_function, (obj.__module__, obj.__qualname__, code_digest(obj.__code__),
+                                    _cells(obj), obj.__defaults__))
+        if type(obj) is types.CodeType:
+            return (_cmp_function, ("<code>", obj.co_qualname, code_digest(obj), (), None))
+        return InPickler.reducer_override(self, obj)
+
+
+class FastCmpPickler(pickle.Pickler):
+    """C-pickler version of CmpPickler (what digest_cmp uses; ~5x faster). The C pickler
+    memoizes str / tuple / bytes / frozenset by identity, so those are routed through
+    persistent ids that carry their value (a fresh object per visit): the bytes then do not
+    depend on interning, as in CmpPickler. Mutable objects and Expr nodes are memoized, so
+    their sharing is part of the bytes. Elided containers (replay: `Elided` stand-ins; record:
+    the ids in `elided`) are written as their stand-in key on both sides."""
+
+    elided = None
+
+    def persistent_id(self, obj):
+        t = type(obj)
+        if t is str:
+            return obj.encode("utf-8", "surrogatepass")
+        if t is tuple:
+            return ("t",) + obj
+        if t is frozenset:
+            return ("f",) + tuple(obj)
+        if t is bytes:
+            return ("b", bytearray(obj))
+        if t is Elided:
+            return ("e",) + elided_key(obj)
+        if self.elided:
+            hit = self.elided.get(id(obj))
+            if hit is not None and hit[0] is obj:
+                return ("e",) + hit[1]
+        return None
+
+    def reducer_override(self, obj):
         if type(obj) is types.FunctionType and obj.__module__ != __name__:
             return (_cmp_function, (obj.__module__, obj.__qualname__, code_digest(obj.__code__),
                                     _cells(obj), obj.__defaults__))
@@ -204,17 +410,27 @@ class _CappedBuffer(io.BytesIO):
         return n
 
 
-def dumps_in(value, cap: float = float("inf")) -> bytes:
-    """Pickle a call's input. Raises TooBig as soon as it is known to be over `cap` bytes."""
+def dumps_in(value, cap: float = float("inf"), elide: int | None = None,
+             elided: dict | None = None) -> bytes:
+    """Pickle a call's input. Raises TooBig as soon as it is known to be over `cap` bytes.
+    With `elide`, list / dict / set with more than `elide` items are written as stand-ins and
+    listed in `elided` (id -> (obj, key)); the caller keeps that dict for the effect digest."""
     buf = _CappedBuffer(cap)
-    InPickler(buf, protocol=5).dump(value)
+    if elide is None:
+        p = InPickler(buf, protocol=5)
+    else:
+        p = _ElidingInPickler(buf, protocol=5)
+        p.elide, p.elided = elide, (elided if elided is not None else {})
+    p.dump(value)
     data = buf.getvalue()
     if len(data) > cap:
         raise TooBig()
     return data
 
 
-def digest_cmp(value) -> bytes:
+def digest_cmp(value, elided: dict | None = None) -> bytes:
     buf = io.BytesIO()
-    CmpPickler(buf, protocol=5).dump(value)
+    p = FastCmpPickler(buf, protocol=5)
+    p.elided = elided
+    p.dump(value)
     return hashlib.blake2b(buf.getvalue(), digest_size=16).digest()

@@ -172,7 +172,8 @@ class Selector:
         except AllTests as exc:
             return self.all_numbers(), f"ALL ({exc})"
         if self._jobs and self.diffexec is not None:
-            dropped, note = self.diffexec.prune(self._jobs, self._benefit(per_file))
+            dropped, note = self.diffexec.prune(self._jobs, self._benefit(per_file),
+                                                lambda only: self._benefit(per_file, only))
             if note:
                 reasons.append(note)
             per_file = [(p, got - dropped.get(p, set())) for p, got in per_file]
@@ -184,12 +185,13 @@ class Selector:
             chosen |= self._untraced
         return chosen & self._all, "; ".join(reasons)
 
-    def _benefit(self, per_file) -> int:
-        """Cost saved (ms) if diffexec dropped every prunable test: 0 → do not run it."""
+    def _benefit(self, per_file, only: set[int] | None = None) -> int:
+        """Cost saved (ms) if diffexec dropped every prunable test (or every prunable test in
+        `only`): 0 → do not run it."""
         from . import pack
         ms_of = self.diffexec.ms_of
         everything = set().union(*(got for _, got in per_file))
-        prunable = {p: nums for p, _, nums in self._jobs}
+        prunable = {p: (nums if only is None else nums & only) for p, _, nums in self._jobs}
         rest = set().union(*(got - prunable.get(p, set()) for p, got in per_file))
         return (pack.cost_ms(pack.pack(everything, ms_of), ms_of)
                 - pack.cost_ms(pack.pack(rest, ms_of), ms_of))

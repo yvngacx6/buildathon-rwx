@@ -24,7 +24,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-SQLGLOT = Path("/opt/sqlglot")
+SQLGLOT = Path(os.environ.get("DIFFEXEC_SQLGLOT", "/opt/sqlglot"))
 
 
 def main() -> None:
@@ -35,8 +35,9 @@ def main() -> None:
     ap.add_argument("-j", type=int, default=os.cpu_count())
     ap.add_argument("--resume", action="store_true",
                     help="keep per-file recordings already in --work (after an interrupted run)")
+    ap.add_argument("--no-manifest", action="store_true", help="experiment: do not touch MANIFEST.json")
     a = ap.parse_args()
-    repo = Path(a.out).resolve().parent.parent
+    repo = Path(__file__).resolve().parent.parent
     work = Path(a.work)
     files = sorted({t["file"] for t in json.loads(Path(a.tests).read_text())["tests"]})
     env = dict(os.environ, PYTHONHASHSEED="0", SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1",
@@ -88,9 +89,12 @@ def main() -> None:
     record_wall = time.time() - start
     record_cpu = (cpu1.children_user - cpu0.children_user) + (cpu1.children_system - cpu0.children_system)
 
-    built = subprocess.run([sys.executable, "-m", "diffexec.build", str(work), a.out], cwd=repo,
+    built = subprocess.run([sys.executable, "-m", "diffexec.build", str(work), a.out, a.tests], cwd=repo,
                            env=env, capture_output=True, text=True, check=True).stdout.strip()
     print(built)
+    if a.no_manifest:
+        print(f"record wall {time.time() - start:.0f}s", file=sys.stderr)
+        return
     data = Path(a.out).read_bytes()
     manifest_path = repo / "maps" / "MANIFEST.json"
     manifest = json.loads(manifest_path.read_text())

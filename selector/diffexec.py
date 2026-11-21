@@ -174,6 +174,44 @@ class DiffExec:
             self._failed = set(meta.get("failed", ()))
         return self._idx
 
+    def _possible(self, jobs) -> set[int] | None:
+        """Candidates that the replay could drop at best: for every changed function, the test
+        has a recorded phase, all its phases and its classmates' SETUP phases are complete, and
+        all calls outside tests are complete (u/<n>.pkl). Only a gate before the replay."""
+        import pickle
+        import zipfile
+        self._index()
+        entries = []
+        for path, _, _ in jobs:
+            for chain in self.sel._chains.get(path, []):
+                entries.extend(self._by_name.get((path, ".".join(chain)), []))
+        if not entries:
+            return None
+        cands = set().union(*(nums for _, _, nums in jobs))
+        with zipfile.ZipFile(self.store) as zf:
+            names = set(zf.namelist())
+            for dead, n in entries:
+                if dead or f"u/{n}.pkl" not in names:
+                    return None  # old store layout or dead (precheck covers dead)
+                uses = pickle.loads(zf.read(f"u/{n}.pkl"))
+                bad, seen = set(), set()
+                for ph, v in uses.items():
+                    if not isinstance(ph, tuple):
+                        if v is None:
+                            return set()
+                        continue
+                    seen.add(ph[1])
+                    if v is None:
+                        if ph[0] == "SETUP":
+                            bad.update(self._mates.get(self._class_of.get(ph[1], ph[1]), [ph[1]]))
+                        bad.add(ph[1])
+                cands = {num for num in cands
+                         if self.sel._id_of[num] in seen and self.sel._id_of[num] not in bad
+                         and self.sel._id_of[num] not in self._failed}
+                if not cands:
+                    return cands
+        return cands
+
     def _precheck(self, jobs) -> str | None:
         """Cheap parent-side filter: every changed function must have a live recording.
 
@@ -196,8 +234,9 @@ class DiffExec:
                     return f"{'.'.join(chain)}: not recorded ({dead[0]})"
         return None
 
-    def prune(self, jobs, benefit_ms: int = 1) -> tuple[dict[str, set[int]], str]:
-        """jobs: [(path, new text, candidate test numbers)] → ({path: dropped numbers}, note)."""
+    def prune(self, jobs, benefit_ms: int = 1, benefit_of=None) -> tuple[dict[str, set[int]], str]:
+        """jobs: [(path, new text, candidate test numbers)] → ({path: dropped numbers}, note).
+        benefit_of(numbers): cost saved if only those candidates were dropped."""
         t0 = time.process_time()
         if self.sel._mixed_py:
             return {}, "diffexec: skipped (a .py edit outside function bodies)"
@@ -209,6 +248,15 @@ class DiffExec:
             why = f"precheck error {type(e).__name__}"
         if why:
             return {}, f"diffexec: keep all ({why})"
+        if benefit_of is not None:
+            try:
+                possible = self._possible(jobs)
+            except Exception:  # noqa: BLE001  (only a gate: on error, replay as before)
+                possible = None
+            if possible is not None:
+                benefit_ms = benefit_of(possible) if possible else 0
+                if benefit_ms <= 0:
+                    return {}, "diffexec: skipped (no candidate worth dropping has complete recordings)"
         got = self._replay(jobs, benefit_ms)
         if got is None:
             return {}, "diffexec: no answer (error / timeout / budget)"

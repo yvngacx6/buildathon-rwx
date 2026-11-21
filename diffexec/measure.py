@@ -40,9 +40,9 @@ def main() -> None:
     seen_prune = []
     orig = de.prune
 
-    def spy(jobs, benefit_ms=1):
+    def spy(jobs, benefit_ms=1, benefit_of=None):
         de.why_kept = {}
-        dropped, note = orig(jobs, benefit_ms)
+        dropped, note = orig(jobs, benefit_ms, benefit_of)
         seen_prune.append((jobs, dropped, note, dict(de.why_kept)))
         return dropped, note
 

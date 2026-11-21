@@ -11,12 +11,13 @@ RESUME=${RESUME:-}                               # RESUME=1: keep finished per-f
 [ -n "$RESUME" ] || rm -rf "$WORK"
 mkdir -p "$WORK"
 
-docker build -q -f "$REPO/mapbuild/Dockerfile" -t blast-mapbuild "$REPO" >/dev/null
+IMAGE=${MAPBUILD_IMAGE:-blast-mapbuild}             # tag of the map-building image
+docker build -q -f "$REPO/mapbuild/Dockerfile" -t "$IMAGE" "$REPO" >/dev/null
 
 start=$(date +%s)
 docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
   -v "$REPO:/repo" -v "$WORK:/work" \
-  blast-mapbuild \
+  "$IMAGE" \
   python /repo/mapbuild/diffexec_run.py --tests /repo/sample/tests.json --work /work \
     --out /repo/maps/diffexec.zip -j "$JOBS" ${RESUME:+--resume}
 echo "diffexec store build wall time: $(( $(date +%s) - start ))s" >&2
