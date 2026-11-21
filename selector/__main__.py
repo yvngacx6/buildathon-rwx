@@ -43,7 +43,7 @@ def main() -> None:
             numbers, reason = selector.select(patch_file.read_text(errors="replace"))
         except Exception as exc:  # never crash: any surprise means run everything
             numbers, reason = selector.all_numbers(), f"ALL (error: {type(exc).__name__}: {exc})"
-        workers = pack.pack(numbers, ms_of)
+        workers = all_workers if numbers == everything else pack.pack(numbers, ms_of)
         if numbers != everything and pack.cost_ms(workers, ms_of) >= ALL_FRACTION * all_cost:
             # Nearly the price of ALL: take ALL, which cannot miss.
             numbers, workers, reason = everything, all_workers, f"ALL (selection ~ALL cost) {reason}"

@@ -14,11 +14,16 @@ COPY maps /app/maps
 
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
-# Build-time static scan of the pinned source for name-reader narrowing (selector/nameindex.py),
-# plus the import-time state snapshot (selector/state.py) next to it. The bytecode cache lets the
-# run's patched-import subprocess skip compiling every unpatched module.
-# The build is not charged; the run only unpickles what a commit needs.
-RUN python -m compileall -q /opt/sqlglot/sqlglot \
+# The build is not charged, the run's CPU is: do everything that depends only on the pinned
+# source and the maps here, so the run only reads what a commit needs.
+#  * bytecode for the selector and sqlglot (the run, and its patched-import subprocess, would
+#    otherwise compile every module; PYTHONDONTWRITEBYTECODE only stops writing the cache)
+#  * the maps as per-file marshal shards (selector/maps.py)
+#  * the static name scan for name-reader narrowing (selector/nameindex.py), plus the
+#    import-time state snapshot (selector/state.py) next to it
+RUN python -m compileall -q /opt/sqlglot/sqlglot /app/selector \
+ && python -m selector.maps build /app/maps /app/index/maps \
  && python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl \
  && chmod -R a+rX /app /opt/sqlglot
-CMD ["python", "-m", "selector"]
+# -S: no site module (the selector needs only the standard library).
+CMD ["python", "-S", "-m", "selector"]
