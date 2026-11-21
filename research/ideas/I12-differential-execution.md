@@ -9,14 +9,15 @@ pass.
 
 **Feasible, as a store recorded offline and committed to the repo. It is not feasible as a
 recording inside the Docker build. It is worth about −26 s on the sample, −10 s on private264
-and −6 s on adversarial46, at roughly 1–3 s of CPU per set, with 0 misses everywhere.**
+and −6 s on adversarial46, for +0.8 to +4.3 s of container CPU (EC2), with 0 misses everywhere.**
 
 | | sample | private264 | private41 | adversarial46 |
 |---|---|---|---|---|
 | main (no store) | 183.9 | 3263.9 | 546.2 | 1213.4 |
 | **+ diffexec, store C300 (full suite, not label-derived, 8.7 MB gz)** | **158.0** | **3253.6** | **546.0** | **1207.0** |
 | replay child CPU (laptop) | 0.50 | 2.42 | 0.28 | 0.33 |
-| container CPU without → with store (EC2, pinned image, scorer flags) | EC2_S | EC2_P264 | EC2_P41 | EC2_ADV |
+| container CPU without → with store (EC2, pinned image, scorer flags) | 1.10 → 2.19 | 24.7 → 29.0 | 3.35 → 4.15 | 5.77 → 6.98 |
+| **net (simulated + CPU) vs main** | **−24.8** | **−6.0** | **+0.6** | **−5.2** |
 | misses | 0/30 | 0/264 | 0/41 | 0/46 |
 
 The C300 rows come from `diffexec/measure.py`: simulated cost before and after pruning, summed
@@ -178,7 +179,12 @@ Makefile's scorer flags.
 - The first version spawned a subprocess per replay and re-imported sqlglot each time, about
   0.4 s per replay (sample 2.00 → 4.70). The fork version costs 0.3 s once plus about
   0.05–0.5 s per replay.
-- C300 on main: EC2_TABLE.
+- C300 on main (2 runs each, same simulated seconds as the laptop):
+  - sample 1.10 → 2.19 (+1.1);
+  - private41 3.35 → 4.15 (+0.8);
+  - adversarial 5.77 → 6.98 (+1.2);
+  - private264 24.7 → 29.0 (+4.3).
+- About 0.3 s of each increase is the one sqlglot import plus the index load; the rest is replay.
 
 ## Soundness holes (0 misses is necessary, not proof)
 
