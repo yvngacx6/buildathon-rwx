@@ -169,6 +169,7 @@ class Selector:
         self._files: list[diff.FilePatch] = []  # the current commit's files
         self._state: dict | None | bool = False  # its import-state diff (False: not yet run)
         self._state_error: str | None = None  # file that failed the patched import, if known
+        self._state_unread: list[str] = []  # `_state_readers`: changed keys with no seen reader
         self._direct: dict[str, bool] | None = None  # names `_by_names` saw edited
         self._inert: names.BodyChange | None = None  # … and the whole change it accepted
         self.notes: list[str] = []  # why a definition-time region was (not) narrowed
@@ -640,11 +641,16 @@ class Selector:
                 # slow callers a run-time pruner (diffexec / subtest / slowverify) may drop –
                 # unless the import-time runs leave this commit `_mixed_py`: count them in what
                 # the import-state diff can save
-                slack = (got & self._slow & prunable - fixed
+                slack = (got & self._slow & (prunable - fixed)
                          if not self._mixed_py and self.diffexec is not None else set())
+                # its own state entry (a def with a closure, e.g. `super()`'s `__class__`
+                # cell, is digested with its code): the edit itself, seen by its callers
+                own = (None if r.signature or r.is_lambda or not r.chain
+                       else f"M {module} {r.chain[0]}" if len(r.chain) == 1
+                       else f"C {module}:{'.'.join(r.chain[:-1])} {r.chain[-1]}")
                 at_import, same_state = self._function_at_import(path, first + r.is_lambda, last,
-                                                                 chosen | got, slack)
-                if not got and same_state == "readers":
+                                                                 chosen | got, slack, own)
+                if not got and same_state in ("readers", "readers-unseen"):
                     # Never ran under a test; what its runs at import built differently is
                     # read only by the tests in at_import.
                     kinds.append(f"unrun def {'.'.join(r.chain) or '<lambda>'}, runs at import")
@@ -665,7 +671,7 @@ class Selector:
                 if at_import:
                     kinds.append(f"(runs at import: +{len(at_import - got)}"
                                  + (", readers of changed import state)" if same_state else ")"))
-                    if same_state != "readers":
+                    if same_state != "readers":  # (also "readers-unseen")
                         # the import-time runs may have built anything the run-time pruners
                         # cannot see
                         self._mixed_py = True
@@ -1074,6 +1080,7 @@ class Selector:
         in_tests: set[int] = set()
         n_sites = 0
         owners: dict[str, tuple] = {}
+        per_key: list[tuple[str, set[int], set[int]]] = []  # (key, reads, reads ∩ touch)
         for kind, owner, attr in changed:
             if kind == "C" and attr in TYPEDDICT_KEYS:
                 # Set by the TypedDict metaclass; Python reads them only when it builds a
@@ -1091,7 +1098,9 @@ class Selector:
                                 site.lines[0] - 1].lstrip().startswith("class "))
                         for site in index.mentions(cname)):
                     raise names.Fallback(f"{owner}.{attr}: TypedDict read or held at import")
-                typed |= self._mention_runners({cname})
+                key_typed = self._mention_runners({cname})
+                typed |= key_typed
+                per_key.append((f"{kind} {owner} {attr}", key_typed, set()))
                 continue
             if attr.startswith("__") and attr.endswith("__"):
                 raise names.Fallback(f"{owner}.{attr} is a special name")
@@ -1110,6 +1119,9 @@ class Selector:
                 touch |= self.maps.whole_file(owner_path) | self._class_users(
                     _module_of(owner_path), [chain])
             same = frozenset(found.get("same", {}).get(f"{kind} {owner} {attr}", ()))
+            key_free: set[int] = set()
+            key_touched: set[int] = set()
+            per_key.append((f"{kind} {owner} {attr}", key_free, key_touched))
             for site in index.sites(attr, owner_path, chain, True):
                 if (kind == "C" and site.recv is not None
                         and not self._related(index, (site.path, site.recv), owner_path, chain)):
@@ -1118,16 +1130,23 @@ class Selector:
                     n_sites += 1
                     if bucket == "tests":
                         in_tests |= got
+                        key_free |= got
                     elif kind == "M":
                         free |= got
+                        key_free |= got
                     elif users is None or bucket == "loose":
                         loose |= got
+                        key_touched |= got
                     else:
                         held |= got & users
+                        key_touched |= got & users
         # Class-attribute reads stay within the users of the owner classes and their files
         # (the bound `_by_names` relies on); `held` narrows that further.
         got = free | ((loose | held) & touch) | in_tests
         got |= typed
+        # changed values no test is seen reading (a reader the index is blind to, or none):
+        # callers of `_state_readers(…, allow_empty)` let the lines' run-time callers stand in
+        self._state_unread = [k for k, f, t in per_key if not f and not t & touch]
         if not got and not allow_empty and untyped:
             raise names.Fallback("no test ran a line reading a changed value")
         shown = sorted({f"{o.rsplit(':', 1)[-1]}.{a}" for _, o, a in changed})
@@ -1386,7 +1405,8 @@ class Selector:
 
     def _function_at_import(self, path: str, first: int, last: int,
                             have: set[int] | None = None,
-                            slack: set[int] = frozenset()) -> tuple[set[int], bool]:
+                            slack: set[int] = frozenset(),
+                            own: str | None = None) -> tuple[set[int], bool]:
         """Tests that depend on function lines path:first..last having run while modules
         were imported (`_import_time`: ALL for `import sqlglot`, else the dependents of each
         such module) – unless the import-state diff (selector/state.py) shows that importing
@@ -1399,12 +1419,17 @@ class Selector:
         dependents add at least STATE_MIN_GAIN to `have` (what the commit selects already)
         less `slack`: slow tests in `have` the run-time pruners may drop, which they may
         only try when the import-time runs are shown not to matter (`_mixed_py`, r19).
+        `own`: the state key of the edited def itself (a body edit). A def with a closure
+        (`super()`'s `__class__` cell) is digested with its code, so the edit shows there;
+        that entry is the edit, which its callers see (lines map), not an import-time
+        product (whatever holds the function at import is digested as its own entry).
 
         Otherwise, when the patched package imports, the tests that can observe the changed
         import-time state (`_import_state_users`) if cheaper than the dependents.
 
         Returns (tests, True if the state diff showed no change, "readers" if the tests are
-        the readers of the changed state, else False)."""
+        the readers of the changed state, "readers-unseen" if so but some changed value had
+        no seen reader (the lines' run-time callers stand in for it), else False)."""
         modules = self.maps.import_time.modules(path, first, last)
         if not modules:
             return set(), False
@@ -1418,13 +1443,19 @@ class Selector:
                 and all((m.split(".")[0] == "sqlglot" and m != "sqlglot.__main__")  # state.SKIP_MODULES
                         or self._explained_root(m, path, first, last) for m in modules)):
             found = self._state_diff()
-            if found is not None and not found["changed"]:
+            if found is not None and not [k for k in found["changed"] if k != own]:
                 return set(), True
         if wide is None or self._cost(wide | have) - base >= STATE_MIN_GAIN:
             try:
-                got, _ = self._import_state_users(path, first, last, modules)
-                if (wide is None or self._seconds(got) < self._seconds(wide)
-                        or (slack and not got & slack)):
+                got, _ = self._import_state_users(path, first, last, modules, own)
+                if self._state_unread:
+                    # some changed value has no seen reader: the run-time callers stand in
+                    # for it (`allow_empty`), so they must not be pruned at run time
+                    if wide is None or self._seconds(got) < self._seconds(wide):
+                        return got, "readers-unseen"
+                elif (wide is None or self._seconds(got) < self._seconds(wide)
+                        or (slack and not got & slack
+                            and self._cost((got | have) - slack) < self._cost(wide | have))):
                     return got, "readers"
             except names.Fallback:
                 pass
@@ -1467,6 +1498,7 @@ class Selector:
                 raise names.Fallback(f"imported by {m}, which the diff does not cover")
         if hook is not None and hook in found["changed"]:
             found = dict(found, changed=[k for k in found["changed"] if k != hook])
+        self._state_unread = []
         if not found["changed"]:
             return extra, "state: the patched import builds identical state"
         # a changed value nobody is seen reading usually means a reader the index is blind
