@@ -28,7 +28,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 #    (selector/subtest.py, ~30 s)
 #  * the phase lines and errors.py frontier calls of test_max_nodes (selector/slowverify.py)
 RUN python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')" \
-    /opt/sqlglot/sqlglot /app/selector /app/diffexec \
+    /opt/sqlglot/sqlglot /opt/sqlglot/tests /app/selector /app/diffexec \
  && python -m selector.maps build /app/maps /app/index/maps \
  && python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl \
  && PYTHONHASHSEED=0 python -m selector.subtest build /opt/sqlglot /app/index/subtest.zip \

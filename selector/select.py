@@ -211,6 +211,12 @@ class Selector:
             self.genmem = GenMem.create(self)
         except Exception:  # noqa: BLE001  (optional pruner)
             self.genmem = None
+        self.runverify = None
+        try:
+            from .runverify import RunVerify
+            self.runverify = RunVerify.create(self)
+        except Exception:  # noqa: BLE001  (optional pruner)
+            self.runverify = None
 
     def all_numbers(self) -> set[int]:
         return set(self._all)
@@ -256,7 +262,16 @@ class Selector:
             if self._untraced is None:
                 self._untraced = self.maps.untraced()
             chosen |= self._untraced
-        return chosen & self._all, "; ".join(reasons)
+        chosen &= self._all
+        if chosen and self.runverify is not None:
+            # Last: run what is left, if cheap, on the patched code; drop what passes.
+            try:
+                chosen, note = self.runverify.prune(self._files, chosen)
+            except Exception as e:  # noqa: BLE001
+                note = f"runverify: keep ({type(e).__name__})"
+            if note:
+                reasons.append(note)
+        return chosen, "; ".join(reasons)
 
     def _subtest(self, per_file, reasons, pruner):
         """Drop slow tests a run-time sub-test verification shows to pass: the TPC executor
