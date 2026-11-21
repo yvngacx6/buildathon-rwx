@@ -1,0 +1,1 @@
+FLAGS="--rm --platform linux/amd64 --network none --cpus 2 --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp --volume $HOME/agent-exec/sample/commits:/data/commits:ro --volume $HOME/agent-exec/sample/tests.json:/data/tests.json:ro"
