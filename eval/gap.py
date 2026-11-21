@@ -68,7 +68,8 @@ MISS_PENALTY_S = 300.0
 DEFAULT_SETS = ["sample", "private", "private41", "adversarial"]
 
 # Rule methods whose top-level result is credited to a mechanism.
-WRAPPED = ["_slow_tests_off_statements", "_class_users", "_import_time", "_definition_time",
+WRAPPED = ["_slow_tests_off_statements", "_class_users", "_function_at_import", "_import_time",
+           "_definition_time",
            "_import_bound", "_by_names", "_by_state", "_test_code"]
 
 # ALL fallback reasons, grouped for the aggregate table (first match wins).
@@ -128,6 +129,8 @@ class TracingSelector(Selector):
                 self.credits.append(("statement rule (slow)", slow))
         elif name == "_class_users":
             self.credits.append(("signature class users", set(result)))
+        elif name == "_function_at_import":  # (tests, import state unchanged)
+            self.credits.append(("import-time map", set(result[0])))
         elif name == "_import_time":
             self.credits.append(("import-time map", set(result)))
         elif name == "_definition_time":
