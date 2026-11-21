@@ -189,6 +189,12 @@ class Selector:
             self.subtest = SubTest.create(self)
         except Exception:  # noqa: BLE001  (optional pruner)
             self.subtest = None
+        self.slowverify = None
+        try:
+            from .slowverify import SlowVerify
+            self.slowverify = SlowVerify.create(self)
+        except Exception:  # noqa: BLE001  (optional pruner)
+            self.slowverify = None
 
     def all_numbers(self) -> set[int]:
         return set(self._all)
@@ -222,8 +228,10 @@ class Selector:
             if note:
                 reasons.append(note)
             per_file = [(p, got - dropped.get(p, set())) for p, got in per_file]
-        if self._jobs and self.subtest is not None and not self._mixed_py and not self._defaults:
-            per_file = self._subtest(per_file, reasons)
+        if self._jobs and not self._mixed_py and not self._defaults:
+            for pruner in (self.subtest, self.slowverify):
+                if pruner is not None:
+                    per_file = self._subtest(per_file, reasons, pruner)
         for _, got in per_file:
             chosen |= got
         if chosen:
@@ -232,11 +240,13 @@ class Selector:
             chosen |= self._untraced
         return chosen & self._all, "; ".join(reasons)
 
-    def _subtest(self, per_file, reasons):
-        """Drop TPC executor tests whose touched queries re-run with the pinned outputs."""
+    def _subtest(self, per_file, reasons, pruner):
+        """Drop slow tests a run-time sub-test verification shows to pass: the TPC executor
+        tests whose touched queries re-run with the pinned outputs (subtest.py), test_max_nodes
+        whose expensive phases run no touched statement (slowverify.py)."""
         from . import pack
         prunable = {p: nums for p, _, nums in self._jobs}
-        cands = set(self.subtest.numbers)
+        cands = set(pruner.numbers)
         for p, got in per_file:
             cands -= got - prunable.get(p, set())
         cands &= set().union(*(got for _, got in per_file))
@@ -250,7 +260,7 @@ class Selector:
             rest = everything - only
             return base - (pack.cost_ms(pack.pack(rest, ms_of), ms_of) if rest else 0)
 
-        dropped, note = self.subtest.prune(self._jobs, self._spans, cands, benefit)
+        dropped, note = pruner.prune(self._jobs, self._spans, cands, benefit)
         if note:
             reasons.append(note)
         return [(p, got - dropped) for p, got in per_file]
