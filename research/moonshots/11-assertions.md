@@ -8,14 +8,14 @@ CPU. The payoff is still small, because it only applies to clean function-body e
 |---|---|
 | sample | about +5 s |
 | private264 | about -2 s |
-| P (practice-style) | __P__ |
+| P (practice-style) | -2.6 (net); +0.4 without the warm-up charge |
 | Q300 | __Q__ |
 
 - After two soundness fixes: **0 false drops in 2,811 labeled verdicts** (sample and private).
 - The prototype found **two false drops** first. Both are fixed (§Soundness). One of the two is a
   coverage hole that other line maps built with `sys.monitoring` LINE events alone may share.
-- Chance it helps the final measurably (more than 2 s per 40): **about 15%**.
-- Expected gain: **about +1 s per 40** (range -2 to +5).
+- Chance it helps the final measurably (more than 2 s per 40): **about 10%**.
+- Expected gain: **about 0 s per 40.** It ranges from -2.6 to +0.5 on P, and is +5 on sample.
 
 ## Mechanism (prototype: `11-assertions/asrv.py`, built on moon-02 `forksrv.py`)
 
@@ -87,13 +87,13 @@ commits:
 
 | | sample | private264 | P | Q300 |
 |---|---|---|---|---|
-| eligible (sliceable) commits | 8 / 30 | 47 / 264 | __Pn__ | __Qn__ |
+| eligible (sliceable) commits | 8 / 30 | 47 / 264 | 165 / 465 | __Qn__ |
 | verdicts vs labels | 70 / 70 exact | 2,740 exact; 1 extra fail; **0 false drops** | – | – |
-| gain, θ = 0.05 | 9.3 | 0.7 | __Pg__ | __Qg__ |
-| scorer CPU, θ = 0.05 (+3.0 warm-up) | 1.0 | 0.3 | __Pc__ | __Qc__ |
-| **net per 40, θ = 0.05** | **+5.3** | **-2.5** | __Pnet__ | __Qnet__ |
-| net per 40, θ = ∞ | +6.1 | -8.6 | __Pinf__ | __Qinf__ |
-| commits → [] per 40 | 4.0 | 0.3 | | |
+| gain, θ = 0.05 | 9.3 | 0.7 | 0.9 | __Qg__ |
+| scorer CPU, θ = 0.05 (+3.0 warm-up) | 1.0 | 0.3 | 0.6 | __Qc__ |
+| **net per 40, θ = 0.05** | **+5.3** | **-2.5** | **-2.6** | __Qnet__ |
+| net per 40, θ = ∞ | +6.1 | -8.6 | -2.0 | __Qinf__ |
+| commits → [] per 40 | 4.0 | 0.3 | 0.3 | |
 
 Where the sample gain comes from: 2qn5, 8y7j and fryt each go from about 2 s to 0, and bj7g gains a
 little. Each is a small set of dialect candidates that all pass.
@@ -118,6 +118,10 @@ candidates in the store):
     θ = ∞ the CPU loses.
 - **Fixture-case slicing** (a changed optimizer fixture case runs alone; `fix.py`) has a ceiling of
   only 0.0 / 1.9 / 0.8 s per 40 on sample / private / P. Nearly every fixture edit fails its test.
+- P (465 commits with cheap store candidates): 165 sliced; 108 module or class body edits, 101
+  fixture-only edits, 43 pure insertions, 24 with changed code that ran during warm-up, 7 first-line
+  edits. Best commits there: 3dwo, 94ik, ymum, 75de, orfb and 89l3, each about +2 s. Only about 3 per
+  40 commits are attempted at all.
 - **Module and class body edits** are the large ineligible group. Slicing them needs the
   state-diff machinery (which attributes changed) together with attribute-read coverage per unit.
   That is a separate project.
