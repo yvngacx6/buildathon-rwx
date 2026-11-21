@@ -410,9 +410,11 @@ class Cases:
                 lines = sorted(d)
                 idx = self._idx[path] = (lines, [d[ln] for ln in lines])
             lines, sids = idx
+            got = set()
             for first, last in ss:
-                for j in range(bisect.bisect_left(lines, first), bisect.bisect_right(lines, last)):
-                    out.update(meta["sets"][sids[j]])
+                got.update(sids[bisect.bisect_left(lines, first):bisect.bisect_right(lines, last)])
+            for sid in got:
+                out.update(meta["sets"][sid])
         return out
 
     def plan(self, spans: dict, numbers: set[int]):
