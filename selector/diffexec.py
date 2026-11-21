@@ -27,7 +27,9 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_STORE = REPO / "maps" / "diffexec.zip"
+# The repo keeps the store packed (maps/diffexec.xz); the Docker build expands it here
+# (python -m diffexec.solid unpack maps/diffexec.xz index/diffexec.zip).
+DEFAULT_STORE = REPO / "index" / "diffexec.zip"
 # Test sources mentioning these observe resources that replay cannot compare.
 RESOURCE_MODULES = {"tracemalloc", "gc", "resource", "time", "timeit", "psutil", "threading",
                     "signal", "faulthandler", "pyperf"}

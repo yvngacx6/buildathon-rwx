@@ -69,7 +69,7 @@ Push to a public GitHub repository with the `Dockerfile` at its top, then enter 
 - The scorer is linux/amd64. On an Apple Silicon Mac, build and run with `--platform linux/amd64`, as the Makefile does, or your timings and wheels will differ.
 - A change that only adds a comment is not promised to be harmless.
 
-## Note for judges: `maps/diffexec.zip`
+## Note for judges: `maps/diffexec.xz`
 
 **Interim build:** the store on this branch was recorded on a laptop (same sqlglot sha, same
 requirements versions, Python 3.13.12), not in the pinned image; see `maps/MANIFEST.json` →

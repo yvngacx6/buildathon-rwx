@@ -101,7 +101,7 @@ the whole module when `__future__` imports or module-level `global` could matter
 walk skips expressions without a `lambda` line; each pinned file is parsed and scoped once
 per run. Cyclic GC is off in the selector (trees free by reference count). The state-diff
 subprocess is unchanged in what it computes (same digests; only fast paths for exact types).
-## Differential execution (I12): `maps/diffexec.zip`
+## Differential execution (I12): `maps/diffexec.xz`
 
 For a commit whose `.py` edits are all inside function bodies, the tests the lines map selects
 for those functions are checked by replaying, old code against new code, every call input
@@ -124,7 +124,7 @@ droppable. Effect digests use the C pickler (identity-independent for immutables
 under a global byte budget by lines(f) × (seconds a change of f could save)^1.5 per byte
 (tests.json seconds; no labels).
 
-**Note for judges.** `maps/diffexec.zip` is built only from sqlglot at the pinned commit running
+**Note for judges.** `maps/diffexec.xz` is built only from sqlglot at the pinned commit running
 its own test suite in the pinned image (`mapbuild/diffexec_build.sh`): for every function under
 `sqlglot/`, the deduplicated inputs it was called with while each test ran (capped per function,
 caps applied after merging, so independent of parallelism) and a digest of each call's effect.

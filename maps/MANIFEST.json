@@ -50,22 +50,22 @@
  },
  "classes_run": "classes_run.json.gz: mapbuild/classes_run.py from trace_one.py traces (r6, same image/sha; every trace's classes equals classes.json.gz): classes minus objects made while a sqlglot/ module body executes",
  "diffexec": {
-  "file": "diffexec.zip",
-  "what": "per sqlglot function: deduplicated call inputs seen while each test ran (inputs over 16 kB with big list/dict/set elided to length-only stand-ins), with a digest of each call's effect (args after the call + result/exception), per (function, test phase) completeness. Built only from the pinned commit's own test run; no labels, patches or mutants. See research/ideas/I12-differential-execution.md (round 8).",
+  "file": "diffexec.xz",
+  "what": "per sqlglot function: deduplicated call inputs seen while each test ran (inputs over 16 kB with big list/dict/set elided to length-only stand-ins), with a digest of each call's effect (args after the call + result/exception), per (function, test phase) completeness. Built only from the pinned commit's own test run; no labels, patches or mutants. See research/ideas/I12-differential-execution.md (round 8). Round 14: the store zip is kept in the repo as ONE solid xz stream (diffexec/solid.py, functions in source order, 192 MiB dictionary; ~1.8x smaller than per-entry LZMA because functions share inputs); the Docker build expands it to /app/index/diffexec.zip.",
   "image": "python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 + requirements.lock",
   "sqlglot_sha": "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
   "env": {
    "PYTHONHASHSEED": "0",
    "SKIP_INTEGRATION": "0"
   },
-  "build_command": "mapbuild/diffexec_build.sh",
+  "build_command": "mapbuild/diffexec_build.sh (round 14: rebuilt from the round-8 per-file recordings with DIFFEXEC_STORE_BUDGET=27e6 DIFFEXEC_BUILD_BUCKETS=16, then python -m diffexec.solid pack)",
   "granularity": "one pytest process per test file; caps and the store budget applied after merging",
   "caps": {
    "calls_per_function": 50000,
    "bytes_per_input": 16000,
    "elide_containers_over_items": 32,
    "recorded_input_bytes_per_function_per_file": 2000000,
-   "store_budget": 13500000.0,
+   "store_budget": 27000000.0,
    "stakes_power": 1.5,
    "expensive_test_s": 0.5,
    "line_weight": true
@@ -75,18 +75,19 @@
   "record_wall_seconds": "about 2,000 (first run, 56 files) + 2,880 (RESUME run, 2 files, shared 4-core host)",
   "record_cpu_seconds": "not measured over both runs; the RESUME run used 1,911 CPU-s",
   "functions": 6678,
-  "functions_recorded": 2039,
+  "functions_recorded": 3071,
   "dead_by_reason": {
-   "budget": 4134,
+   "budget": 3102,
    "generator": 285,
    "calls": 220
   },
   "tests_failed_while_recorded": 1,
-  "bytes": 13102711,
+  "bytes": 13234508,
   "tests_failed_while_recorded_ids": [
    "tests/test_dialect_imports.py::TestDialectImports::test_dialect_attribute_access_is_cached"
   ],
-  "sha256": "bb6d6d09ee865a16a8017523cab086319b23d63543620d3dacce72de7eec5021"
+  "sha256": "f737ae2822701314ce9545d87bf9c7d3a1203d8d263a9160320ccf41e8fd84e0",
+  "zip_bytes_expanded_per_entry_lzma": 24646400
  },
  "not_shipped": {
   "files": [
@@ -95,5 +96,5 @@
   ],
   "why": "reference-only maps, removed from the repo for the 20 MB limit (r8-diffexec2); mapbuild/build.sh rebuilds them; keys/bytes/sha256 above describe the removed files"
  },
-"dialect_reach": "classes.json.gz and classes_run.json.gz then pass through mapbuild/dialect_reach.py <pinned sqlglot> maps (r12): every test recorded for a dialect class is also recorded for each sqlglot class in the MRO of that dialect's tokenizer_class / jsonpath_tokenizer_class / parser_class / generator_class (metaclass-resolved, inherited ones included). Static relation from the pinned source only; adds rows, never removes; idempotent."
+ "dialect_reach": "classes.json.gz and classes_run.json.gz then pass through mapbuild/dialect_reach.py <pinned sqlglot> maps (r12): every test recorded for a dialect class is also recorded for each sqlglot class in the MRO of that dialect's tokenizer_class / jsonpath_tokenizer_class / parser_class / generator_class (metaclass-resolved, inherited ones included). Static relation from the pinned source only; adds rows, never removes; idempotent."
 }

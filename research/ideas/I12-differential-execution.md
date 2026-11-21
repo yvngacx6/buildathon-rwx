@@ -344,3 +344,24 @@ Makefile's scorer flags.
 | `selector/diffexec.py` | gates, fork server, drop rule, resource rule |
 | `diffexec/measure.py`, `report_store.py`, `changed.py`, `try_patch.py`, `i13_bytecode.py` | measurement tools |
 | `diffexec/Dockerfile` | measurement image (`STORE=` prebuilt, or `RECORD=1` for an in-build recording) |
+
+## Round 14: solid-packed store (`maps/diffexec.xz`)
+
+- Cost reason #1 on 1,600 unlabeled mutants was "function not recorded (budget)" (24 % of cost).
+  The store was capped by the repo size, and each zip entry was compressed on its own.
+- Functions share inputs (the same token lists, trees and SQL reach hundreds of parser and
+  generator functions), so ONE xz stream over all entries (`diffexec/solid.py`, functions in
+  source order, 192 MiB dictionary) is 1.7-1.8x smaller: main's 13.10 MB zip packs to 7.65 MB.
+  The Docker build expands it to `/app/index/diffexec.zip`, the zip the replay read before
+  (entries deflate-1 instead of LZMA, so reading one is cheaper).
+- Rebuilt from the round-8 recordings (no re-record) with `DIFFEXEC_STORE_BUDGET=27e6`:
+  3,071 functions alive (was 2,039); 13.23 MB packed (the per-entry-LZMA zip would be
+  24.6 MB); repo tree 15.5 MB, unchanged.
+- Tried and dropped (bucket-0 sample, 30 functions, 118 MB raw): externalizing Expr roots as
+  content-addressed trees saved only ~10-20 % packed; 15 % of blobs fail the byte-identical
+  round trip and 37 % of bytes fall back. Byte-level matching across functions is weak because
+  pickle memo indices shift with what was pickled before (BINGET n differs).
+- All plannable functions (4,952) need about 3.1 GB raw, ~100 MB per-function xz, very roughly
+  55 MB solid: the rest needs a position-independent input encoding (re-record), not a better
+  compressor.
+- Not done: the calls cap (220 functions over 50k calls are never recorded).

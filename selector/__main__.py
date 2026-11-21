@@ -64,7 +64,7 @@ def _hashseed_for_diffexec() -> None:
     if os.environ.get("PYTHONHASHSEED") == "0" or os.environ.get("BR_DIFFEXEC", "1") == "0":
         return
     store = Path(os.environ.get("BR_DIFFEXEC_STORE",
-                                Path(__file__).resolve().parent.parent / "maps" / "diffexec.zip"))
+                                Path(__file__).resolve().parent.parent / "index" / "diffexec.zip"))
     if not store.is_file():
         return
     try:

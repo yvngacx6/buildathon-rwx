@@ -1,7 +1,7 @@
 """Record the diffexec store (idea I12) inside the map-building image. Called by diffexec_build.sh.
 
     python /repo/mapbuild/diffexec_run.py --tests /repo/sample/tests.json --work /work \
-        --out /repo/maps/diffexec.zip [-j N]
+        --out /repo/maps/diffexec.xz [-j N]
 
 * One pytest process per test FILE (`pytest -p diffexec.record <file>`), run in parallel. A
   file's recording therefore does not depend on which other files ran, or on -j.
@@ -91,8 +91,14 @@ def main() -> None:
     record_wall = time.time() - start
     record_cpu = (cpu1.children_user - cpu0.children_user) + (cpu1.children_system - cpu0.children_system)
 
-    built = subprocess.run([sys.executable, "-m", "diffexec.build", str(work), a.out, a.tests], cwd=repo,
+    # The run-time zip is built in the work dir; the repo keeps it packed as one solid xz
+    # stream (diffexec/solid.py), which the Docker build expands back into the zip.
+    zip_out = a.out if a.out.endswith(".zip") else str(work / "diffexec.zip")
+    built = subprocess.run([sys.executable, "-m", "diffexec.build", str(work), zip_out, a.tests], cwd=repo,
                            env=env, capture_output=True, text=True, check=True).stdout.strip()
+    if zip_out != a.out:
+        subprocess.run([sys.executable, "-m", "diffexec.solid", "pack", zip_out, a.out], cwd=repo,
+                       env=env, check=True)
     print(built)
     if a.no_manifest:
         print(f"record wall {time.time() - start:.0f}s", file=sys.stderr)
@@ -103,7 +109,7 @@ def main() -> None:
     import ast
     stats = ast.literal_eval(built)
     manifest["diffexec"] = {
-        "file": "diffexec.zip",
+        "file": os.path.basename(a.out),
         "what": "per sqlglot function: deduplicated call inputs seen while each test ran, with a digest "
                 "of each call's effect (args after the call + result/exception). Built only from the "
                 "pinned commit's own test run; no labels, patches or mutants. See research/ideas/"

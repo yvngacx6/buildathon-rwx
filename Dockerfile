@@ -11,7 +11,7 @@ tarfile.open(fileobj=io.BytesIO(data)).extractall('/opt', filter='data')" \
 
 COPY selector /app/selector
 COPY maps /app/maps
-# Differential-execution replay (I12); its store is maps/diffexec.zip.
+# Differential-execution replay (I12); its store is maps/diffexec.xz (expanded below).
 COPY diffexec /app/diffexec
 
 WORKDIR /app
@@ -22,12 +22,14 @@ ENV PYTHONDONTWRITEBYTECODE=1
 #    sqlglot: else the run, and its patched-import subprocess, compile every module they
 #    import, every time (PYTHONDONTWRITEBYTECODE only stops writing the cache)
 #  * the maps as per-file marshal shards (selector/maps.py)
+#  * the diffexec store, kept solid-packed in the repo, as the per-function zip the replay reads
 #  * the static name scan for name-reader narrowing (selector/nameindex.py), plus the
 #    import-time state snapshot (selector/state.py) next to it
 RUN python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')" \
     /opt/sqlglot/sqlglot /app/selector /app/diffexec \
  && python -m selector.maps build /app/maps /app/index/maps \
  && python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl \
+ && python -m diffexec.solid unpack /app/maps/diffexec.xz /app/index/diffexec.zip \
  && chmod -R a+rX /app /opt/sqlglot
 # -S: no site module (the selector needs only the standard library).
 CMD ["python", "-S", "-m", "selector"]

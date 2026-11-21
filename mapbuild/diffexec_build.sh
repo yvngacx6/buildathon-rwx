@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Rebuild maps/diffexec.zip (differential-execution store, idea I12) in the pinned image.
+# Rebuild maps/diffexec.xz (differential-execution store, idea I12) in the pinned image.
 #   usage: mapbuild/diffexec_build.sh [work-dir] [jobs]   (needs Docker; ~2.5 CPU-h, ~10 min on 32 cores)
-# Reads only sample/tests.json (the test file list). Writes maps/diffexec.zip + MANIFEST "diffexec".
+# Reads only sample/tests.json (the test file list). Writes maps/diffexec.xz (the store zip packed
+# solid, diffexec/solid.py; the Docker build expands it) + MANIFEST "diffexec".
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -19,6 +20,6 @@ docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
   -v "$REPO:/repo" -v "$WORK:/work" \
   "$IMAGE" \
   python /repo/mapbuild/diffexec_run.py --tests /repo/sample/tests.json --work /work \
-    --out /repo/maps/diffexec.zip -j "$JOBS" ${RESUME:+--resume}
+    --out /repo/maps/diffexec.xz -j "$JOBS" ${RESUME:+--resume}
 echo "diffexec store build wall time: $(( $(date +%s) - start ))s" >&2
-ls -l "$REPO/maps/diffexec.zip" >&2
+ls -l "$REPO/maps/diffexec.xz" >&2
