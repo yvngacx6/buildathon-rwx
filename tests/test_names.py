@@ -232,3 +232,21 @@ def test_decorated_class_with_side_effects_falls_back(selector):
 def test_when_v1_cannot_bound_a_module_edit_never_narrow(selector):
     # consts.K is star-imported by stars.py: v1 answers ALL, and so must we.
     assert run(selector, "sqlglot/consts.py", "K = 1", "K = 2") == EVERYONE
+
+
+def test_prebuilt_index_is_used_only_for_the_source_it_describes(tmp_path):
+    import pickle
+    from selector import nameindex
+    repo = tmp_path / "src"
+    for path, text in FILES.items():
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(text)
+    out = tmp_path / "names.pkl"
+    data = nameindex.build(nameindex.read_sources(repo), nameindex.file_sizes(repo))
+    out.write_bytes(pickle.dumps(data))
+    loaded = nameindex.load(out, repo)
+    assert loaded is not None
+    paths = {s.path for s in loaded.sites("WEEK", "sqlglot/dialect.py", ("TSQL",), False)}
+    assert {"sqlglot/dialect.py", "tests/test_tsql.py"} <= paths
+    (repo / "sqlglot/user.py").write_text(USER + "# edited\n")
+    assert nameindex.load(out, repo) is None

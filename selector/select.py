@@ -354,10 +354,9 @@ class Selector:
         """The prebuilt name index (image build) if it describes this source; else build it
         in memory (same answers, ~2 s more CPU)."""
         if self._name_index is None:
-            fp = nameindex.fingerprint(self.sqlglot)
             path = Path(os.environ.get("BR_INDEX", nameindex.DEFAULT_PATH))
-            self._name_index = nameindex.load(path, fp) or nameindex.NameIndex(
-                nameindex.build(self._all_sources(), fp))
+            self._name_index = nameindex.load(path, self.sqlglot) or nameindex.NameIndex(
+                nameindex.build(self._all_sources(), []))
         return self._name_index
 
     def _class_users(self, module: str, chains) -> set[int]:

@@ -8,11 +8,11 @@ getattr scan). That takes ~2 s of CPU, and the build is not charged, so the Dock
 and a run only unpickles the tables (and, per name, the occurrences it asks about). When the
 index is missing or describes other source (fingerprint of file paths and sizes), the
 selector builds it in memory from the source instead: same answers, more CPU.
+(A stale index is detected by re-checking the size of every file it scanned.)
 """
 
 from __future__ import annotations
 
-import hashlib
 import pickle
 import re
 import sys
@@ -32,33 +32,33 @@ def read_sources(sqlglot: Path) -> dict[str, str]:
     return sources
 
 
-def fingerprint(sqlglot: Path) -> str:
-    """Which source an index describes: every scanned file's path and size (cheap to check)."""
-    h = hashlib.sha256()
-    for root in ("sqlglot", "tests"):
-        for p in sorted((sqlglot / root).rglob("*.py")):
-            h.update(f"{p.relative_to(sqlglot).as_posix()}:{p.stat().st_size}\n".encode())
-    return h.hexdigest()
+def file_sizes(sqlglot: Path) -> list[tuple[str, int]]:
+    """Which source an index describes: every scanned file's path and size."""
+    return sorted((p.relative_to(sqlglot).as_posix(), p.stat().st_size)
+                  for root in ("sqlglot", "tests") for p in (sqlglot / root).rglob("*.py"))
 
 
-def build(sources: dict[str, str], fp: str) -> dict:
+def build(sources: dict[str, str], files: list[tuple[str, int]]) -> dict:
     """The stored form of `Index.export()`. Occurrences are pickled per name, so a run only
     unpickles the names it asks about."""
     data = Index(sources).export()
     data["occ"] = {k: zlib.compress(pickle.dumps(v, pickle.HIGHEST_PROTOCOL), 1)
                    for k, v in data["occ"].items()}
-    data["fingerprint"] = fp
+    data["files"] = files
     return data
 
 
-def load(path: Path, fp: str) -> NameIndex | None:
-    """The index built for this exact source, or None (missing / stale / unreadable)."""
+def load(path: Path, sqlglot: Path) -> NameIndex | None:
+    """The index built for this source, or None (missing / stale / unreadable).
+
+    Checks that every file the index scanned still has its size (a stat per file; no
+    directory walk), which catches a different checkout or a fake test repo."""
     try:
         data = pickle.loads(path.read_bytes())
+        if not all((sqlglot / rel).stat().st_size == size for rel, size in data["files"]):
+            return None
     except (OSError, pickle.UnpicklingError, EOFError, AttributeError, ValueError,
-            ImportError):
-        return None
-    if not isinstance(data, dict) or data.get("fingerprint") != fp:
+            ImportError, KeyError, TypeError):
         return None
     return NameIndex(data)
 
@@ -220,7 +220,7 @@ def main(argv: list[str]) -> None:
     if len(argv) != 3 or argv[0] != "build":
         sys.exit(main.__doc__)
     sqlglot, out = Path(argv[1]), Path(argv[2])
-    data = build(read_sources(sqlglot), fingerprint(sqlglot))
+    data = build(read_sources(sqlglot), file_sizes(sqlglot))
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(pickle.dumps(data, pickle.HIGHEST_PROTOCOL))
     print(f"name index: {len(data['occ'])} names, {out.stat().st_size // 1024} KiB -> {out}")
