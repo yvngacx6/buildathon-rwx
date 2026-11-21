@@ -42,7 +42,6 @@ import json
 import os
 import pickle
 import re
-import subprocess
 import sys
 import types
 from pathlib import Path
@@ -142,6 +141,9 @@ class Snapshot:
 
     def _fp(self, v: object, depth: int) -> str:
         f = self.fp
+        if type(v) is dict:  # the most common container: the dict branch below, sooner
+            items = [(f(k), f(x)) for k, x in v.items()]
+            return _h("dict", "dict", items if self.ordered else sorted(items))
         if isinstance(v, type):
             if self._ours(v):
                 return "class:" + self._register(v, f"<anon>.{v.__module__}.{v.__qualname__}")
@@ -252,11 +254,13 @@ class Snapshot:
                  for k in [key] + [self.class_key.get(id(b)) for b in cls.__mro__[1:]] if k}
         return sorted(found)
 
-    def info(self) -> dict[str, dict]:
-        """Per class key: source file, qualname, whether the name leads to it, and the keys
-        of its ancestors."""
+    def info(self, keys: set[str] | None = None) -> dict[str, dict]:
+        """Per class key (all, or those in `keys`): source file, qualname, whether the name
+        leads to it, and the keys of its ancestors."""
         out = {}
         for key, cls in self.classes:
+            if keys is not None and key not in keys:
+                continue
             mod = sys.modules.get(cls.__module__)
             out[key] = {
                 "module": cls.__module__,
@@ -364,8 +368,8 @@ def compare(snap: Snapshot, old: dict, patched: dict[str, str]) -> dict:
             changed.append(k)
         elif k not in loose and _module_of_key(k) in modules:
             changed.append(k)
-    info = snap.info()
     keys = {k.split(" ")[1] for k in changed if k.startswith("C ")}
+    info = snap.info(keys)
     return {"changed": sorted(changed),
             "info": {k: info.get(k) or old["info"].get(k) for k in keys},
             "instances": sorted(set(snap.instance_mro()) | set(old["instances"]))}
@@ -444,6 +448,8 @@ _RUN = (f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent.pa
 
 
 def _run(args: list[str], stdin: str | None) -> str | None:
+    import subprocess  # here: the interpreter that `_run` starts does not need it
+
     env = {"PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1", "PATH": os.environ.get(
         "PATH", "/usr/bin:/bin")}
     if os.environ.get("BR_STATE_PYCACHE"):
