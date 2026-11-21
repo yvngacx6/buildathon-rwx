@@ -109,7 +109,8 @@ class Selector:
     def __init__(self, tests: list[dict], sqlglot: Path, maps: Path) -> None:
         self.tests = tests
         self.sqlglot = sqlglot
-        self.maps = Maps(maps, tests, Path(os.environ.get("BR_MAPS_COMPILED", maps_module.COMPILED)))
+        compiled = Path(os.environ.get("BR_MAPS_COMPILED", maps_module.COMPILED))
+        self.maps = Maps(maps, tests, compiled)
         self._all = {t["number"] for t in tests}
         self._by_file: dict[str, set[int]] = {}
         self._id_of: dict[int, str] = {}
@@ -264,7 +265,8 @@ class Selector:
             # (ImportError at collection, AttributeError at call) – far beyond its own tests.
             raise AllTests(f"{path}: binding removed ({', '.join(sorted(lost)[:3])})")
         removed, added = diff.changed_lines(fp)
-        found = classify.regions(old_tree, new_tree, removed, added, same, self._old_scopes(path))
+        found = classify.regions(old_tree, new_tree, removed, added, same,
+                                 self._old_scopes(path))
         if not found:
             return set(), "no behaviour-changing region"
         if path.startswith("tests/"):
@@ -922,10 +924,9 @@ def _module_scope(body: list[ast.stmt]):
         yield stmt
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
-        for name in ("body", "orelse", "finalbody"):
-            yield from _module_scope(getattr(stmt, name, None) or [])
-        for part in getattr(stmt, "handlers", None) or getattr(stmt, "cases", None) or []:
-            yield from _module_scope(part.body)
+        for name in classify.NESTED_STMTS:
+            for child in getattr(stmt, name, None) or ():
+                yield from _module_scope([child] if isinstance(child, ast.stmt) else child.body)
 
 
 def _is_future(stmt: ast.stmt) -> bool:
@@ -933,7 +934,7 @@ def _is_future(stmt: ast.stmt) -> bool:
 
 
 def _has_docstring(body: list[ast.stmt]) -> bool:
-    return bool(body) and classify._is_docstring(body[0])
+    return bool(body) and classify.is_docstring(body[0])
 
 
 def _leading_futures(body: list[ast.stmt]) -> int:

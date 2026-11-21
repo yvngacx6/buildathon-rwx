@@ -46,7 +46,8 @@ def main() -> None:
         workers = all_workers if numbers == everything else pack.pack(numbers, ms_of)
         if numbers != everything and pack.cost_ms(workers, ms_of) >= ALL_FRACTION * all_cost:
             # Nearly the price of ALL: take ALL, which cannot miss.
-            numbers, workers, reason = everything, all_workers, f"ALL (selection ~ALL cost) {reason}"
+            numbers, workers = everything, all_workers
+            reason = f"ALL (selection ~ALL cost) {reason}"
         cost = pack.cost_ms(workers, ms_of) / 1000
         print(f"[{commit}] {len(numbers)} tests, {len(workers)} workers, {cost:.1f}s :: {reason}",
               file=sys.stderr)

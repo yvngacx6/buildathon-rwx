@@ -56,7 +56,7 @@ class _Scope:
     metaclass: bool = False  # a def directly inside a metaclass
 
 
-def _is_docstring(stmt: ast.stmt) -> bool:
+def is_docstring(stmt: ast.stmt) -> bool:
     return (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
             and isinstance(stmt.value.value, str))
 
@@ -74,15 +74,15 @@ def strip_docstrings(tree: ast.AST) -> ast.AST:
         node = todo.pop()
         body = getattr(node, "body", None)
         if (isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-                and body and _is_docstring(body[0])):
+                and body and is_docstring(body[0])):
             body[0] = ast.copy_location(ast.Pass(), body[0])
-        for name in _NESTED_STMTS:
+        for name in NESTED_STMTS:
             todo.extend(getattr(node, name, None) or ())
     return tree
 
 
 # Fields that hold statements (or handlers / match cases, which hold statements).
-_NESTED_STMTS = ("body", "orelse", "finalbody", "handlers", "cases")
+NESTED_STMTS = ("body", "orelse", "finalbody", "handlers", "cases")
 
 
 def _is_metaclass(node: ast.ClassDef) -> bool:
@@ -175,7 +175,7 @@ class Scopes:
         if self._lambda_lines is not None and hasattr(node, "end_lineno"):
             i = bisect.bisect_left(self._lambda_lines, _first_line(node))
             if i == len(self._lambda_lines) or self._lambda_lines[i] > node.end_lineno:
-                fields = [f for f in fields if f in _NESTED_STMTS]
+                fields = [f for f in fields if f in NESTED_STMTS]
         out = []
         for name in fields:
             value = getattr(node, name, None)
@@ -218,9 +218,6 @@ class Scopes:
             if s.start <= line <= s.end and (best is None or s.depth > best.depth):
                 best = s
         return best
-
-    def top_level_classes(self) -> list[str]:
-        return [s.chain[0] for s in self.scopes if s.kind == "class" and len(s.chain) == 1]
 
 
 def lambda_call_lines(lam: ast.Lambda) -> tuple[int, int]:
@@ -488,8 +485,8 @@ def _yields(node: ast.AST) -> bool:
 
 
 def top_level_classes(tree: ast.Module) -> list[str]:
-    """`Scopes(tree).top_level_classes()`: classes outside any def or class body (module
-    level, also inside module-level if / try / with / match), in source order."""
+    """Classes outside any def or class body (module level, also inside module-level
+    if / try / with / match), in source order."""
     out = []
     todo = list(reversed(tree.body))
     while todo:
@@ -498,6 +495,6 @@ def top_level_classes(tree: ast.Module) -> list[str]:
             out.append(node.name)
         elif not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for name in reversed(node._fields):
-                if name in _NESTED_STMTS:
+                if name in NESTED_STMTS:
                     todo.extend(reversed(getattr(node, name, None) or ()))
     return out
