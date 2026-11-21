@@ -284,6 +284,22 @@ def test_computed_lookup_on_a_module_cannot_read_a_class_attribute():
     assert found[other] is None
 
 
+@pytest.mark.parametrize("old, new, kept", [
+    ('{"x": 1, "y": 2}', '{"x": 1, "y": 3}', {"truth", "keys"}),
+    ('{"x": 1}', '{"z": 1}', {"truth"}),
+    ('{"x": 1}', '{}', set()),
+    ('{"x": 1, **A}', '{"x": 2, **A}', set()),  # unpacking: unknown
+    ("True", "False", set()),
+    ("3", "4", {"truth"}),
+    ('["a", "b"]', '["b", "a"]', {"truth", "keys"}),
+    ("[]", "()", set()),  # another type
+])
+def test_what_a_literal_edit_keeps(old, new, kept):
+    import ast
+    from selector.names import _kept
+    assert _kept(ast.parse(old, mode="eval").body, ast.parse(new, mode="eval").body) == kept
+
+
 @pytest.mark.parametrize("code, use", [
     ("if x.A: pass", "truth"),
     ("y = 1 if not x.A else 2", "truth"),

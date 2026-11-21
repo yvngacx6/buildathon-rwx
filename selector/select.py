@@ -589,8 +589,14 @@ class Selector:
                 if touch is not None and (owner_path, owner_chain) != (path, r.chain):
                     touch |= self.maps.whole_file(owner_path) | self._class_users(
                         _module_of(owner_path), [owner_chain])
+            # an in-place literal edit: reads of only its truth / keys may see no change
+            kept = (change.same.get(name, frozenset())
+                    if (owner_path, owner_chain) == (path, r.chain if r.kind == "class" else ())
+                    else frozenset())
             for site in index.sites(name, owner_path, owner_chain, name in change.new_names):
                 n_sites += 1
+                if site.when == "run" and site.use and site.use in kept:
+                    continue
                 if (site.when == "run" and not site.dynamic and not site.path.startswith("tests/")
                         and self.maps.import_time.modules(site.path, *site.lines)):
                     # a def body that also runs at import (`sql_names()` building the

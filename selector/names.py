@@ -79,6 +79,8 @@ class BodyChange:
     # a changed statement builds a set: its iteration order can follow the literal's order,
     # which the state snapshot (sets digested sorted) does not see
     sets: bool = False
+    # name → what an in-place edit provably keeps of the value ("truth", "keys"; Site.use)
+    same: dict[str, frozenset[str]] = field(default_factory=dict)
 
 
 def _key(stmt: ast.stmt) -> str:
@@ -143,11 +145,52 @@ def body_change(old_body: list[ast.stmt], new_body: list[ast.stmt],
             same_kind = _kind(old.value) == _kind(stmt.value)
             for name in names:
                 out.names[name] = out.names.get(name, True) and same_kind
+            if len(names) == 1:
+                kept = _kept(old.value, stmt.value)
+                if kept:
+                    out.same[names[0]] = kept
     for names in old_by_target:  # removed assignments: readers now see the inherited value
         for n in names:
             out.names[n] = False
             out.new_names.add(n)
     return out
+
+
+def _shape(node: ast.AST) -> tuple[bool | None, frozenset | None]:
+    """(truth, set of keys / elements) of a literal display, statically; None: unknown."""
+    if isinstance(node, ast.Constant):
+        try:
+            return bool(node.value), None
+        except Exception:  # noqa: BLE001
+            return None, None
+    if isinstance(node, ast.Dict):
+        items = node.keys
+    elif isinstance(node, (ast.Set, ast.List, ast.Tuple)):
+        items = node.elts
+    else:
+        return None, None
+    if any(k is None or isinstance(k, ast.Starred) for k in items):
+        return None, None  # ** / * unpacking: size and members unknown
+    truth = bool(items)
+    if not all(isinstance(k, ast.Constant) for k in items):
+        return truth, None
+    try:
+        return truth, frozenset((type(k.value), k.value) for k in items)
+    except TypeError:
+        return truth, None
+
+
+def _kept(old: ast.AST, new: ast.AST) -> frozenset[str]:
+    """What reads of truth / membership see unchanged between two literal values."""
+    if type(old) is not type(new):
+        return frozenset()
+    (t0, k0), (t1, k1) = _shape(old), _shape(new)
+    kept = set()
+    if t0 is not None and t0 == t1:
+        kept.add("truth")
+    if k0 is not None and k0 == k1:
+        kept.add("keys")
+    return frozenset(kept)
 
 
 def _unmatched(body: list[ast.stmt], keys: list[str], other_keys: list[str]) -> list[ast.stmt]:
