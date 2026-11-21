@@ -123,7 +123,8 @@ class Selector:
         self._sources: dict[str, str] | None = None
         self._some_sources: dict[str, str | None] = {}  # `_source` before `_all_sources`
         self._classes_of: dict[str, list[str]] = {}
-        self._old_trees: dict[str, ast.Module] = {}
+        self._old_trees: dict[str, tuple[ast.Module, list[str] | None]] = {}
+        self._scopes: dict[str, classify.Scopes] = {}
         self._name_index: nameindex.NameIndex | None = None
         self._files: list[diff.FilePatch] = []  # the current commit's files
         self._state: dict | None | bool = False  # its import-state diff (False: not yet run)
@@ -263,7 +264,7 @@ class Selector:
             # (ImportError at collection, AttributeError at call) – far beyond its own tests.
             raise AllTests(f"{path}: binding removed ({', '.join(sorted(lost)[:3])})")
         removed, added = diff.changed_lines(fp)
-        found = classify.regions(old_tree, new_tree, removed, added, same)
+        found = classify.regions(old_tree, new_tree, removed, added, same, self._old_scopes(path))
         if not found:
             return set(), "no behaviour-changing region"
         if path.startswith("tests/"):
@@ -703,7 +704,7 @@ class Selector:
         got: set[int] = set()
         if not names:
             return got
-        for s in classify.Scopes(old_tree).scopes:
+        for s in self._old_scopes(path).scopes:
             if s.kind != "def":
                 continue
             body = s.node.body
@@ -856,10 +857,17 @@ class Selector:
     def _old_tree(self, path: str, old_bytes: bytes) -> ast.Module:
         """The pinned file's syntax tree, docstrings stripped (parsed once per run: nothing
         changes the trees after `strip_docstrings`)."""
-        tree = self._old_trees.get(path)
-        if tree is None:
-            tree = self._old_trees[path] = classify.strip_docstrings(ast.parse(old_bytes))
-        return tree
+        if path not in self._old_trees:
+            tree = classify.strip_docstrings(ast.parse(old_bytes))
+            lines = None if b"\r" in old_bytes else old_bytes.decode("utf-8").split("\n")
+            self._old_trees[path] = tree, lines
+        return self._old_trees[path][0]
+
+    def _old_scopes(self, path: str) -> classify.Scopes:
+        """`Scopes` of a file `_old_tree` parsed (built once per run)."""
+        if path not in self._scopes:
+            self._scopes[path] = classify.Scopes(*self._old_trees[path])
+        return self._scopes[path]
 
     def _all_sources(self) -> dict[str, str]:
         if self._sources is None:

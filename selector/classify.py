@@ -333,11 +333,12 @@ def _unchanged(region: Region, old: Scopes, new: Scopes, same: SameAst) -> bool:
 
 
 def regions(old_tree: ast.Module, new_tree: ast.Module, removed: list[int], added: list[int],
-            same: SameAst | None = None) -> list[Region]:
+            same: SameAst | None = None, old_scopes: Scopes | None = None) -> list[Region]:
     """Behaviour-changing regions of one file. Pass trees through `strip_docstrings` first.
-    `same`: the trees' SameAst, if the caller has one (else nodes are compared by dump)."""
+    `same`: the trees' SameAst, if the caller has one (else nodes are compared by dump);
+    `old_scopes`: `Scopes(old_tree)`, if the caller has it."""
     same = same or SameAst()
-    old, new = Scopes(old_tree, same.old), Scopes(new_tree, same.new)
+    old, new = old_scopes or Scopes(old_tree, same.old), Scopes(new_tree, same.new)
     found: dict[Region, None] = {}
     for line in removed:
         found.setdefault(_region_for_old_line(old, line))
