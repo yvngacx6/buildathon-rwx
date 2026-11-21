@@ -14,8 +14,10 @@ What it does, per commit with static selection S
            worker re-imports everything; they are never worth running here.
   2. Cost policy (no knowledge of which tests a patch breaks, only prices):
        saving   = cost(S) - cost(K)        (scorer cost: busiest worker + 2 s per worker)
-       expected = (1 - P_FAIL) * saving    (P_FAIL_DATA when the patch touches a non-.py file:
-                                            data/fixture edits are made to change test output)
+       expected = (1 - P_FAIL) * saving    (P_FAIL_DATA when the patch touches a non-.py file)
+       P_FAIL / P_FAIL_DATA are measured cost priors (how often a run finds a failure, on the
+       labeled sets). They only decide whether running is worth the CPU: a wrong prior costs
+       seconds, never a miss, because the output is always the run's failures ∪ K, or S.
        run R iff expected > estimated CPU of running R + MARGIN.
   3. Run R with pytest against the patched sqlglot (symlink overlay in /tmp, forked child of a
      server that has pytest pre-imported but never sqlglot) and judge each test with the
@@ -344,21 +346,20 @@ def _child(root: str, src: str, ids: list[str], out: str) -> None:
         sys.path[:] = [root] + [p for p in sys.path if p not in ("", src, here, os.getcwd())]
         os.environ["PYTHONPATH"] = root
 
-        # A test that starts a process pool or child interpreter we did not plan for → anomaly.
+        # A test that starts a process pool or multiprocessing child we did not plan for: refuse
+        # it (a spawn pool sized by the host's cores could hit the pid / memory limits) and mark
+        # the run as an anomaly, so the commit keeps its static selection.
         import concurrent.futures.process as cfp
         import multiprocessing.process as mpp
-        orig_pool_init, orig_start = cfp.ProcessPoolExecutor.__init__, mpp.BaseProcess.start
 
-        def pool_init(self, *a, **k):
-            result["spawned"].append("ProcessPoolExecutor")
-            return orig_pool_init(self, *a, **k)
+        def refuse(what):
+            def guard(self, *a, **k):
+                result["spawned"].append(what)
+                raise RuntimeError(f"selector.verify: {what} refused")
+            return guard
 
-        def proc_start(self, *a, **k):
-            result["spawned"].append("multiprocessing.Process")
-            return orig_start(self, *a, **k)
-
-        cfp.ProcessPoolExecutor.__init__ = pool_init
-        mpp.BaseProcess.start = proc_start
+        cfp.ProcessPoolExecutor.__init__ = refuse("ProcessPoolExecutor")
+        mpp.BaseProcess.start = refuse("multiprocessing.Process")
 
         import pytest
 
