@@ -4,68 +4,201 @@ Each map file is loaded lazily, on first use, and each key is resolved to test n
 when it is asked for, so a run that never needs a map never pays for it.
 Test ids are translated to numbers through the run's own tests.json; ids the run does not
 know are ignored.
+
+The image build compiles the maps (`python -m selector.maps build maps index/maps`) into
+marshal files, with the line-keyed maps split per source file, so a run reads only the
+files a commit touches instead of decompressing and decoding every map. The compiled form
+holds exactly the same keys and index lists; when it is missing or was built from another
+map file (CRC of the .json.gz), the selector reads the .json.gz itself.
 """
 
 from __future__ import annotations
 
 import gzip
 import json
+import marshal
+import sys
+import zlib
+from array import array
 from pathlib import Path
 
-MAP_FILES = ("lines", "classes", "reads", "test_imports", "import_time", "imports")
+MAP_FILES = ("lines", "classes", "classes_run", "reads", "test_imports", "import_time", "imports")
+SHARDED = ("lines", "import_time")  # keys "<path>:<line>": one compiled file per path
 ISOLATION_FAILURE = "<isolation-failure>"  # imports map: tests whose record may be incomplete
+COMPILED = Path(__file__).resolve().parent.parent / "index" / "maps"
+WHOLE_FILE = "*"  # in a compiled shard: every index recorded for any line of the file
+
+
+class _Table:
+    """The raw content of one map file: its "tests" list, its other top-level fields
+    ("extra") and key → indices into "tests"."""
+
+    def __init__(self, source: Path, compiled: Path | None) -> None:
+        self.source = source
+        self._compiled = compiled
+        self._meta: dict | None = None
+        self._shards: dict[str, dict[str, bytes]] = {}
+
+    def _load(self) -> dict:
+        if self._meta is None:
+            meta = None
+            if self._compiled is not None and self.source.is_file():
+                try:
+                    meta = marshal.loads((self._compiled / "meta.marshal").read_bytes())
+                    if meta["source_crc"] != _crc(self.source):
+                        meta = None
+                except (OSError, EOFError, ValueError, TypeError, KeyError):
+                    meta = None
+            if meta is None:  # no usable compiled form: the .json.gz itself
+                self._compiled = None
+                data = {"tests": [], "map": {}}
+                if self.source.is_file():
+                    data = json.loads(gzip.decompress(self.source.read_bytes()))
+                meta = {"tests": data["tests"], "map": data["map"], "extra": _extra(data)}
+            self._meta = meta
+        return self._meta
+
+    @property
+    def tests(self) -> list[str]:
+        return self._load()["tests"]
+
+    @property
+    def extra(self) -> dict:
+        return self._load()["extra"]
+
+    def get(self, key: str):
+        """Indices recorded for `key` (empty when absent)."""
+        meta = self._load()
+        if self._compiled is None:
+            return meta["map"].get(key, ())
+        if "map" in meta:
+            packed = meta["map"].get(key)
+        else:
+            path, _, line = key.rpartition(":")
+            packed = self._shard(path).get(line)
+        return _unpack(packed)
+
+    def in_file(self, path: str):
+        """Indices recorded for any key `<path>:<line>`."""
+        meta = self._load()
+        if self._compiled is not None:
+            return _unpack(self._shard(path).get(WHOLE_FILE))
+        out: set[int] = set()
+        for key, idx in meta["map"].items():
+            if key.rpartition(":")[0] == path:
+                out.update(idx)
+        return out
+
+    def _shard(self, path: str) -> dict[str, bytes]:
+        shard = self._shards.get(path)
+        if shard is None:
+            number = self._load()["shards"].get(path)
+            shard = self._shards[path] = {} if number is None else marshal.loads(
+                (self._compiled / f"{number}.marshal").read_bytes())
+        return shard
+
+
+def _extra(data: dict) -> dict:
+    return {k: v for k, v in data.items() if k not in ("tests", "map")}
+
+
+def _crc(path: Path) -> int:
+    return zlib.crc32(path.read_bytes())
+
+
+def _pack(indices) -> bytes:
+    return array("I", indices).tobytes()
+
+
+def _unpack(packed: bytes | None):
+    return () if packed is None else memoryview(packed).cast("I")
+
+
+def compile_maps(source: Path, out: Path) -> None:
+    """Build step: write the compiled form of every map in `source` under `out`."""
+    for name in MAP_FILES:
+        src = source / f"{name}.json.gz"
+        if not src.is_file():
+            continue
+        data = json.loads(gzip.decompress(src.read_bytes()))
+        meta = {"source_crc": _crc(src), "tests": data["tests"], "extra": _extra(data)}
+        folder = out / name
+        folder.mkdir(parents=True, exist_ok=True)
+        if name in SHARDED:
+            shards: dict[str, dict[str, list[int]]] = {}
+            for key, idx in data["map"].items():
+                path, _, line = key.rpartition(":")
+                shards.setdefault(path, {})[line] = idx
+            meta["shards"] = {}
+            for number, (path, shard) in enumerate(sorted(shards.items())):
+                packed = {line: _pack(idx) for line, idx in shard.items()}
+                packed[WHOLE_FILE] = _pack(sorted({i for idx in shard.values() for i in idx}))
+                (folder / f"{number}.marshal").write_bytes(marshal.dumps(packed))
+                meta["shards"][path] = number
+        else:
+            meta["map"] = {key: _pack(idx) for key, idx in data["map"].items()}
+        (folder / "meta.marshal").write_bytes(marshal.dumps(meta))
+        print(f"map {name}: {len(data['map'])} keys -> {folder}")
 
 
 class Map:
-    """One `<name>.json.gz` file: key → frozenset of test numbers."""
+    """One map file: key → frozenset of test numbers."""
 
-    def __init__(self, path: Path, number_of: dict[str, int]) -> None:
+    def __init__(self, path: Path, number_of: dict[str, int], compiled: Path | None) -> None:
         self.path = path
+        self._table = _Table(path, compiled)
         self._number_of = number_of
-        self._raw: dict[str, list[int]] | None = None
-        self._numbers: list[int | None] = []
+        self._numbers: list[int | None] | None = None
         self._cache: dict[str, frozenset[int]] = {}
-        self.extra: dict = {}
 
-    def _load(self) -> dict[str, list[int]]:
-        if self._raw is None:
-            if self.path.is_file():
-                data = json.loads(gzip.decompress(self.path.read_bytes()))
-            else:
-                data = {"tests": [], "map": {}}
-            self._numbers = [self._number_of.get(t) for t in data["tests"]]
-            self._tests = data["tests"]
-            self._raw = data["map"]
-            self.extra = {k: v for k, v in data.items() if k not in ("tests", "map")}
-        return self._raw
+    def _translate(self, idx) -> frozenset[int]:
+        if self._numbers is None:
+            self._numbers = [self._number_of.get(t) for t in self._table.tests]
+        numbers = self._numbers
+        return frozenset(n for n in (numbers[i] for i in idx) if n is not None)
 
     def get(self, key: str) -> frozenset[int]:
         """Tests recorded for `key` (empty when the key is absent)."""
         hit = self._cache.get(key)
         if hit is None:
-            idx = self._load().get(key, ())
-            hit = frozenset(n for n in (self._numbers[i] for i in idx) if n is not None)
-            self._cache[key] = hit
+            hit = self._cache[key] = self._translate(self._table.get(key))
         return hit
 
+    def in_file(self, path: str) -> frozenset[int]:
+        """Tests recorded for any key `<path>:<line>`."""
+        return self._translate(self._table.in_file(path))
+
+    @property
+    def extra(self) -> dict:
+        """Top-level fields of the map file other than "tests" and "map"."""
+        return self._table.extra
+
     def traced_ids(self) -> list[str]:
-        self._load()
-        return self._tests
+        return self._table.tests
 
 
 class Maps:
     """All maps for one run, plus derived lookups the selector needs."""
 
-    def __init__(self, directory: Path, tests: list[dict]) -> None:
+    def __init__(self, directory: Path, tests: list[dict], compiled: Path | None = None) -> None:
+        """`compiled`: the folder `compile_maps` wrote, if any."""
         number_of = {t["id"]: t["number"] for t in tests}
         self._number_of = number_of
-        self.lines = Map(directory / "lines.json.gz", number_of)
-        self.classes = Map(directory / "classes.json.gz", number_of)
-        self.reads = Map(directory / "reads.json.gz", number_of)
-        self.test_imports = Map(directory / "test_imports.json.gz", number_of)
-        self.import_time = ImportTimeMap(directory / "import_time.json.gz")
-        self.imports = Map(directory / "imports.json.gz", number_of)
-        self._file_index: dict[str, list[str]] | None = None
+
+        def open_map(name: str) -> Map:
+            return Map(directory / f"{name}.json.gz", number_of, compiled and compiled / name)
+
+        self.lines = open_map("lines")
+        self.classes = open_map("classes")
+        # classes_run: instantiations outside sqlglot module bodies (objects made at import
+        # are reached through the state entries that hold them); without it, `classes`
+        self.classes_run = (open_map("classes_run")
+                            if (directory / "classes_run.json.gz").is_file() else None)
+        self.reads = open_map("reads")
+        self.test_imports = open_map("test_imports")
+        self.import_time = ImportTimeMap(directory / "import_time.json.gz",
+                                         compiled and compiled / "import_time")
+        self.imports = open_map("imports")
         self._unvouched: frozenset[int] | None = None
         self._file_cache: dict[str, frozenset[int]] = {}
 
@@ -80,15 +213,7 @@ class Maps:
         """Tests that executed any line of `path`."""
         hit = self._file_cache.get(path)
         if hit is None:
-            if self._file_index is None:
-                index: dict[str, list[str]] = {}
-                for key in self.lines._load():
-                    index.setdefault(key.rpartition(":")[0], []).append(key)
-                self._file_index = index
-            out: set[int] = set()
-            for key in self._file_index.get(path, ()):
-                out |= self.lines.get(key)
-            hit = self._file_cache[path] = frozenset(out)
+            hit = self._file_cache[path] = self.lines.in_file(path)
         return hit
 
     def module_users(self, module: str, class_names: list[str]) -> set[int]:
@@ -114,7 +239,6 @@ class Maps:
         `pytest --collect-only tests`)? by_import: loaded by an import statement (or a
         package), i.e. other collected modules need it, not only pytest itself.
         True when the map does not say (missing map or field): assume the worst."""
-        self.imports._load()
         key = "collection_imported" if by_import else "collection"
         paths = self.imports.extra.get(key)
         return paths is None or path in paths
@@ -135,23 +259,20 @@ class ImportTimeMap:
 
     ROOT = "sqlglot"
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, compiled: Path | None = None) -> None:
         self.path = path
-        self._roots: list[str] = []
-        self._raw: dict[str, list[int]] | None = None
-
-    def _load(self) -> dict[str, list[int]]:
-        if self._raw is None:
-            data = {"tests": [], "map": {}}
-            if self.path.is_file():
-                data = json.loads(gzip.decompress(self.path.read_bytes()))
-            self._roots, self._raw = data["tests"], data["map"]
-        return self._raw
+        self._table = _Table(path, compiled)
 
     def modules(self, path: str, first: int, last: int) -> set[str]:
         """Modules whose import executes any line in path:first..last."""
-        raw = self._load()
+        roots = self._table.tests
         out: set[str] = set()
         for line in range(first, last + 1):
-            out.update(self._roots[i] for i in raw.get(f"{path}:{line}", ()))
+            out.update(roots[i] for i in self._table.get(f"{path}:{line}"))
         return out
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] != ["build"] or len(sys.argv) != 4:
+        sys.exit("usage: python -m selector.maps build <maps dir> <out dir>")
+    compile_maps(Path(sys.argv[2]), Path(sys.argv[3]))

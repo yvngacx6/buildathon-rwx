@@ -170,7 +170,8 @@ def test_snapshot_of_other_source_is_not_used(repo, tmp_path, monkeypatch):
     (other / D).write_text(DIALECT + "\n# changed size\n")
     (other / "sqlglot/__init__.py").write_text("")
     assert state.diff(other, snapshot, {}) is None
-    assert state.diff(root, snapshot, {}) == {"changed": [], "info": {}, "instances": []}
+    assert state.diff(root, snapshot, {}) == {"changed": [], "info": {}, "instances": [],
+                                              "holders": {}}
 
 
 def test_diff_reports_derived_values(repo):

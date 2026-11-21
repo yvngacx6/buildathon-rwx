@@ -6,6 +6,8 @@ We try every worker count k = 1..8 with longest-first (LPT) packing and keep the
 
 from __future__ import annotations
 
+import heapq
+
 WORKER_COST_MS = 2_000
 MAX_WORKERS = 8
 
@@ -16,15 +18,23 @@ def duration_ms(seconds: float) -> int:
 
 
 def lpt(tests: list[tuple[int, int]], k: int) -> tuple[list[list[int]], int]:
-    """Pack (number, ms) pairs onto k workers, longest first. Returns (workers, max load)."""
+    """Pack (number, ms) pairs, sorted longest first (`by_length`), onto k workers in that
+    order. Returns (workers, max load)."""
     workers: list[list[int]] = [[] for _ in range(k)]
     loads = [0] * k
-    for number, ms in sorted(tests, key=lambda t: (-t[1], t[0])):
-        i = loads.index(min(loads))
+    heap = [(0, i) for i in range(k)]  # (load, worker): the least loaded, lowest index first
+    for number, ms in tests:
+        load, i = heap[0]
         workers[i].append(number)
-        loads[i] += ms
+        loads[i] = load + ms
+        heapq.heapreplace(heap, (loads[i], i))
     workers = [w for w in workers if w]
     return workers, max(loads) if loads else 0
+
+
+def by_length(tests: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """(number, ms) pairs, longest first, then by number."""
+    return sorted(tests, key=lambda t: (-t[1], t[0]))
 
 
 def cost_ms(workers: list[list[int]], ms_of: dict[int, int]) -> int:
@@ -39,7 +49,7 @@ def pack(numbers: set[int], ms_of: dict[int, int]) -> list[list[int]]:
     """Best packing of `numbers` over 1..8 workers. Empty set → no workers."""
     if not numbers:
         return []
-    tests = [(n, ms_of[n]) for n in numbers]
+    tests = by_length([(n, ms_of[n]) for n in numbers])
     best: tuple[int, list[list[int]]] | None = None
     for k in range(1, min(MAX_WORKERS, len(tests)) + 1):
         workers, load = lpt(tests, k)

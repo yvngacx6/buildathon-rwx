@@ -68,3 +68,17 @@ Push to a public GitHub repository with the `Dockerfile` at its top, then enter 
 - `requirements.lock` is every package in the environment we labeled in, on the image the `Dockerfile` starts from. To run sqlglot's tests the way we did, `pip install -r requirements.lock` and put the sqlglot checkout on `PYTHONPATH`; sqlglot's own `pip install -e .[dev]` picks newer versions.
 - The scorer is linux/amd64. On an Apple Silicon Mac, build and run with `--platform linux/amd64`, as the Makefile does, or your timings and wheels will differ.
 - A change that only adds a comment is not promised to be harmless.
+
+## Note for judges: `maps/diffexec.zip`
+
+**Interim build:** the store on this branch was recorded on a laptop (same sqlglot sha, same
+requirements versions, Python 3.13.12), not in the pinned image; see `maps/MANIFEST.json` →
+`diffexec.status`. The replay that decides runs at run time in the pinned image.
+
+This store comes only from running sqlglot's own test suite at the pinned commit in the
+pinned image (`mapbuild/diffexec_build.sh`). For each sqlglot function, it holds the inputs
+the function was called with during each test, plus a digest of each call's effect. It
+contains no labels, patches or mutants. At run time the selector executes the old and the
+patched function on these recorded inputs. It drops a test only when every recorded call
+that can reach that test behaves identically. Details: `ARCHITECTURE.md` →
+"Differential execution".

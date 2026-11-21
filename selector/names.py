@@ -96,12 +96,11 @@ def _targets(stmt: ast.stmt) -> tuple[str, ...] | None:
 def body_change(old_body: list[ast.stmt], new_body: list[ast.stmt],
                 old_tree: ast.AST) -> BodyChange:
     """Diff two statement lists of one class or module body. Raises Fallback."""
-    old_keys, new_keys = Counter(map(_key, old_body)), Counter(map(_key, new_body))
-    removed = [s for s in old_body if _consume(old_keys, new_keys, s)]
-    old_keys, new_keys = Counter(map(_key, old_body)), Counter(map(_key, new_body))
-    added = [s for s in new_body if _consume(new_keys, old_keys, s)]
+    old_keys, new_keys = list(map(_key, old_body)), list(map(_key, new_body))
+    removed = _unmatched(old_body, old_keys, new_keys)
+    added = _unmatched(new_body, new_keys, old_keys)
     out = BodyChange()
-    known = {ast.dump(n) for n in ast.walk(old_tree) if isinstance(n, (ast.Name, ast.Attribute))}
+    known = _KnownNames(old_tree)
     old_by_target: dict[tuple[str, ...], ast.stmt] = {}
     for stmt in removed:
         names = _targets(stmt)
@@ -145,13 +144,31 @@ def body_change(old_body: list[ast.stmt], new_body: list[ast.stmt],
     return out
 
 
-def _consume(mine: Counter, theirs: Counter, stmt: ast.stmt) -> bool:
-    """True when `stmt` has no unmatched twin on the other side (multiset difference)."""
-    k = _key(stmt)
-    if theirs[k] > 0:
-        theirs[k] -= 1
-        return False
-    return True
+def _unmatched(body: list[ast.stmt], keys: list[str], other_keys: list[str]) -> list[ast.stmt]:
+    """Statements of `body` (with `keys`) left over once each is paired with an equal one on
+    the other side (multiset difference, in order)."""
+    theirs = Counter(other_keys)
+    out = []
+    for stmt, k in zip(body, keys):
+        if theirs[k] > 0:
+            theirs[k] -= 1
+        else:
+            out.append(stmt)
+    return out
+
+
+class _KnownNames:
+    """Dumps of every name / attribute in the old file (`in` test; walked on first use)."""
+
+    def __init__(self, tree: ast.AST) -> None:
+        self._tree = tree
+        self._dumps: set[str] | None = None
+
+    def __contains__(self, dump: str) -> bool:
+        if self._dumps is None:
+            self._dumps = {ast.dump(n) for n in ast.walk(self._tree)
+                           if isinstance(n, (ast.Name, ast.Attribute))}
+        return dump in self._dumps
 
 
 def _kind(node: ast.AST) -> str:
@@ -167,6 +184,12 @@ def _diff(o: ast.AST, n: ast.AST, ancestors: list[ast.AST], lam: ast.Lambda | No
     if isinstance(o, ast.Dict) and _unique_keys(o) and _unique_keys(n):
         old_items = {ast.dump(k) if k else f"**{i}": (k, v) for i, (k, v) in
                      enumerate(zip(o.keys, o.values))}
+        new_order = [ast.dump(k) if k else f"**{i}" for i, k in enumerate(n.keys)]
+        if ([k for k in old_items if k in new_order]
+                != [k for k in new_order if k in old_items]):
+            # entries reordered: dict order is observable (`arg_types` order is the
+            # positional order of a function's arguments)
+            yield o, n, ancestors, lam
         for i, (k, v) in enumerate(zip(n.keys, n.values)):
             key = ast.dump(k) if k else f"**{i}"
             if key not in old_items:
@@ -204,7 +227,7 @@ def _unique_keys(d: ast.Dict) -> bool:
     return len(keys) == len(set(keys))
 
 
-def _inert(node: ast.AST, known: set[str]) -> bool:
+def _inert(node: ast.AST, known: _KnownNames | set[str]) -> bool:
     """Evaluating `node` cannot raise or run code: literals, containers, lambdas, known names."""
     if isinstance(node, ast.Constant):
         return True
@@ -257,6 +280,10 @@ class Site:
     copy: tuple[tuple[str, ...], tuple[str, ...]] | None = None  # (owner chain, targets)
     what: str = ""
     dynamic: bool = False  # getattr(x, v) / vars(x) / …: may read any name, of any object
+    # getattr / hasattr / attrgetter (an attribute lookup): on an object it reaches class
+    # attributes only through the object's class. vars() / dir() / __dict__ / getmembers list
+    # a namespace (an object's own dict never holds class attributes): False.
+    lookup: bool = False
     memo: bool = False  # "def" site whose result is cached across tests (not just at import)
     typecheck: bool = False  # the class argument of isinstance / issubclass (not handed on)
     # Where the value read here goes, when it can only be observed further on (run sites):
@@ -703,7 +730,10 @@ class Index:
                         allowed = _name_pattern(name_arg, ctx, node, parents)
                     elif kind == "names":
                         allowed = _loop_filter(node, parents)
-                    site = dataclasses.replace(self._site(path, node, ctx, stmt), dynamic=True)
+                    lookup = (isinstance(node, ast.Call) and isinstance(node.func, (ast.Name, ast.Attribute))
+                              and _last_name(node.func) in DYNAMIC_CALLS)
+                    site = dataclasses.replace(self._site(path, node, ctx, stmt), dynamic=True,
+                                               lookup=lookup)
                     self._dynamic.append((path, node, site, allowed,
                                           kind == "names", _on_module(node, ctx.func)))
         return self._dynamic

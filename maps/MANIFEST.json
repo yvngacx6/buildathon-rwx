@@ -19,7 +19,8 @@
   "classes.json.gz": 1224,
   "reads.json.gz": 65,
   "test_imports.json.gz": 61,
-  "import_time.json.gz": 27788
+  "import_time.json.gz": 27788,
+  "classes_run.json.gz": 1224
  },
  "bytes": {
   "lines.json.gz": 638319,
@@ -28,7 +29,8 @@
   "classes.json.gz": 63293,
   "reads.json.gz": 17856,
   "test_imports.json.gz": 17999,
-  "import_time.json.gz": 89455
+  "import_time.json.gz": 89455,
+  "classes_run.json.gz": 67241
  },
  "json_sha256": {
   "lines.json.gz": "abf873bd79f3d4f4d7a867f286d68a3727899ff45d215b6ce73f1f1d7aa05abe",
@@ -37,12 +39,49 @@
   "classes.json.gz": "bd8a8b68f81fabd18f149d10b2197ce94c315c63a73ad14485a518455f58068b",
   "reads.json.gz": "ec9bac97b1345881da4247eecf485f6bbe6b312d5b8996d62e9d4c1e5b90e262",
   "test_imports.json.gz": "60c49d6b4c070cda176471547825565befb8d1970e0db0125da2a81a0c5515a2",
-  "import_time.json.gz": "4c208c9b19b0b50ea325b31036563652cd471bfcd44969ee7091d849cd9e1ed0"
+  "import_time.json.gz": "4c208c9b19b0b50ea325b31036563652cd471bfcd44969ee7091d849cd9e1ed0",
+  "classes_run.json.gz": "d278f6814fb3cc9d3ac133b8bdfa1ee968a3d2a85ac7734f55d6709f93f02b0c"
  },
  "imports": {
   "build_command": "SKIP_INTEGRATION=0 python mapbuild/import_map.py sample/tests.json <scratch copy of pinned sqlglot> maps -j4 (--recollect redoes only the collection lists)",
   "built": "2026-11-21; full map on laptop (python 3.13.12, same pinned source, same requirements versions). Checked in the pinned image (agent-adv = python:3.13-slim@sha256:e48f59... + requirements.lock, EC2): every 8th test (203) re-traced there gives identical module sets, and identical collection lists. Full image run not done: the shared 4-core box was ~100 min busy.",
   "facts": "1620 tests each run alone, 244 modules, 0 isolation failures; collection: 160 modules (101 by import). No labeled patch used.",
   "environment_note": "The only except ImportError around a repo import is sqlglot/_version (generated, not in the repo), so optional dependencies cannot change the module closures."
+ },
+ "classes_run": "classes_run.json.gz: mapbuild/classes_run.py from trace_one.py traces (r6, same image/sha; every trace's classes equals classes.json.gz): classes minus objects made while a sqlglot/ module body executes",
+ "diffexec": {
+  "file": "diffexec.zip",
+  "what": "per sqlglot function: deduplicated call inputs seen while each test ran, with a digest of each call's effect (args after the call + result/exception). Built only from the pinned commit's own test run; no labels, patches or mutants. See research/ideas/I12-differential-execution.md.",
+  "image": "python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 + requirements.lock",
+  "sqlglot_sha": "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
+  "env": {
+   "PYTHONHASHSEED": "0",
+   "SKIP_INTEGRATION": "0"
+  },
+  "build_command": "mapbuild/diffexec_build.sh",
+  "granularity": "one pytest process per test file; caps applied after merging",
+  "caps": {
+   "calls_per_function": 50000,
+   "distinct_input_bytes_per_function": 300000,
+   "bytes_per_input": 16000
+  },
+  "test_files": 58,
+  "jobs": 4,
+  "record_wall_seconds": "about 3,000 on 4 cores (EC2, census 124 s), done as a first run plus a RESUME=1 rerun of tests/test_serde.py after the early-abort fix; that rerun alone took 41 s",
+  "record_cpu_seconds": "not measured over both runs; the slow file before the fix (test_serde) alone used about 1,550 CPU-s",
+  "functions": 6678,
+  "functions_recorded": 3488,
+  "dead_by_reason": {
+   "calls": 220,
+   "bytes": 450,
+   "generator": 285,
+   "input": 2235
+  },
+  "tests_failed_while_recorded": 1,
+  "bytes": 9367581,
+  "sha256": "b9fdddd5228bdc33b9a67577194e8063e35e91e9dedf54ca905d847a8f29a2f6",
+  "tests_failed_while_recorded_ids": [
+   "tests/test_dialect_imports.py::TestDialectImports::test_dialect_attribute_access_is_cached"
+  ]
  }
 }

@@ -74,7 +74,8 @@ import os
 import re
 from pathlib import Path, PurePosixPath
 
-from . import classify, diff, nameindex, names, pack, state
+from . import classify, diff, nameindex, names, pack
+from . import maps as maps_module
 from .maps import ImportTimeMap, Maps
 
 # Class and module bodies of these files shape nearly every test (map gives ~1550 of 1620):
@@ -92,11 +93,16 @@ DOC_SUFFIXES = (".md", ".rst", ".txt", ".html", ".png", ".svg", ".jpg")
 DOC_FILES = {"LICENSE", "Makefile", "CHANGELOG", ".gitignore", ".pre-commit-config.yaml"}
 CONFIG_FILES = {"pyproject.toml", "setup.cfg"}
 ALWAYS_ALL = {"pytest.ini", "tox.ini", "conftest.py", "setup.py"}
-ALL_FRACTION = 0.85  # selection cost ≥ this × ALL cost → just run ALL
+# Selection cost ≥ this × ALL cost → just run ALL. r5-tune: 0.85 fired on 32.8 s selections
+# (0.89 × ALL, 4 s dearer, never needed on any set); 0.95 keeps the free hedge near equal cost.
+ALL_FRACTION = 0.95
 SLOW_SECONDS = 5.0  # tests at least this slow get the statement-level rule in function bodies
-# An import-state diff costs ~1.2 s of container CPU (EC2, pinned image). Run it only when the
-# wide set costs at least this much more than the cheapest selection it could give.
-STATE_MIN_GAIN = 2.0
+# An import-state diff costs ~0.8 s of container CPU (r3-cpu). Run it only when the wide set
+# costs at least this much more than the cheapest selection it could give. r5-tune: 1.2 adds
+# diffs that save ~1.8 s each; ≤1.0 adds diffs that save ~0.5 s (< their CPU).
+STATE_MIN_GAIN = 1.2
+EXPR_ROOT = "sqlglot.expressions.core:Expr"
+MAX_HOLDER_ENTRIES = 200  # more entries hold import-time objects of a class: do not restrict
 # Class hierarchies the classes map records (maps/MANIFEST.json notes): a test that made an
 # instance of one of these classes (or used it as a dialect) is credited to it and its bases.
 TRACKED_ROOTS = {
@@ -116,7 +122,8 @@ class Selector:
     def __init__(self, tests: list[dict], sqlglot: Path, maps: Path) -> None:
         self.tests = tests
         self.sqlglot = sqlglot
-        self.maps = Maps(maps, tests)
+        compiled = Path(os.environ.get("BR_MAPS_COMPILED", maps_module.COMPILED))
+        self.maps = Maps(maps, tests, compiled)
         self._all = {t["number"] for t in tests}
         self._by_file: dict[str, set[int]] = {}
         self._id_of: dict[int, str] = {}
@@ -128,12 +135,25 @@ class Selector:
         self._slow = {n for n, s in self._secs.items() if s >= SLOW_SECONDS}
         self._untraced: set[int] | None = None
         self._sources: dict[str, str] | None = None
+        self._some_sources: dict[str, str | None] = {}  # `_source` before `_all_sources`
+        self._classes_of: dict[str, list[str]] = {}
+        self._old_trees: dict[str, tuple[ast.Module, list[str] | None]] = {}
+        self._scopes: dict[str, classify.Scopes] = {}
         self._name_index: nameindex.NameIndex | None = None
         self._files: list[diff.FilePatch] = []  # the current commit's files
         self._state: dict | None | bool = False  # its import-state diff (False: not yet run)
         self._direct: dict[str, bool] | None = None  # names `_by_names` saw edited
         self.notes: list[str] = []  # why a definition-time region was (not) narrowed
         self._dependents: dict[str, set[int]] = {}
+        self._jobs: list = []
+        self._mixed_py = False
+        self._chains: dict[str, list] = {}
+        self.diffexec = None
+        try:
+            from .diffexec import DiffExec
+            self.diffexec = DiffExec.create(self)
+        except Exception:  # noqa: BLE001  (diffexec is an optional pruner)
+            self.diffexec = None
 
     def all_numbers(self) -> set[int]:
         return set(self._all)
@@ -148,18 +168,39 @@ class Selector:
         self._files, self._state = files, False
         chosen: set[int] = set()
         reasons = []
+        self._jobs = []  # diffexec: (path, new text, prunable tests) per file
+        self._mixed_py = False  # a .py behaviour change diffexec cannot replay
+        self._chains = {}  # diffexec: changed function chains per file
+        per_file: list[tuple[str, set[int]]] = []
         try:
             for fp in files:
                 got, why = self._select_file(fp)
-                chosen |= got
+                per_file.append((fp.path, got))
                 reasons.append(f"{fp.path}: {why} [{len(got)}]")
         except AllTests as exc:
             return self.all_numbers(), f"ALL ({exc})"
+        if self._jobs and self.diffexec is not None:
+            dropped, note = self.diffexec.prune(self._jobs, self._benefit(per_file))
+            if note:
+                reasons.append(note)
+            per_file = [(p, got - dropped.get(p, set())) for p, got in per_file]
+        for _, got in per_file:
+            chosen |= got
         if chosen:
             if self._untraced is None:
                 self._untraced = self.maps.untraced()
             chosen |= self._untraced
         return chosen & self._all, "; ".join(reasons)
+
+    def _benefit(self, per_file) -> int:
+        """Cost saved (ms) if diffexec dropped every prunable test: 0 → do not run it."""
+        from . import pack
+        ms_of = self.diffexec.ms_of
+        everything = set().union(*(got for _, got in per_file))
+        prunable = {p: nums for p, _, nums in self._jobs}
+        rest = set().union(*(got - prunable.get(p, set()) for p, got in per_file))
+        return (pack.cost_ms(pack.pack(everything, ms_of), ms_of)
+                - pack.cost_ms(pack.pack(rest, ms_of), ms_of))
 
     # ── one file ──────────────────────────────────────────────────────────────
 
@@ -251,15 +292,15 @@ class Selector:
             new_text = diff.apply(old_text, fp)
         except (diff.PatchError, UnicodeDecodeError) as exc:
             raise AllTests(f"{path}: hunk does not apply ({type(exc).__name__})") from None
+        same = classify.SameAst(old_text, new_text)
         try:
-            old_tree = ast.parse(old_bytes)
+            old_tree = self._old_tree(path, old_bytes)
             new_tree = ast.parse(new_text.encode("utf-8"))
-            compile(new_tree, path, "exec")
+            _check_compiles(path, old_tree, new_tree, same)
         except (SyntaxError, ValueError) as exc:  # the module no longer imports
             raise AllTests(f"{path}: {type(exc).__name__}") from None
-        classify.strip_docstrings(old_tree)
         classify.strip_docstrings(new_tree)
-        if ast.dump(old_tree) == ast.dump(new_tree):
+        if same(old_tree, new_tree):
             return set(), "same syntax tree (ignoring comments and docstrings)"
         lost = _bindings(old_tree) - _bindings(new_tree)
         if lost:
@@ -267,13 +308,15 @@ class Selector:
             # (ImportError at collection, AttributeError at call) – far beyond its own tests.
             raise AllTests(f"{path}: binding removed ({', '.join(sorted(lost)[:3])})")
         removed, added = diff.changed_lines(fp)
-        found = classify.regions(old_tree, new_tree, removed, added)
+        found = classify.regions(old_tree, new_tree, removed, added, same,
+                                 self._old_scopes(path))
         if not found:
             return set(), "no behaviour-changing region"
         if path.startswith("tests/"):
+            self._mixed_py = True
             return self._test_code(path, found, old_tree, new_tree)
         if path.startswith("sqlglot/"):
-            return self._library(path, old_tree, new_tree, found)
+            return self._library(path, old_tree, new_tree, found, new_text)
         raise AllTests(f"{path}: .py outside sqlglot/ and tests/")
 
     # ── tests/*.py ────────────────────────────────────────────────────────────
@@ -346,16 +389,24 @@ class Selector:
     # ── sqlglot/*.py ──────────────────────────────────────────────────────────
 
     def _library(self, path: str, old_tree: ast.Module, new_tree: ast.Module,
-                 found: list[classify.Region]) -> tuple[set[int], str]:
+                 found: list[classify.Region], new_text: str = "") -> tuple[set[int], str]:
         module = _module_of(path)
         chosen: set[int] = set(self.maps.reads.get(path))
+        fixed = set(chosen)  # tests diffexec may never drop (readers, definition-time users ...)
+        prunable: set[int] = set()
         kinds = []
         for r in found:
             if r.kind == "function":
                 ran = self.maps.span(path, *r.span)
                 got = self._slow_tests_off_statements(path, ran, r)
+                if got and not r.signature:
+                    prunable |= got
+                    self._chains.setdefault(path, []).append(r.chain)
+                else:
+                    self._mixed_py = True
                 if r.signature:
                     got |= self._class_users(module, r.classes)
+                    fixed |= got
                 # Called while some module is imported (trie builders, decorator factories,
                 # `X = build()` tables, module __getattr__): every importer depends on it,
                 # which no per-test coverage can show.
@@ -371,6 +422,7 @@ class Selector:
                     # Never ran under a test: may run only at import or class creation.
                     # Treat it as a change to the scope that defines it.
                     got = self._definition_time(path, module, old_tree, new_tree, r)
+                    fixed |= got
                     kinds.append(f"unrun def {'.'.join(r.chain) or '<lambda>'} → definition-time")
                 else:
                     dropped = len(ran - got)
@@ -378,15 +430,21 @@ class Selector:
                                  + (f" (-{dropped} slow, off touched statements)" if dropped else ""))
                 if at_import:
                     kinds.append(f"(runs at import: +{len(at_import - got)})")
+                    self._mixed_py = True
+                    fixed |= at_import
                 elif same_state and got:
                     kinds.append("(runs at import: import state unchanged)")
                 got |= at_import
             else:
+                self._mixed_py = True
                 self.notes.clear()
                 got = self._definition_time(path, module, old_tree, new_tree, r)
                 note = f" [{'; '.join(self.notes)}]" if self.notes else ""
                 kinds.append(f"{r.kind} {'.'.join(r.chain) or module}{note}")
+                fixed |= got
             chosen |= got
+        if prunable - fixed and new_text:
+            self._jobs.append((path, new_text, prunable - fixed))
         return chosen, ", ".join(kinds)
 
     def _slow_tests_off_statements(self, path: str, ran_function: set[int],
@@ -523,6 +581,11 @@ class Selector:
                         _module_of(owner_path), [owner_chain])
             for site in index.sites(name, owner_path, owner_chain, name in change.new_names):
                 n_sites += 1
+                if (site.when == "run" and not site.dynamic and not site.path.startswith("tests/")
+                        and self.maps.import_time.modules(site.path, *site.lines)):
+                    # a def body that also runs at import (`sql_names()` building the
+                    # function tables): what it builds there outlives the read
+                    raise names.Fallback(f"{name} read at import ({site.path}:{site.lines[0]})")
                 if site.path.startswith("tests/") and not site.dynamic:
                     if site.when == "run":
                         in_tests |= self.maps.span(site.path, *site.lines)
@@ -556,6 +619,8 @@ class Selector:
                     except diff.PatchError:
                         self._state = None
                         return None
+            from . import state  # imported on first use: few commits need it
+
             snapshot = Path(os.environ.get("BR_STATE", state.DEFAULT_PATH))
             self._state = state.diff(self.sqlglot, snapshot, patched)
         return self._state  # type: ignore[return-value]
@@ -612,7 +677,8 @@ class Selector:
                 users = None
             else:
                 if owner not in owners:
-                    owners[owner] = self._class_owner(owner, info, with_instances, index)
+                    owners[owner] = self._class_owner(owner, info, with_instances, index,
+                                                      found.get("holders"))
                 owner_path, chain, users = owners[owner]
                 touch |= self.maps.whole_file(owner_path) | self._class_users(
                     _module_of(owner_path), [chain])
@@ -653,7 +719,12 @@ class Selector:
                      | set(self.maps.test_imports.get(site.path)))]
         if site.when == "def" and site.memo:
             raise names.Fallback(f"{attr} read in code cached across tests ({site.what})")
-        bucket = "loose" if site.dynamic else "held"
+        # A computed-name lookup (getattr(x, v)) reads a class attribute through an object of
+        # the class or through the class object itself: the same two ways a static `x.NAME`
+        # read does, so it is restricted like one. Namespace listings (vars, __dict__, dir)
+        # and test code stay unrestricted.
+        bucket = "loose" if site.dynamic and not (
+            site.lookup and not site.path.startswith("tests/")) else "held"
         flow = site.flow if site.when == "run" and not site.dynamic and depth < 3 else None
         if flow is not None and flow[0] == "local":
             got: set[int] = set()
@@ -678,10 +749,15 @@ class Selector:
         return None
 
     def _class_owner(self, key: str, info: dict, with_instances: set[str],
-                     index: nameindex.NameIndex) -> tuple[str, tuple[str, ...], set[int] | None]:
+                     index: nameindex.NameIndex, holders: dict | None = None
+                     ) -> tuple[str, tuple[str, ...], set[int] | None]:
         """(source path, class chain, tests that can hold the class; None: do not restrict)
         for a changed class. A class made by `type(...)` at import (a dialect's default
-        Tokenizer) stands for its nearest ancestor defined in the source."""
+        Tokenizer) stands for its nearest ancestor defined in the source.
+
+        Objects of the class built at import (a template parsed into a module constant) are
+        reached through the state entries that hold them (`holders`, build-time snapshot):
+        the tests that ran a line reading one of those entries join the holders."""
         meta = info.get(key)
         if not meta:
             raise names.Fallback(f"no class info for {key}")
@@ -693,21 +769,68 @@ class Selector:
             raise names.Fallback(f"{key}: no class in the source")
         chain = tuple(qual.split("."))
         family = index.check_class(path, chain)  # Fallback: bases / decorators outside view
-        if {key, real} & with_instances:
-            return path, chain, None  # objects built at import: a test need not make one
         if not ({key, real, *mro} & TRACKED_ROOTS):
             return path, chain, None  # the classes map does not record this hierarchy
-        return path, chain, self._holders(family, index)
+        # Expression classes: who made one at run time (classes_run), plus who read an entry
+        # holding one made at import. Other roots are also credited by dialect lookups, which
+        # the holder table does not follow: those keep the classes map, unrestricted if made
+        # at import.
+        expr = EXPR_ROOT in {key, real, *mro} and self.maps.classes_run is not None
+        users = self._holders(family, index, run=expr)
+        if {key, real} & with_instances:  # objects built at import: a test need not make one
+            if not expr:
+                return path, chain, None
+            via = self._entry_readers({key, real}, holders, index)
+            if via is None:
+                return path, chain, None
+            users |= via
+        return path, chain, users
+
+    def _entry_readers(self, keys: set[str], holders: dict | None,
+                       index: nameindex.NameIndex) -> set[int] | None:
+        """Tests that ran a line reading a state entry that holds an import-time object of
+        one of the classes `keys` (or a subclass). None: cannot tell (no holder table, an
+        entry without a source name, a read in code cached across tests, too many)."""
+        if holders is None or self.maps.classes_run is None:
+            return None
+        entries = sorted({e for k in keys for e in holders.get(k, ())})
+        if not entries or len(entries) > MAX_HOLDER_ENTRIES:
+            return None
+        got: set[int] = set()
+        for entry in entries:
+            kind, owner, name = entry.split(" ", 2)
+            if kind == "M":
+                owner_path, chain = self._module_path(owner), ()
+            else:
+                module, _, qual = owner.partition(":")
+                if "#" in owner or "<" in qual or not qual:
+                    return None
+                owner_path, chain = self._module_path(module), tuple(qual.split("."))
+            if owner_path is None or (name.startswith("__") and name.endswith("__")):
+                return None
+            for site in index.sites(name, owner_path, chain, False):
+                if site.path.startswith("tests/"):
+                    got |= (self.maps.span(site.path, *site.lines) if site.when == "run"
+                            else self._by_file.get(site.path, set())
+                            | set(self.maps.test_imports.get(site.path)))
+                elif site.when == "run":
+                    got |= self.maps.span(site.path, *site.lines)
+                elif site.memo:
+                    return None  # a cached result may hand the object to any later test
+                # other import-time reads: what they build is itself a holder entry
+        return got
 
     def _holders(self, family: list[tuple[str, tuple[str, ...]]],
-                 index: nameindex.NameIndex) -> set[int]:
-        """Tests that can hold one of these classes (or an object of one)."""
+                 index: nameindex.NameIndex, run: bool = False) -> set[int]:
+        """Tests that can hold one of these classes (or an object of one). `run`: count
+        objects made at run time only (classes_run; the caller adds import-time holders)."""
         users: set[int] = set()
+        made = self._made_users if run else self._class_users
         for p, ch in family:  # the class, its subclasses and their outer classes
-            users |= self._class_users(_module_of(p), [ch])
+            users |= made(_module_of(p), [ch])
             if len(ch) == 1:  # class attributes that hold it (`Parser = MySQLParser`)
                 for hp, hch in index.holders(ch[0]):
-                    users |= self._class_users(_module_of(hp), [hch])
+                    users |= made(_module_of(hp), [hch])
             for site in index.mentions(ch[0]):  # lines that name the class (or its outer)
                 if site.typecheck:
                     continue  # isinstance(x, C) does not hand C on
@@ -726,7 +849,9 @@ class Selector:
         chain: tuple[str, ...] = ()
         if r.kind == "class":
             chain = r.chain
-            users = self._holders(index.check_class(path, chain), index)
+            # a lower bound: run-time makers only (the holder entries only add tests)
+            users = self._holders(index.check_class(path, chain), index,
+                                  run=path.startswith("sqlglot/expressions/"))
         got: set[int] = set()
         for name in direct:
             for site in index.sites(name, path, chain, True):
@@ -760,7 +885,7 @@ class Selector:
         got: set[int] = set()
         if not names:
             return got
-        for s in classify.Scopes(old_tree).scopes:
+        for s in self._old_scopes(path).scopes:
             if s.kind != "def":
                 continue
             body = s.node.body
@@ -789,7 +914,7 @@ class Selector:
         except AllTests as exc:
             wide, error = None, exc
         if ((wide is None or self._cost(wide) >= STATE_MIN_GAIN)
-                and all(m.split(".")[0] == "sqlglot" and m not in state.SKIP_MODULES
+                and all(m.split(".")[0] == "sqlglot" and m != "sqlglot.__main__"  # state.SKIP_MODULES
                         for m in modules)):
             found = self._state_diff()
             if found is not None and not found["changed"]:
@@ -811,9 +936,11 @@ class Selector:
     def _import_dependents(self, path: str) -> set[int]:
         """Tests that fail if module `path` cannot be imported: dependents of every module
         whose import (per the import-time map) runs the module's top-level statements."""
-        tree = ast.parse(self._all_sources()[path])
+        source = self._source(path)
+        if source is None:
+            raise KeyError(path)
         got: set[int] = set()
-        for stmt in tree.body:
+        for stmt in ast.parse(source).body:
             modules = self.maps.import_time.modules(path, stmt.lineno, stmt.lineno)
             if any(m == "tests" or m.startswith("tests.") for m in modules):
                 # A test module fails to import: a collection error, which by default
@@ -831,11 +958,23 @@ class Selector:
             if path.startswith("tests/"):
                 hit = set(self._by_file.get(path, set())) | self.maps.test_imports.get(path)
             else:
-                source = self._all_sources().get(path)
-                classes = classify.top_level_classes(ast.parse(source)) if source else []
-                hit = set(self.maps.whole_file(path)) | self.maps.module_users(module, classes)
+                hit = set(self.maps.whole_file(path)) | self.maps.module_users(
+                    module, self._top_level_classes(path))
             self._dependents[module] = hit
         return hit
+
+    def _made_users(self, module: str, chains) -> set[int]:
+        """`_class_users` from the classes_run map: tests that made an object of the class
+        outside an import of a sqlglot module (objects made at import are reached through
+        their holder entries, `_entry_readers`). Without that map, `_class_users`."""
+        run = self.maps.classes_run
+        if run is None:
+            return self._class_users(module, chains)
+        out: set[int] = set()
+        for chain in chains:
+            for cut in range(1, len(chain) + 1):
+                out |= run.get(f"{module}.{'.'.join(chain[:cut])}")
+        return out
 
     def _class_users(self, module: str, chains) -> set[int]:
         out: set[int] = set()
@@ -889,7 +1028,7 @@ class Selector:
                 if breaks is not None and breaks.search(self._all_sources()[other]):
                     got |= self._import_dependents(other)
                 users = self.maps.whole_file(other) | self.maps.module_users(
-                    _module_of(other), classify.top_level_classes(ast.parse(self._all_sources()[other])))
+                    _module_of(other), self._top_level_classes(other))
                 if not users:
                     raise AllTests(f"{path}: names imported by {other}, which has no known users")
                 got |= users
@@ -900,12 +1039,16 @@ class Selector:
         """Files that import module `path` and mention one of `names`."""
         module = _module_of(path)
         parent, _, leaf = module.rpartition(".")
-        refers = re.compile(rf"\b{re.escape(module)}\b|from\s+{re.escape(parent)}\s+import\b[^\n]*\b{leaf}\b"
-                            rf"|from\s+\.+{leaf}\s+import")
+        # `module`, `from parent import … leaf`, `from .leaf import`; each one only searched
+        # for in texts that contain its literal part (a regex scan of every file is slow)
+        refers = [(module, re.compile(rf"\b{re.escape(module)}\b")),
+                  (parent, re.compile(rf"from\s+{re.escape(parent)}\s+import\b[^\n]*\b{leaf}\b")),
+                  (f".{leaf}", re.compile(rf"from\s+\.+{leaf}\s+import"))]
         mentions = re.compile(r"\b(" + "|".join(map(re.escape, sorted(names))) + r")\b") if names else None
         out = []
         for other, text in self._all_sources().items():
-            if other == path or not refers.search(text):
+            if other == path or not any(part in text and pattern.search(text)
+                                        for part, pattern in refers):
                 continue
             if f"{module} import *" in text or f".{leaf} import *" in text:
                 raise AllTests(f"{path}: star-imported by {other}")
@@ -914,6 +1057,40 @@ class Selector:
         return out
 
     # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _source(self, path: str) -> str | None:
+        """`self._all_sources().get(path)`, reading only that file."""
+        if self._sources is not None:
+            return self._sources.get(path)
+        if path not in self._some_sources:
+            file = self.sqlglot / path
+            self._some_sources[path] = (file.read_text(errors="replace")
+                                        if path.startswith(("sqlglot/", "tests/"))
+                                        and path.endswith(".py") and file.is_file() else None)
+        return self._some_sources[path]
+
+    def _top_level_classes(self, path: str) -> list[str]:
+        """Top-level classes of a pinned source file (none if it is not one)."""
+        if path not in self._classes_of:
+            source = self._source(path)
+            self._classes_of[path] = (classify.top_level_classes(ast.parse(source))
+                                      if source else [])
+        return self._classes_of[path]
+
+    def _old_tree(self, path: str, old_bytes: bytes) -> ast.Module:
+        """The pinned file's syntax tree, docstrings stripped (parsed once per run: nothing
+        changes the trees after `strip_docstrings`)."""
+        if path not in self._old_trees:
+            tree = classify.strip_docstrings(ast.parse(old_bytes))
+            lines = None if b"\r" in old_bytes else old_bytes.decode("utf-8").split("\n")
+            self._old_trees[path] = tree, lines
+        return self._old_trees[path][0]
+
+    def _old_scopes(self, path: str) -> classify.Scopes:
+        """`Scopes` of a file `_old_tree` parsed (built once per run)."""
+        if path not in self._scopes:
+            self._scopes[path] = classify.Scopes(*self._old_trees[path])
+        return self._scopes[path]
 
     def _all_sources(self) -> dict[str, str]:
         if self._sources is None:
@@ -927,6 +1104,66 @@ class Selector:
     def _old_text(self, path: str) -> str:
         source = self.sqlglot / path
         return source.read_text() if source.is_file() else ""
+
+
+def _check_compiles(path: str, old_tree: ast.Module, new_tree: ast.Module,
+                    same: classify.SameAst) -> None:
+    """Raise what `compile(new_tree, path, "exec")` raises, without compiling again the
+    top-level statements whose text is the old file's (the old file compiles).
+
+    A compile error stays inside one top-level statement but for two module-wide rules:
+    `from __future__` imports must lead the file (and change how the rest compiles), and
+    module-level `global` / `nonlocal`. So when the leading docstring and future imports
+    are the old ones, no other future import exists, and the module scope has no global /
+    nonlocal, only the leading statements and the new top-level statements are compiled.
+    Otherwise (or without both texts, see SameAst) the whole module is."""
+    lead = _leading_futures(new_tree.body)
+    if same.old is not None and _same_lead(old_tree, new_tree, lead, same):
+        old = {classify.text_key(s, same.old) for s in old_tree.body}
+        new = [s for s in new_tree.body[lead:] if classify.text_key(s, same.new) not in old]
+        new_tree = ast.Module(body=new_tree.body[:lead] + new, type_ignores=new_tree.type_ignores)
+    compile(new_tree, path, "exec")
+
+
+def _same_lead(old_tree: ast.Module, new_tree: ast.Module, lead: int,
+               same: classify.SameAst) -> bool:
+    """The first `lead` statements (docstring, future imports) have the old text, the old
+    file has no more future imports, and the new module scope has no other future import
+    and no global / nonlocal."""
+    scope = list(_module_scope(new_tree.body))
+    return (sum(map(_is_future, scope)) == lead - _has_docstring(new_tree.body)
+            and not any(isinstance(s, (ast.Global, ast.Nonlocal)) for s in scope)
+            and len(old_tree.body) >= lead
+            and not (len(old_tree.body) > lead and _is_future(old_tree.body[lead]))
+            and [classify.text_key(s, same.old) for s in old_tree.body[:lead]]
+            == [classify.text_key(s, same.new) for s in new_tree.body[:lead]])
+
+
+def _module_scope(body: list[ast.stmt]):
+    """Statements that run in the module's own scope (not inside a def or class body)."""
+    for stmt in body:
+        yield stmt
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for name in classify.NESTED_STMTS:
+            for child in getattr(stmt, name, None) or ():
+                yield from _module_scope([child] if isinstance(child, ast.stmt) else child.body)
+
+
+def _is_future(stmt: ast.stmt) -> bool:
+    return isinstance(stmt, ast.ImportFrom) and stmt.module == "__future__"
+
+
+def _has_docstring(body: list[ast.stmt]) -> bool:
+    return bool(body) and classify.is_docstring(body[0])
+
+
+def _leading_futures(body: list[ast.stmt]) -> int:
+    """Length of the leading docstring + `from __future__` imports."""
+    n = int(_has_docstring(body))
+    while n < len(body) and _is_future(body[n]):
+        n += 1
+    return n
 
 
 def _module_of(path: str) -> str:
