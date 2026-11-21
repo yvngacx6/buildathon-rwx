@@ -66,3 +66,14 @@ their real spawn process pool (not replaced).
 **Fidelity check:** labeling the 30 sample patches this way reproduces `sample/answers.json`
 exactly (30/30, including 3utz's 37 timeouts/failures), and three unpatched baseline runs
 have 0 failures and every one of the 1620 tests reports.
+
+**Edge cases seen in the seed-20261120 run (265 generated, 264 in the set):**
+- A patch whose run never reaches pytest's session end is left out of the set, because its
+  labels would be a guess. `d80p` (a `parser.py` mutant) hangs during *collection*, which
+  pytest-timeout does not cover, so it is excluded.
+- `hgxu`: after a timeout killed an xdist worker, the run stalled with 12 tests unrun. Those 12
+  were then run on their own in the same image (`pytest <node ids>`), and both logs were merged.
+- Infinite-loop mutants (e.g. `q1zg`) show up as timeouts or crashed workers, which count as failures.
+
+Labeling host: a c7i.8xlarge spot instance (persistent, stop on interruption; the account's
+on-demand vCPU quota is 16), 16 containers × 2 pinned CPUs. 265 patches took about 45 minutes.
