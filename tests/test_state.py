@@ -187,6 +187,19 @@ def test_import_error_falls_back(selector):
     assert got >= set(TSQL_USERS)
 
 
+def test_import_error_is_no_diff_for_every_consumer(repo, selector):
+    # The subprocess reports which file broke the import; every consumer (`_by_state`, the
+    # import-time "state unchanged" rule, `_foreign_state`) sees no diff, never "no change".
+    root, snapshot = repo
+    new = DIALECT.replace("CACHED = 2", "CACHED = int('x')")
+    assert state.diff(root, snapshot, {D: new}) == {"import_error": D}
+    selector._files = select.diff.parse("".join(difflib.unified_diff(
+        DIALECT.splitlines(True), new.splitlines(True), f"a/{D}", f"b/{D}")))
+    selector._state, selector._state_error = False, None
+    assert selector._state_diff() is None
+    assert selector._state_error == D
+
+
 def test_snapshot_of_other_source_is_not_used(repo, tmp_path, monkeypatch):
     root, snapshot = repo
     other = tmp_path / "sqlglot"
