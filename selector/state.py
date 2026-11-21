@@ -351,6 +351,10 @@ def take(root: str, patched: dict[str, str], track: bool = False) -> Snapshot:
         sys.meta_path.insert(0, _PatchedFinder({os.path.join(root, p): s
                                                 for p, s in patched.items()}))
     warnings.simplefilter("ignore")
+    # Import as under the test runner: sqlglot checks `"unittest" in sys.modules` at import
+    # (expressions.core.UNITTEST: stricter validation, e.g. of templates parsed at import).
+    # Without it, a patch that breaks an import-time parse only under pytest looks harmless.
+    import unittest  # noqa: F401
     package = "sqlglot"
     pkg = importlib.import_module(package)
     names = sorted(m.name for m in pkgutil.walk_packages(pkg.__path__, package + ".")
