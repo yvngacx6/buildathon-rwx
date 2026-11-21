@@ -857,7 +857,7 @@ class Index:
             tuple target) over a literal tuple / list / set of string constants (or of
             tuples of them);
           * a for-loop / comprehension target over `self.X` / `cls.X` (the method's
-            receiver, `ctx.recv`), where X is a class-level literal tuple of strings in
+            receiver, `ctx.recv`), where X is a class-level literal tuple (not list) of strings in
             that class and X is bound nowhere else in the source (no subclass or instance
             can rebind it, and no string "X" can reach setattr).
         None: any value (a parameter, any other binding, global / nonlocal)."""
@@ -937,7 +937,7 @@ class Index:
                        else st.target if isinstance(st, ast.AnnAssign) else None)
                 if isinstance(tgt, ast.Name) and tgt.id == it.attr and st.value is not None:
                     v = st.value
-                    if isinstance(v, (ast.Tuple, ast.List)) and not any(
+                    if isinstance(v, ast.Tuple) and not any(  # immutable: a list could grow
                             isinstance(e, ast.Starred) for e in v.elts):
                         return list(v.elts)
                     return None
