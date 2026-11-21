@@ -162,6 +162,8 @@ def repo(tmp_path_factory) -> tuple[Path, Path]:
                           "test_imports": {}}.items():
         body = {"tests": T, "map": mapping}
         (maps / f"{name}.json.gz").write_bytes(gzip.compress(json.dumps(body).encode()))
+    body = {"tests": [], "map": {}}  # no line runs at import
+    (maps / "import_time.json.gz").write_bytes(gzip.compress(json.dumps(body).encode()))
     snapshot = root / "state.pkl"
     assert state.build(repo, snapshot, samples=2)
     return repo, snapshot

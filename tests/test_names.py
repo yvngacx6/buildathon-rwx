@@ -129,7 +129,7 @@ def build_maps() -> dict:
     return {"lines": lines,
             "classes": {"sqlglot.dialect.TSQL": [WEEK, TABLE], "sqlglot.dialect.Dialect":
                         [WEEK, LIMIT_T, TABLE, CACHED, SLOW, LAM]},
-            "reads": {}, "test_imports": {}}
+            "reads": {}, "test_imports": {}, "import_time": {}}
 
 
 @pytest.fixture
