@@ -20,7 +20,7 @@ new moonshot angle is started in its slot.
 | 12 | Compact tree-table input encoding so diffexec can record tpcds/max_nodes callees | moon-12 | running | |
 | 13 | Container CPU | moon-13 | done | ✓ Merged (28767ce): −14% CPU, byte-identical output (≈ −0.7 s/40). |
 | 14 | Fixture-edit precision | moon-14 | done | ✓ Loader-output diff per reader: private −84.5 s, adversarial −19.6 s, P −10.5/40, 0 misses on 73 fixture commits → porting as R27 (r27-fixtures). |
-| 15 | Per-fixture-case slicing for code edits (generalise r17 to test_annotate_funcs, test_qualify_columns, check_file loops) | moon-15 | running | |
+| 15 | Per-fixture-case slicing | moon-15 | done | ~ Sound (0 misses, 75/75 drops really pass) but ≈ −2 s/40 net and +3 min build. Parked; maybe bundle with V1 later. |
 | 16 | Code-commit over-selection | moon-16 | done | ✓ R-DEF (literal-default edits → callers that use the default): −13…−17 s/40, 0 misses → R28. Next: tokenizer-settings read sites (moon-20), key-level state diff (moon-21). |
 | 17 | Determinism audit | moon-17 | done | ✓ Only wall-clock guards flip (tggb +18 s, op07, ktz3 under load). CPU caps decide + timing re-check → R30 (r30-determinism). 66ks flip was a mis-comparison. |
 | 18 | Red-team soundness review of all run-time pruners (diffexec, subtest, slowverify, genmem, r19 import-fn, statement rule) | moon-18 | running | |
@@ -29,3 +29,4 @@ new moonshot angle is started in its slot.
 | 21 | Key-level state diff for class-creation hooks & import-run builders | moon-21 | running | |
 | 22 | Per-optimizer-rule TPC checkpoints (3–5x cheaper re-runs) | moon-22 | running | |
 | 23 | Final-day plan: freeze, pick, and late-merge risk policy (what to submit when, verification checklist) | moon-23 | running | |
+| 24 | Dispatch precision: per-test (class, method) maps for *_sql generator dispatch and parser tables (function-map bucket ≈172 s on practice_like) | moon-24 | running | |
