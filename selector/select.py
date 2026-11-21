@@ -109,6 +109,7 @@ class Selector:
         self._name_index: nameindex.NameIndex | None = None
         self._files: list[diff.FilePatch] = []  # the current commit's files
         self._state: dict | None | bool = False  # its import-state diff (False: not yet run)
+        self._direct: dict[str, bool] | None = None  # names `_by_names` saw edited
         self.notes: list[str] = []  # why a definition-time region was (not) narrowed
         self._dependents: dict[str, set[int]] = {}
 
@@ -313,6 +314,7 @@ class Selector:
         if wide_error is not None:
             raise wide_error  # v1 could not bound it (star import, re-export, …): never narrow
         if r.kind in ("class", "module") and not r.via_def:
+            self._direct = None
             try:
                 got, why = self._by_names(path, old_tree, new_tree, r, wide)
                 if wide is not None and self._seconds(got) >= self._seconds(wide):
@@ -324,6 +326,10 @@ class Selector:
                 try:
                     if wide is not None and self._cost(wide) < STATE_MIN_COST:
                         raise names.Fallback("too cheap to pay for an import-state diff")
+                    direct, self._direct = self._direct, None
+                    if wide is not None and direct and self._seconds(
+                            self._state_floor(path, r, direct, wide)) >= self._seconds(wide):
+                        raise names.Fallback("the edited names' own readers cost as much")
                     got, why = self._by_state(path, r, wide)
                     if wide is not None and self._seconds(got) >= self._seconds(wide):
                         raise names.Fallback(f"{why}, but no cheaper")
@@ -371,6 +377,7 @@ class Selector:
         else:
             old_body, new_body = old_tree.body, new_tree.body
         change = names.body_change(old_body, new_body, old_tree)
+        self._direct = change.names  # for `_state_floor`, if this falls back later
         direct: set[int] = set()
         for first, last in change.lambda_spans:  # a lambda body only runs when called
             got = self.maps.span(path, first, last)
@@ -575,6 +582,11 @@ class Selector:
             return path, chain, None  # objects built at import: a test need not make one
         if not ({key, real, *mro} & TRACKED_ROOTS):
             return path, chain, None  # the classes map does not record this hierarchy
+        return path, chain, self._holders(family, index)
+
+    def _holders(self, family: list[tuple[str, tuple[str, ...]]],
+                 index: nameindex.NameIndex) -> set[int]:
+        """Tests that can hold one of these classes (or an object of one)."""
         users: set[int] = set()
         for p, ch in family:  # the class, its subclasses and their outer classes
             users |= self._class_users(_module_of(p), [ch])
@@ -587,7 +599,30 @@ class Selector:
                 users |= self.maps.span(site.path, *site.lines)
                 if site.path.startswith("tests/") and site.when == "def":
                     users |= self._by_file.get(site.path, set())
-        return path, chain, users
+        return users
+
+    def _state_floor(self, path: str, r: classify.Region, direct: dict[str, bool],
+                     wide: set[int]) -> set[int]:
+        """A subset of what `_by_state` would select, from the directly edited names alone
+        (every value the diff adds only adds readers). Raises Fallback where `_by_state`
+        would. Lets the selector skip the subprocess when even this costs as much as wide."""
+        index = self._index()
+        users: set[int] | None = None
+        chain: tuple[str, ...] = ()
+        if r.kind == "class":
+            chain = r.chain
+            users = self._holders(index.check_class(path, chain), index)
+        got: set[int] = set()
+        for name in direct:
+            for site in index.sites(name, path, chain, True):
+                for bucket, tests in self._site_reads(index, site, name):
+                    if bucket == "tests" or users is None:
+                        got |= tests
+                    elif bucket == "loose":
+                        got |= tests & wide
+                    else:
+                        got |= tests & users & wide
+        return got
 
     def _cost(self, numbers: set[int]) -> float:
         """Scorer cost of running `numbers` alone (best packing), in seconds."""
