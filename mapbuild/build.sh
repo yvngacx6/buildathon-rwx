@@ -15,5 +15,9 @@ docker run --rm --user "$(id -u):$(id -g)" \
   -v "$REPO:/repo" -v "$WORK:/work" \
   blast-mapbuild \
   python /mapbuild/run_tracing.py --tests /repo/sample/tests.json --work /work --out /repo/maps
+# Dialect reach (static, pinned source): a dialect's users also use its parser/generator/tokenizer
+# classes and their bases (mapbuild/dialect_reach.py). Run after classes_run.json.gz exists.
+docker run --rm --user "$(id -u):$(id -g)" -v "$REPO:/repo" blast-mapbuild \
+  python /mapbuild/dialect_reach.py /opt/sqlglot /repo/maps
 echo "map build wall time: $(( $(date +%s) - start ))s" >&2
 du -ch "$REPO"/maps/*.gz | tail -1 >&2
