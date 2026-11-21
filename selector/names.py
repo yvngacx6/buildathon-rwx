@@ -729,6 +729,17 @@ class Index:
                 and isinstance(stmt.targets[0], ast.Name)
                 and isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef))):
             return self._local_flow(path, func, stmt.targets[0].id, parents)
+        if (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)
+                and parent.func.id == "bool" and parent.args == [node] and not parent.keywords
+                and not self._rebinds(path, "bool")):
+            # `Cls(..., kw=bool(x.NAME))`: the stored value is only NAME's truth
+            outer = parents.get(id(parent))
+            if isinstance(outer, ast.keyword) and outer.arg:
+                call = parents.get(id(outer))
+                if isinstance(call, ast.Call):
+                    got = self._init_flow(call, outer.arg, None)
+                    return got + ("truth",) if got is not None else None
+            return None
         if isinstance(parent, ast.keyword) and parent.arg:
             call = parents.get(id(parent))
             if isinstance(call, ast.Call):
@@ -736,6 +747,14 @@ class Index:
         if isinstance(parent, ast.Call) and node in parent.args:
             return self._init_flow(parent, None, parent.args.index(node))
         return None
+
+    def _rebinds(self, path: str, name: str) -> bool:
+        """Does the module bind `name` anywhere (shadowing the builtin)?"""
+        return any(isinstance(n, ast.Name) and n.id == name and not isinstance(n.ctx, ast.Load)
+                   or isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name == name
+                   or isinstance(n, ast.alias) and (n.asname or n.name) == name
+                   or isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names)
+                   for n in ast.walk(self.tree(path)))
 
     def _local_flow(self, path: str, func: ast.AST, var: str,
                     parents: dict[int, ast.AST]) -> tuple | None:
@@ -828,6 +847,126 @@ class Index:
             return None  # the parameter is used for something else too
         return ("attr", cpath, chain, target)
 
+    # ── the values a computed attribute name can take (moon-20) ──────────
+
+    def _var_constants(self, var: str, ctx: _Ctx, path: str) -> set[str] | None:
+        """Every string `var` can hold at a site in `ctx.func`, when each binding of `var`
+        anywhere in that function (nested scopes included: conservative) is one of
+          * `var = "const"`;
+          * a for-loop / comprehension target (`var`, or `var` at a fixed position of a
+            tuple target) over a literal tuple / list / set of string constants (or of
+            tuples of them);
+          * a for-loop / comprehension target over `self.X` / `cls.X` (the method's
+            receiver, `ctx.recv`), where X is a class-level literal tuple of strings in
+            that class and X is bound nowhere else in the source (no subclass or instance
+            can rebind it, and no string "X" can reach setattr).
+        None: any value (a parameter, any other binding, global / nonlocal)."""
+        f = ctx.func
+        if not isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        a = f.args
+        if var in {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs} | {
+                x.arg for x in (a.vararg, a.kwarg) if x}:
+            return None
+        out: set[str] = set()
+        bound = False
+        for n in ast.walk(f):
+            if isinstance(n, (ast.Global, ast.Nonlocal)) and var in n.names:
+                return None
+            if isinstance(n, ast.arg) and n.arg == var:
+                return None  # a nested scope's parameter (conservative)
+            if isinstance(n, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and n.name == var:
+                return None
+            if isinstance(n, ast.alias) and (n.asname or n.name).split(".")[0] == var:
+                return None
+            if isinstance(n, ast.Name) and n.id == var and not isinstance(n.ctx, ast.Load):
+                bound = True
+                got = self._binding_constants(n, var, ctx, path, f)
+                if got is None:
+                    return None
+                out |= got
+        return out if bound and out else None
+
+    def _binding_constants(self, name: ast.Name, var: str, ctx: _Ctx, path: str,
+                           func: ast.AST) -> set[str] | None:
+        parents = self._parents(path)
+        up = parents.get(id(name))
+        if (isinstance(up, ast.Assign) and len(up.targets) == 1 and up.targets[0] is name
+                and isinstance(up.value, ast.Constant) and isinstance(up.value.value, str)):
+            return {up.value.value}
+        pos = None
+        loop = up
+        if isinstance(up, ast.Tuple) and not any(isinstance(e, ast.Starred) for e in up.elts):
+            pos = up.elts.index(name)
+            loop = parents.get(id(up))
+            target = up
+        else:
+            target = name
+        if not isinstance(loop, (ast.For, ast.comprehension)) or loop.target is not target:
+            return None
+        items = self._literal_items(loop.iter, ctx, path)
+        if items is None:
+            return None
+        out = set()
+        for item in items:
+            if pos is None:
+                if not (isinstance(item, ast.Constant) and isinstance(item.value, str)):
+                    return None
+                out.add(item.value)
+            else:
+                if not (isinstance(item, ast.Tuple) and len(item.elts) == len(target.elts)):
+                    return None
+                el = item.elts[pos]
+                if not (isinstance(el, ast.Constant) and isinstance(el.value, str)):
+                    return None
+                out.add(el.value)
+        return out
+
+    def _literal_items(self, it: ast.AST, ctx: _Ctx, path: str) -> list | None:
+        if isinstance(it, (ast.Tuple, ast.List, ast.Set)):
+            return None if any(isinstance(e, ast.Starred) for e in it.elts) else list(it.elts)
+        if (isinstance(it, ast.Attribute) and isinstance(it.value, ast.Name)
+                and ctx.recv is not None and it.value.id == ctx.recv[0]):
+            chain = ctx.recv[1]
+            cls = next((c for p, c, ch in self.classes().get(chain[-1], ())
+                        if p == path and tuple(ch) == tuple(chain)), None)
+            if cls is None or self._stores_of(it.attr) != 1:
+                return None
+            for st in cls.body:
+                tgt = (st.targets[0] if isinstance(st, ast.Assign) and len(st.targets) == 1
+                       else st.target if isinstance(st, ast.AnnAssign) else None)
+                if isinstance(tgt, ast.Name) and tgt.id == it.attr and st.value is not None:
+                    v = st.value
+                    if isinstance(v, (ast.Tuple, ast.List)) and not any(
+                            isinstance(e, ast.Starred) for e in v.elts):
+                        return list(v.elts)
+                    return None
+        return None
+
+    def _stores_of(self, attr: str) -> int:
+        """How many places can bind `attr` as a name or attribute (a string constant equal to
+        it counts as one too: setattr / __dict__ writes)."""
+        memo = self.__dict__.setdefault("_stores_memo", {})
+        if attr not in memo:
+            n = 0
+            for path in self.sources:
+                if attr not in self.sources[path]:
+                    continue
+                for node in ast.walk(self.tree(path)):
+                    if isinstance(node, ast.Name) and node.id == attr and not isinstance(
+                            node.ctx, ast.Load):
+                        n += 1
+                    elif isinstance(node, ast.Attribute) and node.attr == attr and not isinstance(
+                            node.ctx, ast.Load):
+                        n += 1
+                    elif isinstance(node, ast.Constant) and node.value == attr:
+                        n += 1
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                           ast.ClassDef)) and node.name == attr:
+                        n += 1
+            memo[attr] = n
+        return memo[attr]
+
     def _dynamic_sites(self):
         """Reads whose attribute name is computed: getattr(x, v), vars(x), dir(x), x.__dict__."""
         if self._dynamic is None:
@@ -850,6 +989,11 @@ class Index:
                     allowed = None
                     if name_arg is not None:
                         allowed = _name_pattern(name_arg, ctx, node, parents)
+                        if allowed is None and isinstance(name_arg, ast.Name):
+                            consts = self._var_constants(name_arg.id, ctx, path)
+                            if consts:
+                                allowed = re.compile("|".join(re.escape(c) for c in sorted(consts)),
+                                                     re.S)
                     elif kind == "names":
                         allowed = _loop_filter(node, parents)
                     lookup = (isinstance(node, ast.Call) and isinstance(node.func, (ast.Name, ast.Attribute))

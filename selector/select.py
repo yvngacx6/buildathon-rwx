@@ -1232,12 +1232,16 @@ class Selector:
                 got |= self.maps.span(site.path, first, last)
             return [(bucket, got)]
         if flow is not None and flow[0] == "attr":
-            _, path, chain, stored = flow
+            _, path, chain, stored = flow[:4]
+            truth = flow[4:] == ("truth",)  # `kw=bool(x.NAME)`: only NAME's truth is stored
+            if truth and "truth" in same:
+                return []  # the edit keeps the truth: the stored bool is unchanged
             out = []
             for inner in index.sites(stored, path, tuple(chain), False):
                 # the stored attribute holds the same object: same projections
+                # (a stored bool: every read sees exactly what changed)
                 out += self._site_reads(index, inner, stored, depth + 1,
-                                        same if not inner.dynamic else frozenset())
+                                        same if not (inner.dynamic or truth) else frozenset())
             return out
         # "def" sites outside cached code run at import: their products are in the diff; the
         # line map still shows any test that ran them later.
