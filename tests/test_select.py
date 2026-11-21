@@ -169,10 +169,12 @@ def test_hunk_that_does_not_apply_selects_all(selector):
 # ── sqlglot/: functions ──────────────────────────────────────────────────────
 
 def test_function_body_uses_whole_function_span(selector):
-    # Line 11 never ran (short-circuit), but tests that ran the function are selected,
-    # plus the untraced test U, which joins every non-empty selection.
+    # Line 11 never ran (short-circuit), but C ran line 10 of the same 3-line `if` header, so
+    # the touched header ran under C; D ran the function but not the header: dropped
+    # (moon-06: the statement rule applies to every test, STMT_SECONDS = 0). The untraced
+    # test U joins every non-empty selection.
     got = run(selector, edit("sqlglot/lib.py", "len(sql) > LIMIT", "len(sql) >= LIMIT"))
-    assert got == {C, D, U}
+    assert got == {C, U}
 
 
 def test_slow_test_off_the_touched_statement_is_dropped(tmp_path):
@@ -185,7 +187,7 @@ def test_slow_test_on_another_line_of_the_touched_header_is_kept(tmp_path):
     # C (slow) ran line 10 of the 3-line `if` header, not the edited line 11.
     selector = make_selector(tmp_path, slow=(C,))
     got = run(selector, edit("sqlglot/lib.py", "len(sql) > LIMIT", "len(sql) >= LIMIT"))
-    assert got == {C, D, U}
+    assert got == {C, U}  # D never ran the header (moon-06: statement rule for every test)
 
 
 def test_slow_test_kept_when_statements_are_inserted(tmp_path):

@@ -8,9 +8,13 @@ That special case is `SLOW_SECONDS → 0` for the *touched-statement* rule, appl
 instead of only tests ≥ 5 s. Results:
 
 - Misses: 0 on 440 labeled patches (private 264, private41, adversarial, adversarial2, practice_like, sample).
-- Cost per 40 commits: −13.4 s on private, −9.1 on P, −13.6 on Q.
+- Cost per 40 commits, counting only commits whose statement-rule outcome changed:
+  −13.4 s on private, −9.0 on P, −14.4 on Q.
 - Sample: −1.5 s once diffexec timing noise is taken out.
-- Run-time CPU: about 0.
+- Run-time CPU: not higher. Selector process CPU on sample, laptop: 1.68 s on main, 1.0–1.2 s
+  on this change. Forked children are not counted.
+- **Already implemented on this branch:** `selector/select.py` `STMT_SECONDS = 0.0`. Unit tests
+  are updated (169 pass). The scripts are in `research/moonshots/06/`.
 - Hash seed: across 3 hash seeds, no dropped (commit, test) pair runs a changed line (9135 pairs).
 
 After that rule, the work left for real phase re-run or frontier replay is ≤ ~2 s/40 for mid-tier
@@ -98,8 +102,8 @@ on private.
 | adversarial2 (65) | 937.6 | 932.0 | **922.7** (−9.2/40) | 0 / 0 |
 | practice_like (24) | 238.8 | 214.1 | **171.7** (−112/40) | 0 / 0 |
 | sample (30) | 140.2 | 117.3* | 117.2* (real gain −1.5 s) | 0 / 0 |
-| P (600) | 4913.4 | 4859.1 | **4777.0** (−9.1/40) | n/a |
-| Q (1000) | 7849.5 | 7715.5 | **7510.4** (−13.6/40) | n/a |
+| P (600) | 4913.4 | 4859.1 | **4777.0** (rule −9.0/40, noise 0.0) | n/a |
+| Q (1000) | 7849.5 | 7715.5 | **7510.4** (rule −14.4/40, noise +0.8) | n/a |
 
 \* Sample 66ks: the 21.45 s drop of test_execute_tpcds is **diffexec noise**, not this rule.
 
@@ -119,6 +123,18 @@ rarely-taken branch. For example, practice_like ehpl edits `TokenizerCore._add`,
    - None of the 9135 dropped (commit, test) pairs runs a changed line under any seed.
    - The set of tests hitting each line is identical across seeds.
 
+3. Scoping edits are already guarded. `classify.touched_statements` returns None, which falls
+   back to the whole-function rule, in these cases:
+   - a touched statement binds different names (`x=` → `exp=` makes `exp` local everywhere,
+     including `:=`);
+   - it adds `global` or `nonlocal`;
+   - it adds or removes a `yield`;
+   - statements are added or removed;
+   - a nested def header changes;
+   - the def writes state that outlives the call (caches).
+
+   Unit test `test_slow_test_kept_when_the_edit_changes_name_bindings` covers the first case.
+
 **Residual risks:**
 
 - Branches that depend on worker order or cache state. The map comes from one suite-order run;
@@ -128,8 +144,8 @@ rarely-taken branch. For example, practice_like ehpl edits `TokenizerCore._add`,
 - Why main kept cheap tests at the function rule ("absorb line-level noise in the map"): this
   rationale was never measured. These numbers are its first measurement.
 
-**CPU:** none added. It uses the same map shards that are already loaded for the function span,
-and diffexec gets fewer tests to consider.
+**CPU:** no new work. It uses the same map shards that are already loaded for the function
+span, and diffexec gets fewer tests to consider. Measured above: not higher.
 
 ## 4. What is left for real phase re-run / frontier replay
 
@@ -172,9 +188,15 @@ After threshold 0, private's passing mid+semi stake is mostly class/module-state
 
 ## 6. Recommendation / smallest validation
 
-Ship `STMT_SECONDS = 0` as a separate threshold for `_slow_tests_off_statements`. It is a
-two-line diff, and the patched copy is in scratchpad `m06/v05b/selector/select.py`. Keep
-`SLOW_SECONDS = 5` for `slack`.
+Merge the moon-06 `selector/select.py` change: `STMT_SECONDS = 0` as a separate threshold for
+`_slow_tests_off_statements`, with `SLOW_SECONDS = 5` kept for `slack`, plus the two updated
+unit tests.
+
+To re-run the seed check:
+
+1. `research/moonshots/06/mktargets.py` writes the changed lines of the commits whose selection drops tests.
+2. `target_plugin.py` re-traces the full suite (`-p target_plugin`, `PYTHONHASHSEED=0/1/2`).
+3. `checkseeds.py` reports any dropped test that runs a changed line under any seed.
 
 Before merging:
 

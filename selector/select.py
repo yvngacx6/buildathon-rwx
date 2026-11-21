@@ -67,9 +67,10 @@ Then: tests no map knows about join every non-empty selection, and a selection t
 cost nearly as much as ALL becomes ALL (same price, no risk).
 
 Slow tests in function bodies. A test that never executes the statements an edit touches
-runs exactly the code it ran before, so it cannot notice the edit. Cheap tests stay at the
-whole-function rule (they cost almost nothing, and the function span absorbs any line-level
-noise in the map). A slow test (≥ SLOW_SECONDS, from tests.json) is kept only if the lines
+runs exactly the code it ran before, so it cannot notice the edit. moon-06: this now holds for
+every test (STMT_SECONDS = 0; it was ≥ 5 s only, cheap tests kept the whole-function span "to
+absorb line-level noise" – re-traced under 3 hash seeds, no dropped test ran a changed line).
+A test (≥ STMT_SECONDS, from tests.json) is kept only if the lines
 map shows it ran a line of a touched statement: the whole statement for simple statements,
 the header lines for an if / for / while whose header alone changed. The statement view
 exists only for clean in-place edits (classify.touched_statements); otherwise, or when no
@@ -109,7 +110,11 @@ ALWAYS_ALL = {"pytest.ini", "tox.ini", "conftest.py", "setup.py"}
 # Selection cost ≥ this × ALL cost → just run ALL. r5-tune: 0.85 fired on 32.8 s selections
 # (0.89 × ALL, 4 s dearer, never needed on any set); 0.95 keeps the free hedge near equal cost.
 ALL_FRACTION = 0.95
-SLOW_SECONDS = 5.0  # tests at least this slow get the statement-level rule in function bodies
+SLOW_SECONDS = 5.0  # "slow" callers counted as prunable slack by the import-state gain gate
+# moon-06: tests at least this slow get the statement-level rule in function bodies (was
+# SLOW_SECONDS). 0 = every test: 0 misses on 440 labeled patches; private -13.4 s/40,
+# P -9.0, Q -14.4 (research/moonshots/06-subtests.md).
+STMT_SECONDS = 0.0
 # An import-state diff costs ~0.8 s of container CPU (r3-cpu). Run it only when the wide set
 # costs at least this much more than the cheapest selection it could give. r5-tune: 1.2 adds
 # diffs that save ~1.8 s each; ≤1.0 adds diffs that save ~0.5 s (< their CPU).
@@ -163,6 +168,7 @@ class Selector:
         self._number_of = {t["id"]: t["number"] for t in tests}
         self._secs = {t["number"]: float(t.get("seconds", 0.0)) for t in tests}
         self._slow = {n for n, s in self._secs.items() if s >= SLOW_SECONDS}
+        self._stmt_slow = {n for n, s in self._secs.items() if s >= STMT_SECONDS}
         self._untraced: set[int] | None = None
         self._sources: dict[str, str] | None = None
         self._some_sources: dict[str, str | None] = {}  # `_source` before `_all_sources`
@@ -753,7 +759,7 @@ class Selector:
     def _slow_tests_off_statements(self, path: str, ran_function: set[int],
                                    r: classify.Region) -> set[int]:
         """Drop the slow tests that ran the function but none of the touched statements."""
-        slow = ran_function & self._slow
+        slow = ran_function & self._stmt_slow
         if not slow or r.statements is None:
             return ran_function
         ran_statements: set[int] = set()
