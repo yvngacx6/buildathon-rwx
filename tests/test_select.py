@@ -427,8 +427,9 @@ def test_syntax_error_in_collected_file_selects_all(bounded):
     assert run(bounded, edit("tests/helpers.py", "return 1", "return 1 +")) == ALL
 
 
-def test_deleted_test_file_nothing_imports_selects_its_tests(bounded):
-    assert run(bounded, patch("tests/test_lib.py", TEST, None)) == {A, B, U}
+def test_deleted_test_file_selects_all(bounded):
+    """A deleted test file may abort the labeler's whole pytest run ("not found"): ALL."""
+    assert run(bounded, patch("tests/test_lib.py", TEST, None)) == ALL
 
 
 def test_deleted_module_imported_at_collection_selects_all(bounded):

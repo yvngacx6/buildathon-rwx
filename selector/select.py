@@ -193,6 +193,10 @@ class Selector:
             raise AllTests(why)
         if self.maps.collected(path, by_import=removed):
             raise AllTests(f"{why}; {path} is loaded at collection")
+        if removed and path.startswith("tests/"):
+            # A deleted/renamed test file: if the labeler passes explicit node ids, pytest
+            # stops with "file or directory not found" for the whole run. Unknown → ALL.
+            raise AllTests(f"{why}; removed test file")
         return loaders | self.maps.reads.get(path), f"{why} → tests that load it (run time)"
 
     def _config(self, fp: diff.FilePatch) -> tuple[set[int], str]:
