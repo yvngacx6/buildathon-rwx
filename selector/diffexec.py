@@ -28,11 +28,13 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 # Test sources mentioning these observe resources that replay cannot compare.
-RESOURCE_NAMES = {"tracemalloc", "gc", "resource", "time", "timeit", "perf_counter",
-                  "process_time", "monotonic", "setrecursionlimit", "getrecursionlimit",
-                  "getsizeof", "getrefcount", "psutil", "threading", "signal"}
+RESOURCE_MODULES = {"tracemalloc", "gc", "resource", "time", "timeit", "psutil", "threading",
+                    "signal", "faulthandler", "pyperf"}
+RESOURCE_ATTRS = {"setrecursionlimit", "getrecursionlimit", "getsizeof", "getrefcount",
+                  "get_traced_memory", "perf_counter", "process_time", "monotonic"}
 COMMIT_BUDGET_S = float(os.environ.get("BR_DIFFEXEC_COMMIT_S", "3"))
 BATCH_BUDGET_S = float(os.environ.get("BR_DIFFEXEC_BATCH_S", "60"))
+BENEFIT_SHARE = float(os.environ.get("BR_DIFFEXEC_SHARE", "0.3"))
 
 
 class DiffExec:
@@ -42,9 +44,10 @@ class DiffExec:
         self.spent = 0.0
         self._idx = None
         self._by_name: dict | None = None
+        self._warm = False
         from .pack import duration_ms
         self.ms_of = {t["number"]: duration_ms(t["seconds"]) for t in selector.tests}
-        self._resource_tests: set[str] | None = None
+        self._resource_files: dict[str, set[str]] = {}
         self._class_of: dict[str, str] = {}
         self._mates: dict[str, list[str]] = {}
         for t in selector.tests:
@@ -64,12 +67,15 @@ class DiffExec:
 
     # ── run the replay child ────────────────────────────────────────────────
 
-    def _replay(self, jobs) -> dict | None:
-        budget = min(COMMIT_BUDGET_S, BATCH_BUDGET_S - self.spent)
-        if budget < 1:
+    def _replay(self, jobs, benefit_ms: int = 10_000) -> dict | None:
+        # CPU is charged: spend at most ~30 % of what the replay could save (and at most 3 s).
+        budget = min(COMMIT_BUDGET_S, BENEFIT_SHARE * benefit_ms / 1000, BATCH_BUDGET_S - self.spent)
+        if budget < 0.05:
             return None
         req = {"root": str(self.sel.sqlglot), "store": str(self.store), "deadline_s": budget,
                "files": [{"path": p, "new_text": text} for p, text, _ in jobs]}
+        if os.environ.get("PYTHONHASHSEED") == "0" and hasattr(os, "fork"):
+            return self._replay_fork(req, budget)
         env = dict(os.environ, PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1")
         t0 = os.times()
         try:
@@ -87,6 +93,71 @@ class DiffExec:
             return None
         lines = proc.stdout.strip().splitlines()
         return json.loads(lines[-1]) if lines else None
+
+    def _replay_fork(self, req: dict, budget: float) -> dict | None:
+        """Same as the child process, but forked from this process with sqlglot pre-imported
+        once (the selector re-executes itself with PYTHONHASHSEED=0, see __main__)."""
+        if not self._warm:
+            root = str(self.sel.sqlglot)
+            if root not in sys.path:
+                sys.path.insert(0, root)
+            if str(REPO) not in sys.path:
+                sys.path.insert(0, str(REPO))
+            import sqlglot  # noqa: F401
+            import sqlglot.optimizer  # noqa: F401
+            from diffexec import replay  # noqa: F401
+            self._warm = True
+        from diffexec import replay
+        t0 = os.times()
+        rfd, wfd = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # child: never returns
+            code = 1
+            try:
+                os.close(rfd)
+                data = json.dumps(replay.run_request(req)).encode()
+                with os.fdopen(wfd, "wb") as fh:
+                    fh.write(data)
+                code = 0
+            except BaseException:  # noqa: BLE001
+                if os.environ.get("DIFFEXEC_DEBUG"):
+                    import traceback
+                    traceback.print_exc()
+            finally:
+                os._exit(code)
+        os.close(wfd)
+        chunks = []
+        deadline = time.monotonic() + budget + 5
+        import select as _select
+        status = None
+        with os.fdopen(rfd, "rb") as fh:
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                ready, _, _ = _select.select([fh], [], [], left)
+                if not ready:
+                    break
+                chunk = os.read(fh.fileno(), 1 << 16)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        timed_out = time.monotonic() >= deadline
+        if timed_out:
+            os.kill(pid, 9)
+        _, status = os.waitpid(pid, 0)
+        if timed_out:
+            status = -1
+        t1 = os.times()
+        self.last_child = round((t1.children_user - t0.children_user)
+                                + (t1.children_system - t0.children_system), 2)
+        self.spent += self.last_child
+        if status != 0:
+            return None
+        try:
+            return json.loads(b"".join(chunks))
+        except ValueError:
+            return None
 
     # ── decide ──────────────────────────────────────────────────────────────
 
@@ -132,7 +203,7 @@ class DiffExec:
             why = f"precheck error {type(e).__name__}"
         if why:
             return {}, f"diffexec: keep all ({why})"
-        got = self._replay(jobs)
+        got = self._replay(jobs, benefit_ms)
         if got is None:
             return {}, "diffexec: no answer (error / timeout / budget)"
         if got.get("bail"):
@@ -158,14 +229,13 @@ class DiffExec:
                     if kind == "SETUP":  # setUpClass work reaches the whole class
                         bad_tests.update(self._mates.get(self._class_of.get(tid, tid), [tid]))
                     bad_tests.add(tid)
-        resource = self._resource()
         dropped: dict[str, set[int]] = {}
         n = 0
         for path, _, numbers in jobs:
             out = set()
             for num in numbers:
                 tid = self.sel._id_of[num]
-                if tid in bad_tests or tid not in seen_tests or tid in resource:
+                if tid in bad_tests or tid not in seen_tests or self._is_resource(tid):
                     continue
                 # setUpClass of a classmate that ran a changed function must also be ok
                 out.add(num)
@@ -176,29 +246,35 @@ class DiffExec:
                          f"(blobs {stats.get('ok')}/{stats.get('blobs')}, child cpu {stats.get('cpu_s')}s, rusage {self.last_child}s, "
                          f"parent {time.process_time() - t0:.2f}s)")
 
-    def _resource(self) -> set[str]:
-        """Test ids whose own source (test function or its class body) names a resource probe."""
-        if self._resource_tests is not None:
-            return self._resource_tests
-        out: set[str] = set()
-        files = {tid.split("::")[0] for tid in self.sel._id_of.values()}
-        for f in files:
+    def _is_resource(self, tid: str) -> bool:
+        """Does the test's class (or module-level test function) name a resource probe?
+
+        Coarse on purpose: a use of a resource module (or RESOURCE_ATTRS) anywhere in the test's class marks all
+        tests of that class. Files are parsed lazily, only for candidate tests.
+        """
+        f = tid.split("::")[0]
+        hit = self._resource_files.get(f)
+        if hit is None:
+            hit = set()
             try:
                 tree = ast.parse((self.sel.sqlglot / f).read_bytes())
             except (OSError, SyntaxError, ValueError):
-                out.update(t for t in self.sel._id_of.values() if t.startswith(f + "::"))
-                continue
-            module_hit = any(isinstance(n, (ast.Import, ast.ImportFrom)) and
-                             any(a.name.split(".")[0] in RESOURCE_NAMES or a.name in RESOURCE_NAMES
-                                 for a in n.names) for n in ast.walk(tree))
-            if not module_hit:
-                continue
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
-                    names |= {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
-                    if names & RESOURCE_NAMES:
-                        out.update(t for t in self.sel._id_of.values()
-                                   if t.startswith(f + "::") and t.endswith("::" + node.name))
-        self._resource_tests = out
-        return out
+                hit = {"*"}
+            else:
+                bound = set()  # local names bound to resource modules or their members
+                for n in ast.walk(tree):
+                    if isinstance(n, ast.Import):
+                        for al in n.names:
+                            if al.name.split(".")[0] in RESOURCE_MODULES:
+                                bound.add((al.asname or al.name).split(".")[0])
+                    elif isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] in RESOURCE_MODULES:
+                        bound.update(al.asname or al.name for al in n.names)
+                for node in tree.body:
+                    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                        names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+                        attrs = {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
+                        if names & bound or attrs & RESOURCE_ATTRS:
+                            hit.add(node.name)
+            self._resource_files[f] = hit
+        parts = tid.split("::")
+        return "*" in hit or (len(parts) > 1 and parts[1] in hit)

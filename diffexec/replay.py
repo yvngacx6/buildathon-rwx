@@ -94,7 +94,10 @@ class _Logs(logging.Handler):
 
 
 def main() -> None:
-    req = json.load(sys.stdin)
+    print(json.dumps(run_request(json.load(sys.stdin))))
+
+
+def run_request(req: dict) -> dict:
     t_start = time.process_time()
     deadline = t_start + float(req.get("deadline_s", 20))
     root = os.path.realpath(req["root"])
@@ -138,8 +141,7 @@ def main() -> None:
             break
     if out["bail"] or not plan:
         out["stats"]["cpu_s"] = round(time.process_time() - t_start, 3)
-        print(json.dumps(out))
-        return
+        return out
 
     modules = {}
     for _, _, _, _, m in plan:
@@ -259,7 +261,7 @@ def main() -> None:
                 v = "ok" if all(verdict[i] for i in idxs) else "bad"
             info["phases"][phase_name(phase)] = v
     out["stats"] = {"blobs": n_blobs, "ok": n_ok, "cpu_s": round(time.process_time() - t_start, 3)}
-    print(json.dumps(out))
+    return out
 
 
 if __name__ == "__main__":
