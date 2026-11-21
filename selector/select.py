@@ -382,11 +382,13 @@ class Selector:
                 sites = index.sites(name, path, tuple(chain), True)
             except names.Fallback as exc:
                 raise AllTests(f"{why}: {exc}") from None
+            if not chain:
+                got |= self._from_imports(name, why, module)
             for site in sites:
                 if site.path.startswith("tests/") and site.when == "def" and not site.dynamic:
                     raise AllTests(f"{why}: {site.path}:{site.lines[0]} reads {name} at collection")
-            if not chain:
-                got |= self._from_imports(name, why)
+                if site.when == "def" and site.memo:  # (as `_site_reads`, before the diff)
+                    raise AllTests(f"{why}: {name} read in code cached across tests ({site.what})")
             if kind == "def":
                 s = scopes.by_chain.get(tuple(q.split(".")))
                 if s is None or s.kind != "def":
@@ -409,12 +411,14 @@ class Selector:
             raise AllTests(f"{why}: {exc}") from None
         return got | callers | readers, f"removed {', '.join(sorted(lost)[:3])} → callers, {how}"
 
-    def _from_imports(self, name: str, why: str) -> set[int]:
+    def _from_imports(self, name: str, why: str, module: str) -> set[int]:
         """`from … import name` statements: inside a def → the tests that ran that line;
-        at module level in a test file → AllTests (collection error); at module level in
-        sqlglot/ → nothing here (if it imports the removed name, the patched package does
-        not import and the state diff is unavailable)."""
+        at module level in a test file → AllTests (collection error); at module level in an
+        unpatched sqlglot/ file, from this module → AllTests (the patched package does not
+        import: the state diff would be unavailable); other module-level imports → the diff
+        tells (it fails if one does import the removed name)."""
         got: set[int] = set()
+        patched = {fp.path for fp in self._files}
         for other in sorted({p for p, _ in self._index().data["imports"].get(name, ())}):
             source = self._source(other)
             if source is None:
@@ -424,6 +428,8 @@ class Selector:
                     got |= self.maps.span(other, node.lineno, node.end_lineno or node.lineno)
                 elif other.startswith("tests/"):
                     raise AllTests(f"{why}: {other} imports {name} at collection")
+                elif other not in patched and _from_module(other, node) == module:
+                    raise AllTests(f"{why}: {other} imports {name}")
         return got
 
     # ── tests/*.py ────────────────────────────────────────────────────────────
@@ -1354,6 +1360,16 @@ def _bindings(tree: ast.Module) -> set[str]:
     """Names bound at module level and in class bodies (nested classes included), as
     dotted paths: `func`, `Class`, `Class.attr`, `Class.method`. Function bodies are skipped."""
     return set(_binding_kinds(tree))
+
+
+def _from_module(path: str, node: ast.ImportFrom) -> str:
+    """The absolute module a `from … import` in file `path` names."""
+    if not node.level:
+        return node.module or ""
+    package = _module_of(path) if path.endswith("__init__.py") else _module_of(path).rpartition(".")[0]
+    parts = package.split(".")
+    base = ".".join(parts[:len(parts) - (node.level - 1)])
+    return f"{base}.{node.module}" if node.module else base
 
 
 def _import_froms(tree: ast.Module, name: str):
