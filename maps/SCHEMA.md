@@ -13,7 +13,9 @@ Test ids are pytest node ids exactly as in `tests.json` `"id"` (for example
 
 | File | Key | Value: tests that … |
 |---|---|---|
-| `lines.json.gz` | `"<repo path>:<line>"`, e.g. `"sqlglot/parser.py:812"` | executed that line (all code, including module and class bodies; process-pool work traced inline with pickle round-trip; `setUpClass` work credited to every test in the class) |
+| `lines.json.gz` | `"<repo path>:<line>"`, e.g. `"sqlglot/parser.py:812"` | executed that line **while the test ran** (from the start of its setup: `setUpClass`, `setUp`, body, teardown; process-pool work traced inline with pickle round-trip), **outside any module-body execution**. Lines that ran only because a module was imported (at startup, at collection, or lazily inside the test) are left out: use `import_time` and `classes` for those |
+| `lines_phase.json.gz` | same | like `lines`, but also keeps lines run by imports that happened during the test (lazy dialect loads). Reference only |
+| `lines_full.json.gz` | same | everything the test's own interpreter executed, including `import sqlglot` and collection. Reference only |
 | `classes.json.gz` | `"<module>.<Qualname>"`, e.g. `"sqlglot.dialects.tsql.TSQL"` | instantiated that class or a subclass of it (MRO), or used it as a dialect |
 | `reads.json.gz` | `"<repo path>"`, e.g. `"tests/fixtures/optimizer/simplify.sql"` | opened that file for reading |
 | `test_imports.json.gz` | `"<repo path of a module under tests/>"` | live in a test file that imports it (directly or transitively) |
