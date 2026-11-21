@@ -400,6 +400,34 @@ def build(root: Path, out: Path) -> None:
             queries.append(q)
             print(f"{suite} {len(queries)} exec={q['execute']} cpu={cpu_exec:.2f}/{cpu_opt:.2f}"
                   f" stable={stable}", file=sys.stderr)
+        # r26: the run-time child verifies its checkpointed queries one after the other, warm;
+        # a fresh fork per query (above) overstates that ~1.7x. Re-time them in one fork, in
+        # order (the same outputs, else never checkpointed).
+        ck_idx = [i for i, q in enumerate(queries) if q.get("cpu_ck") is not None]
+
+        def warm_ck():
+            got = {}
+            for i in ck_idx:
+                t0 = time.process_time()
+                c = run_query(queries[i], schemas[suite], tables[suite], False, "ck")
+                got[i] = (c, time.process_time() - t0)
+            return got
+
+        if ck_idx:
+            try:
+                warm = _in_fork(warm_ck)
+            except RuntimeError:
+                warm = {}
+            for i in ck_idx:
+                q = queries[i]
+                c, cpu = warm.get(i, (None, None))
+                if c is None or c[0] != q["outs"]["ck"] or c[1] != q["outs"]["duck"]:
+                    q["outs"]["ck"], q["cpu_ck"] = None, None
+                else:
+                    q["cpu_ck"] = cpu
+            print(f"{suite}: {sum(1 for i in ck_idx if queries[i]['cpu_ck'] is not None)}"
+                  f" checkpointable, warm CPU {sum(queries[i]['cpu_ck'] or 0 for i in ck_idx):.2f}s",
+                  file=sys.stderr)
         meta["suites"][suite] = queries
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".tmp")
