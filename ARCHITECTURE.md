@@ -150,6 +150,26 @@ diff otherwise empty → no import-time dependents and the commit stays prunable
 values → their readers (`hook=own`). Before, the entry's own readers (every holder of a
 Parser) made the readers set as wide as the dependents (`_build_list_sort` 25.5 → 2.8 s).
 
+Round 36 (r36-hooks): **a run-time read is observed on its own lines.** Name sites
+(`names.Index._site`, `_local_flow` loads) of an `ast.Name` / `ast.Attribute` read inside a def
+now span only the node's own lines; before, they were widened to the enclosing statement's
+lines (a rule from the coverage.py prototype maps, which credit only a statement's first
+line). The shipped lines map is sys.monitoring LINE events, one interpreter per test, and
+CPython 3.12+ starts a line at every instruction whose line differs from the previous one in
+bytecode order, at every jump target and every exception handler, so an instruction on line L
+only runs after a LINE event for L; a name / attribute load carries a line inside its node.
+String-constant mentions keep the statement span (constants fold into an enclosing literal
+whose load carries the literal's line). Main effect, the `_TokenizerBase.__init_subclass__`
+bucket: `_BYTE_STRING_ESCAPES` reaches `TokenizerCore.byte_string_escapes` (store-only
+constructor flow), read at tokenizer_core.py:1149 inside
+`escapes=(self.byte_string_escapes if token_type == BYTE_STRING else self.string_escapes)`
+of a 10-line call: 670 tests ran the statement, 8 ran line 1149. Byte-escape hook edits
+(P/kjs8, P/bc18, Q/nh8k, Q/7evr) 27.5 → 6.1–6.8 s; also multi-line reads of dialect settings
+(Q/q0xd 25.5 → 6.8). Not narrowable this way: `_COMMENTS` / `_KEYWORD_TRIE` edits (09if, 93uz):
+the key-level map already restricts them to tests that looked up the changed trie keys, and the
+root `*` / `/` lookups are made by the slow TPC tests (a real read; only execution could clear
+them).
+
 Round 16 (r16-allcut): **import-time edits by state readers.** (1) A function body run while
 modules are imported (`import sqlglot` → was ALL; a module's import → its dependents) now
 takes, when the patched package imports and it is cheaper, the readers of every value the
