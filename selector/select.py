@@ -843,6 +843,10 @@ class Selector:
             if on_module is not None and (method
                                           or not re.fullmatch(on_module, module, re.S)):
                 continue  # getattr on modules: reaches module-level defs only
+            if on_module is None and not method:
+                # getattr on objects / classes: a module-level def gets onto one only through
+                # a load of its name, and every load is a call (checked below)
+                continue
             if allowed is not None and not re.fullmatch(allowed, name, re.S):
                 continue
             if allowed is not None or site.when != "run":
