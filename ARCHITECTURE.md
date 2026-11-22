@@ -141,6 +141,15 @@ seen reader → those readers are kept (`fixed`, never pruned) and the commit st
 readers set costs more raw seconds than the dependents if it drops the slow tests; a changed
 value with no seen reader (callers stand in for it) or an import failure → `_mixed_py` as before.
 
+Round 34 (r34-gap): **R-DEF default edits of defs run at import.** The r19 rule skipped the
+edited def's own import-state entry only for body edits. A literal-default edit (R-DEF: every
+change in the file is a literal default and nothing reads `__defaults__` & co.) changes that
+entry only in its defaults, which only a call leaving the parameter out can observe, and such a
+call runs the body (lines map / default-observing calls). So the entry is skipped there too:
+diff otherwise empty → no import-time dependents and the commit stays prunable; other changed
+values → their readers (`hook=own`). Before, the entry's own readers (every holder of a
+Parser) made the readers set as wide as the dependents (`_build_list_sort` 25.5 → 2.8 s).
+
 Round 16 (r16-allcut): **import-time edits by state readers.** (1) A function body run while
 modules are imported (`import sqlglot` → was ALL; a module's import → its dependents) now
 takes, when the patched package imports and it is cheaper, the readers of every value the

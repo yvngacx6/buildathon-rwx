@@ -70,7 +70,7 @@ MISS_PENALTY_S = 300.0
 DEFAULT_SETS = ["sample", "private", "private41", "adversarial"]
 
 # Rule methods whose top-level result is credited to a mechanism.
-WRAPPED = ["_slow_tests_off_statements", "_class_users", "_function_at_import", "_import_time",
+WRAPPED = ["_off_statements", "_never_called", "_constant_defaults", "_class_hook", "_class_users", "_function_at_import", "_import_time",
            "_definition_time",
            "_import_bound", "_by_names", "_by_state", "_test_code", "_removed_bindings"]
 
@@ -123,12 +123,21 @@ class TracingSelector(Selector):
         return call
 
     def _credit(self, name, result, args) -> None:
-        if name == "_slow_tests_off_statements":
+        if name == "_off_statements":
             got = set(result)
             slow = got & self._slow
             self.credits.append(("function map", got - slow))
             if slow:
-                self.credits.append(("statement rule (slow)", slow))
+                self.credits.append(("function map (slow tests)", slow))
+        elif name == "_never_called":
+            if result is not None:
+                self.credits.append(("never-called code readers", set(result[0])))
+        elif name == "_constant_defaults":
+            if result is not None:
+                self.credits.append(("constant-default observers", set(result[0])))
+        elif name == "_class_hook":
+            if result is not None:
+                self.credits.append(("class hook state readers", set(result)))
         elif name == "_class_users":
             self.credits.append(("signature class users", set(result)))
         elif name == "_function_at_import":  # (tests, import state unchanged)
