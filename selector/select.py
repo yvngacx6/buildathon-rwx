@@ -403,6 +403,7 @@ class Selector:
         """{path: [(first, last)]} OLD-file lines whose run can differ under the patch, or a
         reason (str) not to verify. Raises names.Fallback like `_state_readers`."""
         spans: dict[str, list[tuple[int, int]]] = {}
+        covered: set[tuple[str, ...]] = set()  # (module, *def chain) whose edit is in spans
         by_path = {fp.path: fp for fp in self._files}
         for p, new_text in patched.items():
             old_bytes = (self.sqlglot / p).read_bytes()
@@ -414,15 +415,18 @@ class Selector:
                 continue
             removed, added = diff.changed_lines(by_path[p])
             scopes = self._old_scopes(p)
+            module = _module_of(p)
             for r in classify.regions(old_tree, new_tree, removed, added, same, scopes):
                 if r.kind == "function":
                     spans.setdefault(p, []).extend(
                         r.statements if r.statements is not None else [r.span])
+                    covered.add((module, *r.chain))
                 elif r.via_def:  # metaclass / __init_subclass__ …: also runs at run time
                     s = scopes.by_chain.get(r.via_def)
                     if s is None:
                         return f"{'.'.join(r.via_def)}: no pinned def"
                     spans.setdefault(p, []).append((s.start, s.end))
+                    covered.add((module, *r.via_def))
                 # plain class / module bodies run at import: what they build differently is
                 # in the import-state diff, read at the sites below
         changed = [k.split(" ", 2) for k in found["changed"]]
@@ -444,6 +448,12 @@ class Selector:
             for kind, owner, attr in changed:
                 if kind == "C" and owner in new_classes and attr.startswith("__"):
                     continue  # a new class: reached only through the entries that name it
+                if kind == "C" and attr.startswith("__") and (
+                        owner.split(":", 1)[0], *owner.split(":", 1)[-1].split("."), attr) in covered:
+                    # a changed special method of a patched class (`super()` cell: digested
+                    # with its code): Python calls it implicitly, which runs its body, whose
+                    # touched lines are in the spans already
+                    continue
                 if kind == "C" and attr in TYPEDDICT_KEYS:
                     return f"{attr}: TypedDict key set"
                 if attr.startswith("__") and attr.endswith("__"):
@@ -462,21 +472,26 @@ class Selector:
                 same_parts = frozenset(found.get("same", {}).get(entry, ()))
                 start = len(rec)
                 for site in index.sites(attr, owner_path, chain, True):
+                    at = len(rec)
                     for bucket, got in self._site_reads(index, site, attr, same=same_parts):
                         if bucket == "tests" and got & cands:
                             return f"test code reads {attr}"
+                    if site.when != "run":
+                        # runs at import (memoized code raised Fallback above): what it builds
+                        # is itself in the diff, read at its own sites. A module first
+                        # imported during a query runs it there too, but on the patched
+                        # import it builds exactly that diff entry.
+                        del rec[at:]
                 ran: set[int] = set()
                 for path, a, b in rec[start:]:
                     ran |= real_span(path, a, b)
                 if cands - ran:
                     # a TPC test reading the value where no site line shows (key-level map,
                     # attrs map): no line to verify by
+                    # (`_state_readers` takes the key-level map alone when no site ran)
                     by_key = self._key_readers(entry, found)
                     if by_key is not None and (by_key & cands) - ran:
                         return f"{attr}: key-level reader with no site line"
-                    looked = self._attr_readers(owner, attr, info) if kind == "C" else None
-                    if looked is not None and (looked & cands) - ran:
-                        return f"{attr}: looked up with no site line"
         finally:
             del maps.span
         for path, a, b in rec:
