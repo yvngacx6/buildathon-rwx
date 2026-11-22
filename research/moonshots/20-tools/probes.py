@@ -80,7 +80,7 @@ def answers(out: Path) -> None:
             print("INCOMPLETE", log.stem)
             continue
         failing = set()
-        for m in re.finditer(r"^(FAILED|ERROR) (\S+)", text, re.M):
+        for m in re.finditer(r"^(FAILED|ERROR|SUBFAIL) (\S+)", text, re.M):
             tid = m.group(2).split("[")[0]
             if tid in by_id:
                 failing.add(by_id[tid])
