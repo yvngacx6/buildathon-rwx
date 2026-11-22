@@ -195,29 +195,46 @@ def exec_windows(expr, schema, used, cov_factory=None, swap_until=None):
 # seconds: cpu * CALIB_REF / calib. CALIB_REF is the workload's CPU on the machine the budget
 # constants were tuned on (laptop, idle); BR_SUBTEST_NOCALIB=1 stores raw seconds.
 
-CALIB_REF = 0.0  # set below from the reference measurement
+# rwx idle: cpu_exec(tpcds) / calib = 1004; rwx-big at load ~150: 966 (raw CPU 1.72x apart).
+# 11.6 ms maps that ratio onto the laptop-idle 11.4 s the budget constants were tuned with.
+CALIB_REF = 0.0116
+
+
+_CALIB_SQL = ("SELECT a.x, SUM(b.y) AS s FROM a JOIN b ON a.k = b.k AND b.z > 3 "
+              "WHERE a.x IN (SELECT c.x FROM c WHERE c.w < 10) GROUP BY a.x ORDER BY s DESC")
+_CALIB_SCHEMA = {"a": {"x": "INT", "k": "INT"}, "b": {"y": "DOUBLE", "k": "INT", "z": "INT"},
+                 "c": {"x": "INT", "w": "INT"}}
 
 
 def _calib_work() -> int:
-    acc = 0
-    d: dict = {}
-    for i in range(20000):
-        k = ("k", i % 97)
-        d[k] = d.get(k, 0) + i
-        s = f"col{i % 31}".upper()
-        acc += len(s) + (i & 7)
-        lst = [i, s, k]
-        acc += len(lst[1:])
-    return acc + len(d)
+    """A small copy of what the timed runs do: optimize a query with pinned sqlglot (the stage
+    part) and a hash join + aggregate over tuples with generated lambdas (the executor part)."""
+    from sqlglot import parse_one
+    from sqlglot.optimizer import optimize
+    e = optimize(parse_one(_CALIB_SQL), _CALIB_SCHEMA)
+    acc = len(e.sql())
+    left = [(i, i % 101, f"v{i % 13}") for i in range(3000)]
+    right = [(i % 101, float(i), i % 7) for i in range(3000)]
+    index: dict = {}
+    for r in right:
+        index.setdefault(r[0], []).append(r)
+    cond = eval("lambda l, r: r[2] > 3 and l[2] != 'v1'")  # noqa: S307
+    groups: dict = {}
+    for l in left:
+        for r in index.get(l[1], ()):
+            if cond(l, r):
+                groups[l[2]] = groups.get(l[2], 0.0) + r[1]
+    return acc + len(groups)
 
 
 def _calib() -> float:
-    best = float("inf")
+    """Median CPU of 5 runs of the calibration workload."""
+    runs = []
     for _ in range(5):
         t = time.process_time()
         _calib_work()
-        best = min(best, time.process_time() - t)
-    return best
+        runs.append(time.process_time() - t)
+    return sorted(runs)[2]
 
 
 def _norm(cpu: float, c0: float, c1: float) -> float:
@@ -382,7 +399,6 @@ def build(root: Path, out: Path) -> None:
                         return covs, d_opt, dres
 
                     def stage_timed():
-                        c0 = _calib()
                         t0 = time.process_time()
                         e4 = pickle.loads(pexpr)
                         import sqlglot.executor as E
@@ -391,7 +407,8 @@ def build(root: Path, out: Path) -> None:
                         oe.sql(pretty=True)
                         d2 = strict_digest(oe)
                         cpu_stage = time.process_time() - t0
-                        return d2, _norm(cpu_stage, c0, _calib())
+                        c1 = _calib()  # after: it must not warm caches for the run
+                        return d2, _norm(cpu_stage, c1, c1)
                     covs, d_opt, dres = _in_fork(windows)
                     d2, cpu_stage = _in_fork(stage_timed)
                     phases["win"] = covs
@@ -413,14 +430,13 @@ def build(root: Path, out: Path) -> None:
                 return cov.stop(), duck, opt
 
             def timed(q=q):
-                c0 = _calib()
                 t0 = time.process_time()
                 a = run_query(q, schemas[suite], tables[suite], False)
                 t1 = time.process_time()
                 b = run_query(q, schemas[suite], tables[suite], True) if suite == "tpch" else None
                 t2 = time.process_time()
-                c1 = _calib()
-                return a, b, _norm(t1 - t0, c0, c1), _norm(t2 - t1, c0, c1), (c0 + c1) / 2
+                c1 = _calib()  # after: it must not warm caches for the runs
+                return a, b, _norm(t1 - t0, c1, c1), _norm(t2 - t1, c1, c1), c1
 
             try:
                 phases, outs = _in_fork(traced)
@@ -800,7 +816,8 @@ class SubTest:
         self.stage_ok, self.stage_why = False, "off"
         if STAGE:
             try:
-                why = stage_guard(str(self.sel.sqlglot), jobs)
+                why = (None if os.environ.get("BR_SUBTEST_GUARD") == "0"  # experiments only
+                       else stage_guard(str(self.sel.sqlglot), jobs))
             except Exception as e:  # noqa: BLE001
                 why = type(e).__name__
             self.stage_ok = why is None

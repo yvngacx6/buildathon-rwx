@@ -178,6 +178,52 @@ class Map:
         return self._table.tests
 
 
+class AttrsMap:
+    """maps/attrs.json.gz (mapbuild/attrs_map.py), compact form: "classes" {class key: {name:
+    list id}}, "lists" (delta-encoded sorted indices into "tests", shared by every key with the
+    same tests), plus "tracked" / "untracked" / "replaced" / "failed". Loaded on first use."""
+
+    def __init__(self, path: Path, number_of: dict[str, int]) -> None:
+        self.path = path
+        self._number_of = number_of
+        self._data: dict | None = None
+        self._numbers: list[int | None] = []
+        self._lists: list[frozenset[int]] = []
+
+    def _load(self) -> dict:
+        if self._data is None:
+            data = json.loads(gzip.decompress(self.path.read_bytes()))
+            self._numbers = numbers = [self._number_of.get(t) for t in data["tests"]]
+            lists = []
+            for deltas in data["lists"]:
+                idx, at = [], 0
+                for d in deltas:
+                    at += d
+                    idx.append(at)
+                lists.append(frozenset(n for n in (numbers[i] for i in idx) if n is not None))
+            self._lists = lists
+            self._data = data
+        return self._data
+
+    def _translate(self, idx) -> frozenset[int]:
+        if self._data is None:
+            self._load()
+        return frozenset(n for n in (self._numbers[i] for i in idx) if n is not None)
+
+    def get(self, key: str) -> frozenset[int]:
+        """Tests that looked NAME up through class C or a subclass (key "C NAME")."""
+        cls, _, name = key.partition(" ")
+        lid = self._load()["classes"].get(cls, {}).get(name)
+        return self._lists[lid] if lid is not None else frozenset()
+
+    @property
+    def extra(self) -> dict:
+        return self._load()
+
+    def traced_ids(self) -> list[str]:
+        return self._load()["tests"]
+
+
 class Maps:
     """All maps for one run, plus derived lookups the selector needs."""
 
@@ -205,6 +251,10 @@ class Maps:
         self.import_time = ImportTimeMap(directory / "import_time.json.gz",
                                          compiled and compiled / "import_time")
         self.imports = open_map("imports")
+        # moon-19 attrs: class-attribute lookups per test (mapbuild/trace_attrs.py); optional
+        self.attrs = (AttrsMap(directory / "attrs.json.gz", number_of)
+                      if (directory / "attrs.json.gz").is_file() else None)
+        self.directory = directory  # moon-21: maps/keys.json.gz is loaded by select.py
         self._unvouched: frozenset[int] | None = None
         self._file_cache: dict[str, frozenset[int]] = {}
 

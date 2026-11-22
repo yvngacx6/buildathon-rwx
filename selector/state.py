@@ -69,6 +69,81 @@ def _h(*parts: object) -> str:
                   & 0xFFFFFFFFFFFFFFFF, "x")
 
 
+def kid(k: object) -> str | None:
+    """Hash-free identity of a dict key (moonshot 21, shared with mapbuild/keytrace.py):
+    keys that compare equal get equal ids for the kinds covered (str and str subclasses by
+    value, int / bool / integral float by int value, Enum members by class and name, real
+    classes by qualified name, tuples / frozensets element-wise); None for anything else."""
+    if isinstance(k, str):
+        return "s:" + str.__str__(k)
+    if isinstance(k, (bool, int)):
+        return "i:" + int.__repr__(int(k))
+    if isinstance(k, float):
+        return "i:" + int.__repr__(int(k)) if k.is_integer() else "f:" + float.__repr__(k)
+    if k is None:
+        return "n"
+    if isinstance(k, enum.Enum):
+        c = type(k)
+        return f"e:{c.__module__}.{c.__qualname__}.{k.name}"
+    if isinstance(k, type):
+        return None if "<" in k.__qualname__ else f"t:{k.__module__}.{k.__qualname__}"
+    if type(k) in (tuple, frozenset):
+        parts = [kid(x) for x in k]
+        if None in parts:
+            return None
+        if type(k) is frozenset:
+            parts.sort()
+        return ("(" if type(k) is tuple else "{") + ",".join(parts) + ")"  # type: ignore
+    return None
+
+
+KEY_SEP = "\x1f"
+ORDER = "\x00order"  # changed_keys marker: the keys kept their values but not their order
+
+
+def key_table(snap: "Snapshot", v: dict, depth: int = 0, path: str = "",
+              out: dict | None = None) -> dict[str, dict[str, str]] | None:
+    """Per nested path of an exact dict ("" = itself, else KEY_SEP-joined key ids): key id ->
+    value digest, or "D" for a nested exact dict (described at its own path). None when a
+    key has no id or two keys share one."""
+    out = {} if out is None else out
+    here: dict[str, str] = {}
+    out[path] = here
+    for k, x in v.items():
+        kk = kid(k)
+        if kk is None or kk in here:
+            return None
+        if type(x) is dict and depth < 24:
+            here[kk] = "D"
+            if key_table(snap, x, depth + 1, path + KEY_SEP + kk if path else kk, out) is None:
+                return None
+        else:
+            here[kk] = snap.fp(x)
+    return out
+
+
+def changed_keys(old: dict[str, dict[str, str]], new: dict[str, dict[str, str]]
+                 ) -> list[tuple[str, str]]:
+    """(path, key id) pairs whose lookup can give a different result: added, removed or
+    changed keys of the dicts present at the same path in both (a nested dict only on one
+    side, or replacing a value, is a change of its key in the parent)."""
+    out = []
+    for path, was in old.items():
+        now = new.get(path)
+        if now is None:
+            continue  # its parent shows the change
+        if [k for k in was if k in now] != [k for k in now if k in was]:
+            out.append((path, ORDER))  # only iteration sees order: the dict's whole readers
+        for k in was.keys() | now.keys():
+            if was.get(k) != now.get(k) or (was.get(k) == "D" and _sub(path, k) not in new):
+                out.append((path, k))
+    return sorted(set(out))
+
+
+def _sub(path: str, k: str) -> str:
+    return path + KEY_SEP + k if path else k
+
+
 class Snapshot:
     """Digest of every module global and class attribute of the imported package."""
 
@@ -412,6 +487,17 @@ def _main(argv: list[str]) -> None:
     cmd, root = argv[0], argv[1]
     if cmd == "snap":  # snap <root> <out>
         snap = take(root, {}, track=True)
+        keys = {}
+        for k in (snap.entries if argv[3:] == ["keys"] else ()):  # one sample needs them
+            try:
+                v = snap.value(k)
+            except (KeyError, ValueError):
+                continue
+            if type(v) is dict:
+                table = key_table(snap, v)
+                if table is not None:
+                    keys[k] = pickle.dumps(table, pickle.HIGHEST_PROTOCOL)
+        Path(argv[2] + ".keys").write_bytes(pickle.dumps(keys, pickle.HIGHEST_PROTOCOL))
         Path(argv[2]).write_bytes(pickle.dumps(
             {"entries": snap.entries, "info": snap.info(), "instances": snap.instance_mro(),
              "holders": snap.holders(), "proj": projections(snap, snap.entries),
@@ -427,9 +513,38 @@ def _main(argv: list[str]) -> None:
         except Exception as exc:  # noqa: BLE001 - the patched package does not import
             print(json.dumps({"import_error": _failing_file(exc, root)}))
             return
-        print(json.dumps(compare(snap, old, patched)))
+        out = compare(snap, old, patched)
+        out["keys"] = _key_changes(snap, argv[2], out["changed"])
+        print(json.dumps(out))
         return
     sys.exit("usage: state.py snap <root> <out> | diff <root> <old>")
+
+
+def _key_changes(snap: Snapshot, old_path: str, changed: list[str]) -> dict[str, list]:
+    """Per changed entry whose value is an exact dict before and after: the (path, key id)
+    pairs that differ (moonshot 21). Entries left out: no key-level answer."""
+    want = []
+    for k in changed:
+        try:
+            v = snap.value(k)
+        except (KeyError, ValueError):
+            continue
+        if type(v) is dict:
+            want.append((k, v))
+    if not want:
+        return {}
+    try:
+        tables = pickle.loads(Path(old_path + ".keys").read_bytes())
+    except (OSError, pickle.PickleError, EOFError):
+        return {}
+    out = {}
+    for k, v in want:
+        raw = tables.get(k)
+        new = key_table(snap, v) if raw is not None else None
+        if new is None:
+            continue
+        out[k] = changed_keys(pickle.loads(raw), new)
+    return out
 
 
 def _failing_file(exc: BaseException, root: str) -> str | None:
@@ -512,7 +627,7 @@ def build(root: Path, out: Path, samples: int = BUILD_SAMPLES) -> bool:
     Rare variation the samples miss is handled in `compare`."""
     runs = []
     for i in range(samples):
-        data = _snap(root, out.with_suffix(f".{i}.tmp"))
+        data = _snap(root, out.with_suffix(f".{i}.tmp"), keys=i == 0)
         if data is None:
             return False
         runs.append(data)
@@ -532,6 +647,11 @@ def build(root: Path, out: Path, samples: int = BUILD_SAMPLES) -> bool:
             holders.setdefault(k, set()).update(v)
     base["holders"] = {k: sorted(v) for k, v in holders.items()}
     out.write_bytes(pickle.dumps(base, pickle.HIGHEST_PROTOCOL))
+    keys0 = Path(str(out.with_suffix(".0.tmp")) + ".keys")
+    if keys0.is_file():
+        keys0.replace(Path(str(out) + ".keys"))
+    for i in range(1, samples):  # (written empty: only sample 0 computes key tables)
+        Path(str(out.with_suffix(f".{i}.tmp")) + ".keys").unlink(missing_ok=True)
     return True
 
 
@@ -541,8 +661,8 @@ def source_files(root: Path) -> list[tuple[str, int]]:
                   for p in (root / "sqlglot").rglob("*.py"))
 
 
-def _snap(root: Path, part: Path) -> dict | None:
-    if _run(["snap", str(root), str(part)], None) is None:
+def _snap(root: Path, part: Path, keys: bool = False) -> dict | None:
+    if _run(["snap", str(root), str(part)] + (["keys"] if keys else []), None) is None:
         return None
     data = pickle.loads(part.read_bytes())
     part.unlink()
