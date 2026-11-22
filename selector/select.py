@@ -282,9 +282,10 @@ class Selector:
             if note:
                 reasons.append(note)
             per_file = [(p, got - dropped.get(p, set())) for p, got in per_file]
-        if self._jobs and not self._mixed_py and not self._defaults:
+        if self._jobs and not self._mixed_py:
+            # r35: subtest also swaps literal defaults (default-only files); slowverify not
             for pruner in (self.subtest, self.slowverify):
-                if pruner is not None:
+                if pruner is not None and (not self._defaults or pruner is self.subtest):
                     per_file = self._subtest(per_file, reasons, pruner)
         if self.genmem is not None:
             per_file = self._genmem(per_file, reasons)

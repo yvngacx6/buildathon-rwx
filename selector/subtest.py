@@ -1282,13 +1282,24 @@ def _writes_shared(fn, self_shared: bool) -> str | None:
     return None
 
 
-def stage_guard(root: str, jobs) -> str | None:
+def stage_guard(root: str, jobs, defaults: dict | None = None) -> str | None:
     """None when every changed function (old and new version) of the jobs passes
-    _writes_shared, else the reason (→ no checkpoint shortcut for this commit)."""
+    _writes_shared, else the reason (→ no checkpoint shortcut for this commit).
+    r35: a def whose literal defaults change (`defaults`, select._default_changes: the job
+    text is then the old source) keeps its body but may take other branches: it is checked
+    as a changed function too."""
     for path, new_text, _ in jobs:
         with open(os.path.join(root, path), encoding="utf-8") as fh:
             old_text = fh.read()
         old_defs, new_defs = _defs(ast.parse(old_text)), _defs(ast.parse(new_text))
+        for name, line, _params in (defaults or {}).get(path, ()):
+            hits = [d for k, d in old_defs.items() if k[0].split(".")[-1] == name
+                    and min([d[0].lineno] + [x.lineno for x in d[0].decorator_list]) == line]
+            if len(hits) != 1:
+                return f"{name}: default-changed def not found"
+            why = _writes_shared(hits[0][1], path.startswith("sqlglot/dialects/") or "Dialect" in name)
+            if why:
+                return f"{name}: {why}"
         for k in set(old_defs) | set(new_defs):
             o, n = old_defs.get(k), new_defs.get(k)
             if o is not None and n is not None and ast.dump(o[0]) == ast.dump(n[0]):
@@ -1389,6 +1400,11 @@ class SubTest:
             out[n] = todo
         return out, cpu
 
+    def _defaults(self) -> dict:
+        """select.Selector._defaults: {path: [(def name, first line, {param: (old, new)})]}
+        of the default-only files (their jobs carry the old source)."""
+        return dict(getattr(self.sel, "_defaults", None) or {})
+
     def verify(self, jobs, todo: list, budget: float) -> bool:
         """Run the queries in a forked child with the changed code swapped in."""
         meta = self.meta()
@@ -1402,7 +1418,7 @@ class SubTest:
             code = 1
             try:
                 os.close(rfd)
-                ok = _child(root, jobs, todo, meta, self.store, budget)
+                ok = _child(root, jobs, todo, meta, self.store, budget, self._defaults())
                 with os.fdopen(wfd, "wb") as fh:
                     fh.write(b"OK" if ok else b"NO")
                 code = 0
@@ -1452,7 +1468,7 @@ class SubTest:
         if STAGE:
             try:
                 why = (None if os.environ.get("BR_SUBTEST_GUARD") == "0"  # experiments only
-                       else stage_guard(str(self.sel.sqlglot), jobs))
+                       else stage_guard(str(self.sel.sqlglot), jobs, self._defaults()))
             except Exception as e:  # noqa: BLE001
                 why = type(e).__name__
             self.stage_ok = why is None
@@ -1522,14 +1538,19 @@ def _warm_code(root: str, jobs) -> None:
         pass
 
 
-def _swap(root: str, jobs) -> str | None:
-    """Swap the changed functions' code (as diffexec/replay.py). → bail reason or None."""
+def _swap(root: str, jobs, defaults: dict | None = None) -> str | None:
+    """Swap the changed functions' code (as diffexec/replay.py). → bail reason or None.
+    r35 `defaults` ({path: [(def name, first line, {param: (old, new)})]}, default-only files
+    whose job text is the old source): the def's live function objects get the new literal
+    `__defaults__` / `__kwdefaults__` (as diffexec/replay.py), which is all the patched
+    module builds differently (select._default_changes; nothing reads `__defaults__`)."""
     import functools
     import importlib
     import types
     from diffexec import serial
     from diffexec.replay import _new_code, _old_code, _walk
     swaps = {}
+    new_defaults = {}  # (filename, qualname, first line) → {param: new default}
     for path, new_text, _ in jobs:
         filename = os.path.join(root, path)
         old_top = _old_code(filename)  # compiled in the parent before the fork (warm_files)
@@ -1547,14 +1568,35 @@ def _swap(root: str, jobs) -> str | None:
                     o is old_top or not (o.co_flags & 0x01)):
                 return "definition-time body"
             swaps[(filename, o.co_qualname, o.co_firstlineno)] = n
+        for name, line, params in (defaults or {}).get(path, ()):
+            hits = [o for o in old_codes.values() if o.co_name == name
+                    and o.co_firstlineno == line and o.co_flags & 0x01]
+            argn = hits[0].co_varnames[:hits[0].co_argcount + hits[0].co_kwonlyargcount] \
+                if len(hits) == 1 else ()
+            if len(hits) != 1 or not set(params) <= set(argn):
+                return f"default change of {name} not matched"
+            new_defaults[(filename, hits[0].co_qualname, hits[0].co_firstlineno)] = {
+                p: v[1] for p, v in params.items()}
         importlib.import_module(path[:-3].replace("/", ".").removesuffix(".__init__"))
-    if not swaps:
+    if not swaps and not new_defaults:
         return "nothing changed"
     seen = set()
+    seen_defaults = set()
     for obj in gc.get_objects():
         if type(obj) is types.FunctionType:
             c = obj.__code__
             k = (c.co_filename, c.co_qualname, c.co_firstlineno)
+            params = new_defaults.get(k)
+            if params is not None:
+                old_d, old_kw = obj.__defaults__, obj.__kwdefaults__
+                npos = c.co_argcount
+                pos_names = c.co_varnames[npos - len(old_d or ()):npos]
+                if old_d is not None:
+                    obj.__defaults__ = tuple(params.get(nm, v) for nm, v in zip(pos_names, old_d))
+                if old_kw is not None:
+                    obj.__kwdefaults__ = {kk: params.get(kk, v) for kk, v in old_kw.items()}
+                if set(params) <= set(pos_names) | set(old_kw or ()):
+                    seen_defaults.add(k)
             n = swaps.get(k)
             if n is not None:
                 obj.__code__ = n
@@ -1568,6 +1610,8 @@ def _swap(root: str, jobs) -> str | None:
     for k in swaps:
         if k not in seen and not inside(k):
             return f"no live function for {k[1]}"
+    if seen_defaults != set(new_defaults):
+        return "a default-changed function has no live function object"
     return None
 
 
@@ -1586,7 +1630,7 @@ def _warm(root: str) -> None:
     from diffexec import replay, serial  # noqa: F401
 
 
-def _child(root, jobs, todo, meta, store, budget) -> bool:
+def _child(root, jobs, todo, meta, store, budget, defaults=None) -> bool:
     import signal
     sys.setrecursionlimit(1000)  # the pool worker's default (this stack is deeper: stricter)
     # CPU cap: SIGPROF's default action ends the child (→ keep the tests)
@@ -1594,7 +1638,7 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
     signal.setitimer(signal.ITIMER_PROF, budget)
     _warm(root)
     from sqlglot.executor.table import Table
-    why = _swap(root, jobs)
+    why = _swap(root, jobs, defaults)
     if why:
         if os.environ.get("SUBTEST_DEBUG"):
             print("subtest bail:", why, file=sys.stderr)
