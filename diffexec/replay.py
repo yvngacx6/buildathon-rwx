@@ -396,7 +396,7 @@ def run_request(req: dict) -> dict:
                 exc_detail)
         return digest, side, cpu
 
-    n_blobs = n_ok = 0
+    n_blobs = n_ok = n_late = n_bytes = n_retry = 0
     for key, entry, old_code, new_code, module, subst in plan:
         info = {"state": "ok", "phases": {}}
         out["codes"][key] = info
@@ -417,32 +417,56 @@ def run_request(req: dict) -> dict:
         overtime = False
         for data, recorded, status in rec["blobs"]:
             n_blobs += 1
+            n_bytes += len(data)
             if overtime or status != "ok" or recorded is None or time.process_time() > deadline:
+                n_late += status == "ok" and recorded is not None
                 verdict.append(False)
                 continue
-            try:
-                set_mode(False)
-                with _cpu_limit(max(0.0, deadline - time.process_time()) + 0.01):
-                    d_old, side_old, cpu_old = run(live_old, module, data)
-                set_mode(True)
-                with _cpu_limit(min(max(0.0, deadline - time.process_time()), 10 * cpu_old + 0.2) + 0.01):
-                    d_new, side_new, cpu_new = run(new_code, module, data, subst)
-                d_old, d_new = d_old[:len(recorded)], d_new[:len(recorded)]
-                ok = (d_old == recorded == d_new and side_old == side_new
-                      and cpu_new <= 5 * cpu_old + 0.05)
-                if DEBUG and not ok:
-                    print(f"[diffexec] {key}: recorded==old {d_old == recorded} old==new {d_old == d_new} "
-                          f"side {side_old == side_new} cpu {cpu_old:.4f}/{cpu_new:.4f}", file=sys.stderr)
-            except BaseException as e:  # noqa: BLE001  (includes RecursionError, unpicklable output)
-                if DEBUG:
-                    print(f"[diffexec] {key}: error {type(e).__name__}: {e}", file=sys.stderr)
-                    if os.environ.get("DIFFEXEC_DEBUG_TB"):
-                        import traceback
-                        traceback.print_exc(limit=-3)
-                ok = False
-                overtime = isinstance(e, _OverTime)  # likely a loop that never ends: stop here
-            finally:
-                set_mode(False)
+            # A timing verdict (new run > 5x old, or over its 10x cap) is re-measured once with
+            # a fresh old / new pair, min of each: a page-reclaim or SMT-contention spike in one
+            # run must not flip the blob (moon-17). Digests are never re-tried.
+            cpu_olds, cpu_news = [], []
+            ok = False
+            for attempt in (0, 1):
+                timing = False
+                try:
+                    set_mode(False)
+                    with _cpu_limit(max(0.0, deadline - time.process_time()) + 0.01):
+                        d_old, side_old, cpu_old = run(live_old, module, data)
+                    cpu_olds.append(cpu_old)
+                    set_mode(True)
+                    cap = min(max(0.0, deadline - time.process_time()), 10 * min(cpu_olds) + 0.2)
+                    try:
+                        with _cpu_limit(cap + 0.01):
+                            d_new, side_new, cpu_new = run(new_code, module, data, subst)
+                    except _OverTime:
+                        if attempt == 0 and time.process_time() < deadline:
+                            n_retry += 1
+                            continue  # re-measure once
+                        raise
+                    cpu_news.append(cpu_new)
+                    d_old, d_new = d_old[:len(recorded)], d_new[:len(recorded)]
+                    same = d_old == recorded == d_new and side_old == side_new
+                    timing = min(cpu_news) <= 5 * min(cpu_olds) + 0.05
+                    ok = same and timing
+                    if DEBUG and not ok:
+                        print(f"[diffexec] {key}: recorded==old {d_old == recorded} old==new {d_old == d_new} "
+                              f"side {side_old == side_new} cpu {cpu_old:.4f}/{cpu_new:.4f}", file=sys.stderr)
+                    if same and not timing and attempt == 0:
+                        n_retry += 1
+                        continue
+                    break
+                except BaseException as e:  # noqa: BLE001  (includes RecursionError, unpicklable output)
+                    if DEBUG:
+                        print(f"[diffexec] {key}: error {type(e).__name__}: {e}", file=sys.stderr)
+                        if os.environ.get("DIFFEXEC_DEBUG_TB"):
+                            import traceback
+                            traceback.print_exc(limit=-3)
+                    ok = False
+                    overtime = isinstance(e, _OverTime)  # likely a loop that never ends: stop here
+                    break
+                finally:
+                    set_mode(False)
             n_ok += ok
             verdict.append(ok)
         for phase, idxs in rec["uses"].items():
@@ -451,7 +475,7 @@ def run_request(req: dict) -> dict:
             else:
                 v = "ok" if all(verdict[i] for i in idxs) else "bad"
             info["phases"][phase_name(phase, tests)] = v
-    out["stats"] = {"blobs": n_blobs, "ok": n_ok, "cpu_s": round(time.process_time() - t_start, 3)}
+    out["stats"] = {"blobs": n_blobs, "ok": n_ok, "late": n_late, "retry": n_retry, "bytes": n_bytes, "cpu_s": round(time.process_time() - t_start, 3)}
     return out
 
 

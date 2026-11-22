@@ -267,6 +267,7 @@ def run_child(root: str, patched: dict[str, str], everything: bool,
               budget: float) -> tuple[dict | None, float]:
     """(child's verdict or None, child CPU seconds)."""
     import subprocess
+    from .diffexec import wall_guard
     env = {"PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1",
            "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
     t0 = os.times()
@@ -274,7 +275,7 @@ def run_child(root: str, patched: dict[str, str], everything: bool,
         proc = subprocess.run([sys.executable, "-P", "-s", "-S", "-c", _RUN, root,
                                "1" if everything else "0", str(budget)],
                               input=json.dumps(patched), capture_output=True, text=True,
-                              env=env, timeout=budget * 2 + 5, cwd="/")
+                              env=env, timeout=wall_guard(budget), cwd="/")
     except (OSError, subprocess.SubprocessError):
         return None, 0.0
     finally:

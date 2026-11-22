@@ -347,7 +347,8 @@ class SlowVerify:
                 os._exit(code)
         os.close(wfd)
         import select as _select
-        deadline = time.monotonic() + budget * 2 + 2
+        from .diffexec import wall_guard
+        deadline = time.monotonic() + wall_guard(budget)
         chunks = []
         with os.fdopen(rfd, "rb") as fh:
             while True:
