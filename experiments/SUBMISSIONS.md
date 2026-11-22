@@ -23,4 +23,5 @@
 | S19 | 11-21 18:20 | b048c6a (cand-h) | + r33 R-DEF inert dynamic sites | 111.5 | private 2016.5 / 0; final_check PASS | 155.7 (150.2 sim + 5.5 CPU) | 0/40 | Same sim as S17. |
 | S20 | 11-21 18:40 | f85f123 (moon-26) | cand-i (r34) + parallel build (114 s) + moon-22 rule checkpoints + moon-25 exec generate checkpoint | 111.5 | private 2016.5 / 0; final_check PASS | 156.0 (150.2 sim + 5.8 CPU) | 0/40 | Board CPU +0.3 s vs S19 despite local −; best stays S17/S19 155.7. |
 | S21 | 11-21 19:19 | e3fffd8 (cand-j) | + r35 subtest for default-only edits (TPC) | 111.5 | practice_like 657.2 / 0; final_check PASS | **154.8** (150.244 sim + 4.6 CPU) | 0/40 | NEW BEST (CPU only). Board sim unchanged since S17: practice_like gains do not transfer. |
-| S22 | 11-21 19:50 | 49fec10 (cand-k) | + r36 own-line name sites | 111.5 | private 1993.5 / 0; final_check PASS | pending | pending | Limit now 4/hour. |
+| S22 | 11-21 19:50 | 49fec10 (cand-k) | + r36 own-line name sites | 111.5 | private 1993.5 / 0; final_check PASS | 154.9 (150.184 sim + 4.7 CPU) | 0/40 | Limit now 4/hour. |
+| S23 | 11-21 20:05 | 04a0598 (diag38-budget) | DIAGNOSTIC: drop TPC only on "estimate over budget" commits | – | practice_like 3 dropped, 2 misses | pending | pending | Not a final candidate. |
