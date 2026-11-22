@@ -1499,6 +1499,10 @@ class SubTest:
             self.stage_ok = why is None
             self.stage_why = why
         try:
+            # r37: the store is traced with every module loaded first; a touched line the
+            # test ran outside every recorded query phase (warm-up, lazy import) → keep
+            if self.unrecorded(spans, cands):
+                return set(), "subtest: keep (a touched line ran outside the recorded queries)"
             got = self.plan(spans, cands)
         except Exception as e:  # noqa: BLE001
             return set(), f"subtest: keep ({type(e).__name__})"
@@ -1813,7 +1817,24 @@ def _child(root, jobs, todo, meta, store, budget, defaults=None, patched=False) 
     sys.setrecursionlimit(1000)  # the pool worker's default (this stack is deeper: stricter)
     # CPU cap: SIGPROF's default action ends the child (→ keep the tests)
     signal.signal(signal.SIGPROF, signal.SIG_DFL)
-    signal.setitimer(signal.ITIMER_PROF, budget)
+    if patched:
+        # r37: `budget` caps the whole interpreter (start-up and imports included): each
+        # query's own cap is cut to what is left
+        _setitimer, _sigprof = signal.setitimer, signal.SIGPROF
+
+        class _Capped:
+            ITIMER_PROF = signal.ITIMER_PROF
+
+            @staticmethod
+            def setitimer(which, cap):
+                left = budget - time.process_time()
+                if left <= 0.01:
+                    os.kill(os.getpid(), _sigprof)
+                return _setitimer(which, min(cap, left))
+        signal = _Capped  # noqa: F811  (the per-query arming below goes through the cap)
+        signal.setitimer(signal.ITIMER_PROF, budget)
+    else:
+        signal.setitimer(signal.ITIMER_PROF, budget)
     _warm(root)
     from sqlglot.executor.table import Table
     why = None if patched else _swap(root, jobs, defaults)
