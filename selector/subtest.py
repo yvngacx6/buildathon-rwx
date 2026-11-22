@@ -69,6 +69,11 @@ NET_CAP_SHARE = float(os.environ.get("BR_SUBTEST_NET_CAP_SHARE", "1.0"))  # chil
 # saved) charged at 2x costs more than the drop saves. Applied after the choice: it only
 # turns a verification into a keep, never picks another subset.
 NET_MIN_GAIN_MS = float(os.environ.get("BR_SUBTEST_NET_MIN_MS", "3000"))
+# r40: the queries to re-run go cheapest (estimated CPU) first, whole re-runs inline with the
+# checkpoint-verified ones: a divergence ends the child before the dearer queries run (pl
+# h917: 98 stage queries passed in 2.9 s before a ~0 s full query failed). Order only: a
+# drop still needs every query to give the pinned outputs.
+ORDERED = os.environ.get("BR_SUBTEST_ORDER", "1") != "0"
 
 
 # ── shared: what the test does for one query ─────────────────────────────────
@@ -1584,6 +1589,8 @@ class SubTest:
                 # (raw CPU where it runs: on the scorer that is what is charged)
                 cap = min(2.5 * est + 1.0 + FALLBACK_CAP,
                           NET_CAP_SHARE * benefit_of(chosen) / 1000 if NET_SHARE < 100 else 99)
+            if ORDERED:
+                todo = sorted(todo, key=self._cpu)
             ok = self.verify(jobs, todo, cap)
         except Exception as e:  # noqa: BLE001
             return set(), f"subtest: keep ({type(e).__name__})"
@@ -1668,6 +1675,8 @@ class SubTest:
         if futile is not None and futile(chosen):
             return set(), f"tpc-patched: keep (ends ALL anyway; est {est:.2f})"
         cap = min(PATCHED_BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0)
+        if ORDERED:
+            todo = sorted(todo, key=self._cpu)
         meta = self.meta()
         sub = {"schemas": meta["schemas"], "suites": {}}
         for x in todo:
@@ -1927,13 +1936,63 @@ def _child(root, jobs, todo, meta, store, budget, defaults=None, patched=False) 
     tables: dict = {}
     import sqlglot.executor as E
     from sqlglot import parse_one as _parse_one, transpile as _transpile
+
+    def run_one(suite, i, opt, tail, zf) -> bool:
+        """One query re-run whole (or its r39 tail): the pinned outputs?"""
+        q = meta["suites"][suite][i]
+        # each query (with its table loading): at most 3x its pinned CPU + 0.8 s, else the
+        # child ends (→ keep)
+        signal.setitimer(signal.ITIMER_PROF, 3 * (q["cpu_opt"] if opt else q["cpu_exec"]) + 0.8)
+        if tail:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    got = _run_tail(q, meta["schemas"][suite], tables, zf, suite, i)
+                except Exception:  # noqa: BLE001
+                    if os.environ.get("SUBTEST_DEBUG"):
+                        import traceback
+                        traceback.print_exc(file=sys.__stderr__)
+                    return False
+            if got != q["outs"].get("exec"):
+                if os.environ.get("SUBTEST_DEBUG"):
+                    print("subtest tail diff:", suite, i, file=sys.stderr)
+                return False
+            return True
+        tabs = {}
+        if q["execute"] and not opt:
+            from sqlglot import find_tables, parse_one
+            for t in find_tables(parse_one(q["sql"])):
+                key = (suite, t.name)
+                if key not in tables:
+                    cols, rows = marshal.loads(zf.read(f"{suite}/{t.name}"))
+                    tables[key] = Table(columns=cols, rows=rows)
+                tabs[t.name] = tables[key]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                got = run_query(q, meta["schemas"][suite], tabs, opt)
+            except Exception:  # noqa: BLE001
+                return False
+        want = (q["outs"].get("exec") if not opt else None,
+                (q["outs"]["duck"] if (q["execute"] or opt) else None),
+                q["outs"].get("opt") if opt else None)
+        if got != want:
+            if os.environ.get("SUBTEST_DEBUG"):
+                print("subtest diff:", suite, i, opt, file=sys.stderr)
+            return False
+        return True
+
     full = []
     fb_cpu = 0.0  # pinned CPU of the queries re-run whole after a checkpoint diverged
     # checkpoint-verified queries first (cheap; a divergence ends the child early)
     zck = zipfile.ZipFile(store)
     for suite, i, opt, mode, parse_hit, optb_hit, duck_hit, k, gen_hit in todo:
         if mode != "stage":
-            full.append((suite, i, opt, mode == "tail"))
+            # r40: in the given order (the parent sorts the queries cheapest first, so a
+            # divergence among them ends the child before the dearer ones)
+            if ORDERED:
+                if not run_one(suite, i, opt, mode == "tail", zck):
+                    return False
+            else:
+                full.append((suite, i, opt, mode == "tail"))
             continue
         q = meta["suites"][suite][i]
         signal.setitimer(signal.ITIMER_PROF, 3 * ((q["outs"]["cpu_from"][k] if k else q["outs"]["cpu_stage"])
@@ -1983,48 +2042,9 @@ def _child(root, jobs, todo, meta, store, budget, defaults=None, patched=False) 
                     import traceback
                     traceback.print_exc(file=sys.__stderr__)
                 return False
-    tables: dict = {}
-    with zipfile.ZipFile(store) as zf:
-        for suite, i, opt, tail in full:
-            q = meta["suites"][suite][i]
-            # each query (with its table loading): at most 3x its pinned CPU + 0.8 s, else the
-            # child ends (→ keep)
-            signal.setitimer(signal.ITIMER_PROF, 3 * (q["cpu_opt"] if opt else q["cpu_exec"]) + 0.8)
-            if tail:
-                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    try:
-                        got = _run_tail(q, meta["schemas"][suite], tables, zf, suite, i)
-                    except Exception:  # noqa: BLE001
-                        if os.environ.get("SUBTEST_DEBUG"):
-                            import traceback
-                            traceback.print_exc(file=sys.__stderr__)
-                        return False
-                if got != q["outs"].get("exec"):
-                    if os.environ.get("SUBTEST_DEBUG"):
-                        print("subtest tail diff:", suite, i, file=sys.stderr)
-                    return False
-                continue
-            tabs = {}
-            if q["execute"] and not opt:
-                from sqlglot import find_tables, parse_one
-                for t in find_tables(parse_one(q["sql"])):
-                    key = (suite, t.name)
-                    if key not in tables:
-                        cols, rows = marshal.loads(zf.read(f"{suite}/{t.name}"))
-                        tables[key] = Table(columns=cols, rows=rows)
-                    tabs[t.name] = tables[key]
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                try:
-                    got = run_query(q, meta["schemas"][suite], tabs, opt)
-                except Exception:  # noqa: BLE001
-                    return False
-            want = (q["outs"].get("exec") if not opt else None,
-                    (q["outs"]["duck"] if (q["execute"] or opt) else None),
-                    q["outs"].get("opt") if opt else None)
-            if got != want:
-                if os.environ.get("SUBTEST_DEBUG"):
-                    print("subtest diff:", suite, i, opt, file=sys.stderr)
-                return False
+    for suite, i, opt, tail in full:
+        if not run_one(suite, i, opt, tail, zck):
+            return False
     return True
 
 
