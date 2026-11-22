@@ -10,7 +10,7 @@ here knows which tests any particular edit breaks.
   .py, same syntax tree (or docstrings)  nothing
   .py that does not parse after patch    import bound: tests that load the module ∪ read it
   sqlglot/ function body                 tests that ran any line of the function (lines map)
-    … slow tests (≥ SLOW_SECONDS)        only if they ran a touched statement (see below)
+    … clean statement edit               only those that ran a touched statement (see below)
     … signature / decorator              + users of the enclosing classes (classes map)
     … writes a class-level table at run  + tests that ran a line naming that table (the
       time (`self.TABLE[k] = …`, `.pop`)   change can outlive the call: `_class_state_writes`)
@@ -66,14 +66,17 @@ other module imports is not a collection error (its tests just vanish) → impor
 Then: tests no map knows about join every non-empty selection, and a selection that would
 cost nearly as much as ALL becomes ALL (same price, no risk).
 
-Slow tests in function bodies. A test that never executes the statements an edit touches
-runs exactly the code it ran before, so it cannot notice the edit. Cheap tests stay at the
-whole-function rule (they cost almost nothing, and the function span absorbs any line-level
-noise in the map). A slow test (≥ SLOW_SECONDS, from tests.json) is kept only if the lines
-map shows it ran a line of a touched statement: the whole statement for simple statements,
-the header lines for an if / for / while whose header alone changed. The statement view
-exists only for clean in-place edits (classify.touched_statements); otherwise, or when no
-test at all ran the touched statements, slow tests stay at the whole-function rule.
+Statements in function bodies (r23). A test that never executes the statements an edit
+touches runs exactly the code it ran before, so it cannot notice the edit. A test is kept
+only if the lines map (one interpreter per test, so no cache filled by an earlier test hides
+a statement) shows it ran a line of a touched statement: the whole statement for simple
+statements, the header lines for an if / for / while whose header alone changed; for a
+removed statement its old span; for an inserted one the PREVIOUS statement of its body, or
+the enclosing compound statement when it is first in a nested body. The statement view
+exists only for clean edits (classify.touched_statements) whose def keeps its code-object
+shape (`_same_code_shape`); otherwise, or when no test at all ran the touched statements,
+the whole-function rule holds. sqlglot/executor/*: only slow tests (≥ SLOW_SECONDS) get the
+statement view (its line map differs between tracer builds).
 
 test_generator_memory (6.7 s), selected through any route but ALL: its exact body runs on
 the patched package in a fresh interpreter for the dialects the patch can reach; it is
@@ -675,7 +678,7 @@ class Selector:
                 self._spans.setdefault(path, []).extend(
                     r.statements if r.statements is not None else [r.span])
                 ran = self.maps.span(path, *r.span)
-                got = self._slow_tests_off_statements(path, ran, r)
+                got = self._off_statements(path, ran, r, old_tree, new_tree)
                 if got and r.signature and defaults:
                     prunable |= got
                     self._chains.setdefault(path, []).append(r.chain)
@@ -749,7 +752,7 @@ class Selector:
                 else:
                     dropped = len(ran - got)
                     kinds.append(f"def {'.'.join(r.chain) or '<lambda>'}"
-                                 + (f" (-{dropped} slow, off touched statements)" if dropped else ""))
+                                 + (f" (-{dropped} off touched statements)" if dropped else ""))
                 if at_import:
                     kinds.append(f"(runs at import: +{len(at_import - got)}"
                                  + (", readers of changed import state)" if same_state else ")"))
@@ -793,18 +796,32 @@ class Selector:
                 o[1] == "attr" for n in attrs for o in index._occurrences(n))
         return self._no_default_readers
 
-    def _slow_tests_off_statements(self, path: str, ran_function: set[int],
-                                   r: classify.Region) -> set[int]:
-        """Drop the slow tests that ran the function but none of the touched statements."""
-        slow = ran_function & self._slow
-        if not slow or r.statements is None:
+    def _off_statements(self, path: str, ran_function: set[int], r: classify.Region,
+                        old_tree: ast.Module, new_tree: ast.Module) -> set[int]:
+        """Drop the tests that ran the function but none of the touched statements.
+
+        A test that never executes a touched statement (nor reaches an insertion point, see
+        classify.touched_statements) runs the same code as before. Every test gets this rule
+        when the def's code objects keep their shape (`_same_code_shape`: same locals,
+        cells, free variables, argument counts, flags, nested code objects); else only slow
+        tests do (the r2 rule). sqlglot/executor/*: slow tests only (its line map differs
+        between tracer builds). Code reached through pickling (serde.py, __reduce__ & co.,
+        run when expressions cross a process pool): slow tests only, so the statement view
+        never rests on how the map recorded pool traffic (moonshot 03: 3utz)."""
+        if r.statements is None:
+            return ran_function
+        everyone = (not path.startswith("sqlglot/executor/") and path not in PICKLE_FILES
+                    and not PICKLE_HOOKS.intersection(r.chain)
+                    and _same_code_shape(old_tree, new_tree, r.chain))
+        narrow = ran_function if everyone else ran_function & self._slow
+        if not narrow:
             return ran_function
         ran_statements: set[int] = set()
         for first, last in r.statements:
             ran_statements |= self.maps.span(path, first, last)
-        if not ran_statements:
+        if not ran_statements & ran_function:
             return ran_function  # no test ran them: map blind spot, keep the function rule
-        return ran_function - (slow - ran_statements)
+        return ran_function - (narrow - ran_statements)
 
     def _definition_time(self, path: str, module: str, old_tree: ast.Module,
                          new_tree: ast.Module, r: classify.Region) -> set[int]:
@@ -1819,6 +1836,49 @@ def _check_compiles(path: str, old_tree: ast.Module, new_tree: ast.Module,
         new = [s for s in new_tree.body[lead:] if classify.text_key(s, same.new) not in old]
         new_tree = ast.Module(body=new_tree.body[:lead] + new, type_ignores=new_tree.type_ignores)
     compile(new_tree, path, "exec")
+
+
+PICKLE_FILES = {"sqlglot/serde.py"}
+PICKLE_HOOKS = frozenset({"__reduce__", "__reduce_ex__", "__getstate__", "__setstate__",
+                          "__getnewargs__", "__getnewargs_ex__", "__copy__", "__deepcopy__"})
+_SHAPE = ("co_argcount", "co_posonlyargcount", "co_kwonlyargcount", "co_nlocals",
+          "co_flags", "co_varnames", "co_cellvars", "co_freevars", "co_name")
+
+
+def _code_shape(tree: ast.Module, chain: tuple[str, ...]) -> list | None:
+    """Shape of the code object of def `chain` and of every code object nested in it, from
+    compiling the one top-level statement that holds it (so class cells and closures are as
+    in the module). None if the def is not found exactly once along the chain."""
+    tops = [s for s in tree.body if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                                   ast.ClassDef)) and s.name == chain[0]]
+    if len(tops) != 1:
+        return None
+    try:
+        code = compile(ast.Module(body=tops, type_ignores=[]), "<shape>", "exec")
+    except (SyntaxError, ValueError, TypeError):
+        return None
+    for name in chain:
+        found = [c for c in code.co_consts if isinstance(c, type(code)) and c.co_name == name]
+        if len(found) != 1:
+            return None
+        code = found[0]
+    out, todo = [], [code]
+    while todo:
+        c = todo.pop()
+        out.append(tuple(getattr(c, k) for k in _SHAPE))
+        todo.extend(x for x in c.co_consts if isinstance(x, type(c)))
+    return out
+
+
+def _same_code_shape(old_tree: ast.Module, new_tree: ast.Module,
+                     chain: tuple[str, ...]) -> bool:
+    """The edited def binds the same names in the same scopes and keeps its kind (generator,
+    coroutine, …), in itself and in every nested code object: then the edit changes only
+    what its touched statements do."""
+    if not chain:
+        return False
+    old = _code_shape(old_tree, chain)
+    return old is not None and old == _code_shape(new_tree, chain)
 
 
 def _same_lead(old_tree: ast.Module, new_tree: ast.Module, lead: int,

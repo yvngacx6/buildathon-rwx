@@ -377,10 +377,14 @@ def touched_statements(region: Region, old: Scopes, new: Scopes,
     Walks the old and new def bodies in parallel. Equal statements are skipped. A touched
     simple statement gives its full span; a touched compound statement (if / for / while /
     with) whose header alone changed gives its header span (the lines up to its first body
-    statement), else the walk goes into its bodies. None (no statement view) when:
+    statement), else the walk goes into its bodies. Statements removed: their spans (only a
+    test that ran one reaches the place it held). Statements inserted: the span of the
+    PREVIOUS statement in the same body (a test reaches the insertion point only after it
+    ran that statement), or, first in a nested body, the whole enclosing compound statement
+    (its header ran) - never the next statement. None (no statement view) when:
       * the region is not exactly one def body (lambda, signature, metaclass method,
         a name defined twice);
-      * statements were added, removed, split or merged (a body changed length);
+      * a statement was inserted first in the def body (only the whole def reaches it);
       * a nested def / class header changed (it runs whenever the outer body reaches it);
       * a touched statement binds different names, has a global / nonlocal, or adds or
         removes a yield (each of these changes code outside the touched statement);
@@ -411,10 +415,11 @@ def _header(node: ast.stmt) -> list[str]:
 
 
 def _diff_bodies(old: list[ast.stmt], new: list[ast.stmt], spans: list[tuple[int, int]],
-                 same: SameAst) -> bool:
-    """Append the spans of touched statements; False when the edit is not in place."""
+                 same: SameAst, parent: ast.stmt | None = None) -> bool:
+    """Append the spans of touched statements; False when the edit is not in place.
+    `parent`: the compound statement that owns these bodies (None: the def body itself)."""
     if len(old) != len(new):
-        return False
+        return _realigned(old, new, spans, same, parent)
     for a, b in zip(old, new):
         if same(a, b):
             continue
@@ -422,6 +427,8 @@ def _diff_bodies(old: list[ast.stmt], new: list[ast.stmt], spans: list[tuple[int
             return False
         lists = [k for k in _STMT_LISTS if isinstance(getattr(a, k, None), list)]
         if type(a) is not type(b) or not lists:
+            if not _has_code(a):
+                return False  # no line event: the map cannot show who reached it
             spans.append((a.lineno, a.end_lineno))  # a simple statement, or one replaced
             continue
         if _header(a) != _header(b):
@@ -434,8 +441,62 @@ def _diff_bodies(old: list[ast.stmt], new: list[ast.stmt], spans: list[tuple[int
             first_body = min(getattr(a, k)[0].lineno for k in lists if getattr(a, k))
             spans.append((a.lineno, max(a.lineno, first_body - 1)))
         for k in lists:
-            if not _diff_bodies(getattr(a, k), getattr(b, k), spans, same):
+            if not _diff_bodies(getattr(a, k), getattr(b, k), spans, same, a):
                 return False
+    return True
+
+
+_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _has_code(stmt: ast.stmt) -> bool:
+    """Does the statement compile to code that reports a line event when it runs?"""
+    return not (isinstance(stmt, (ast.Pass, ast.Global, ast.Nonlocal))
+                or (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)))
+
+
+def _realigned(old: list[ast.stmt], new: list[ast.stmt], spans: list[tuple[int, int]],
+               same: SameAst, parent: ast.stmt | None) -> bool:
+    """A body whose length changed: align old and new statements (equal syntax trees), then
+      * a removed (or replaced) run old[i:j] → the spans of old[i:j]: the new code sits
+        where old[i] stood, and only a test that ran old[i] got there;
+      * a pure insertion before old[i] → the span of old[i-1] (a test reaches the insertion
+        point only after running it), or, at i == 0, the whole enclosing compound statement
+        (its header ran); at i == 0 of the def body itself: no statement view.
+    Equal-length replaced pairs are diffed as usual. An inserted statement must not bind
+    names other than the ones the old body binds at the same depth, and must not hold a
+    global / nonlocal / yield (the code-object check in select.py backs this up)."""
+    import difflib
+    keys_a = [ast.dump(x) for x in old]
+    keys_b = [ast.dump(x) for x in new]
+    old_names = {name for x in old for name in _bindings(x)}
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, keys_a, keys_b,
+                                                       autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        for b in new[j1:j2]:
+            if (isinstance(b, _DEFS) or _yields(b) or any(isinstance(x, (ast.Global, ast.Nonlocal)) for x in ast.walk(b))
+                    or not set(_bindings(b)) <= old_names):
+                return False
+        if tag == "replace" and i2 - i1 == j2 - j1:
+            if not _diff_bodies(old[i1:i2], new[j1:j2], spans, same, parent):
+                return False
+            continue
+        if i2 > i1:  # removed / replaced run
+            for a in old[i1:i2]:
+                if not _has_code(a) or isinstance(a, _DEFS) or _yields(a) or any(isinstance(x, (ast.Global, ast.Nonlocal))
+                                     for x in ast.walk(a)):
+                    return False
+                spans.append((a.lineno, a.end_lineno))
+        elif any(_has_code(x) for x in old[:i1]):  # pure insertion after old[i1 - 1]
+            # the last earlier statement that has code (a docstring, now `pass`, a bare
+            # constant or `pass` emit no line event: no test would show as having run it)
+            prev = next(x for x in reversed(old[:i1]) if _has_code(x))
+            spans.append((prev.lineno, prev.end_lineno))
+        elif parent is not None:  # first in a nested body: the enclosing statement
+            spans.append((parent.lineno, parent.end_lineno))
+        else:
+            return False
     return True
 
 
