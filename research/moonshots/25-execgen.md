@@ -36,8 +36,10 @@ practice-style commits, 0 misses.**
   - P-style and practice_like: 0.
   - Over P+Q: −36 s / 1600 ≈ **−0.9 s per 40**.
 - **Ground truth:** the real `test_execute_tpcds` / `test_execute_tpch` / `test_optimized_tpch`
-  on patched sqlglot, for every new drop (2 in Q plus 7 in G; e74m = g005 is the same patch) and
-  for the controls. Results are in the table under "Ground truth".
+  on patched sqlglot.
+  - **9/9 new drops pass.** That is 2 in Q plus 7 in G; e74m = g005 is the same patch.
+  - **7/7 gen-mismatch keeps really fail tpcds.**
+  - 2 adversarial controls (state only, sort direction) are kept conservatively.
 - **Code:** branch `moon-25`, `selector/subtest.py` (+~300 lines; `BR_SUBTEST_GEN=0` turns it off).
   - Store: 5.7 → 6.8 MB. It is built in the image, not in the repo.
   - Subtest build: 1 m 39 s wall on EC2 under load, including the gen record and self-check forks.
@@ -144,15 +146,22 @@ Run with `truth25.sh`: apply the patch with the selector's patcher, then run the
   - G g004, g038, g056: `is` → `==` in Generator.binary.
   - G g043: `len(values) == 1` → `== 0`, in `_rename`.
   - G g047, g058: the `escape_backslash` / `ch != "\\"` branch in Generator's string escaping.
-- Controls that must be kept, and were kept:
-  - a25o: sort direction swapped in `_ordered_py`. Kept after a gen mismatch.
-  - a25s: `_next_name()` advanced inside `_rename`. Same strings, state differs. Kept.
-  - dy76 / gci2: `_rename` arity. Gen mismatch, kept.
-  - G g003 / g016 / g033 / g039 / g045: gen mismatch, kept. Their truth is in the table.
+- Controls:
+  - a25o: sort direction swapped in `_ordered_py`.
+  - a25s: `_next_name()` advanced inside `_rename`; same strings, different state.
+  - dy76 / gci2: `_rename` arity.
+  - G g003 / g016 / g033 / g039 / g045: gen mismatch, kept.
 
 | commit | selector (mode 1) | real tests |
 |---|---|---|
-| TRUTH_TABLE |  |  |
+| Q 6b24, Q e74m, G g004, g005 (= e74m), g038, g043, g047, g056, g058 | **dropped** (tpcds, ±opt-tpch) | **all PASS** (3 passed, 79 subtests) — 9/9 |
+| P dy76, P gci2, G g003, g016, g033, g039, g045 | kept (gen replay differs) | **all FAIL** tpcds (ExecuteError / TypeError) — 7/7 correctly kept |
+| a25o (sort direction swapped) | kept (outputs differ in 47 queries) | passes (the test does not see row order there): conservative keep |
+| a25s (`_next_name()` side effect only) | kept (`dbg25.py`: outputs equal in all 55 queries, generator state differs in 46) | passes: conservative keep; shows the state check fires |
+
+Every new drop in P, Q and G is in this table: 9 commits, 8 distinct patches. There are no others.
+I could not reach ≥10 distinct ones. G already enumerates every one-token site on inside-only
+lines (80 sites), so a larger sample does not exist without leaving the bucket.
 
 ## Costs the A/B does not show
 
