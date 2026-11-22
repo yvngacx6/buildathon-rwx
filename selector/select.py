@@ -676,6 +676,7 @@ class Selector:
                     if new_text and any(r.kind == "function" and r.signature for r in found)
                     and self._defaults_unread() else None)
         for r in found:
+            quiet = False  # R-DEF: the edited defaults cannot be observed at import
             if r.kind == "function":
                 self._spans.setdefault(path, []).extend(
                     r.statements if r.statements is not None else [r.span])
@@ -697,8 +698,13 @@ class Selector:
                     # narrower: the tests that ran such a call site (R-DEF, report 16)
                     seen = self._default_observers(path, old_tree, new_tree, r, defaults)
                     if seen is not None:
+                        prunable -= got - seen  # (added above, before the narrowing)
                         got &= seen
-                        kinds.append(f"(default: {len(got)} via default-observing calls)")
+                        # no default-observing call runs at import: every import-time run
+                        # of the def passed the parameters, so it built what it built before
+                        quiet = not self._observed_at_import
+                        kinds.append(f"(default: {len(got)} via default-observing calls"
+                                     + (", none at import)" if quiet else ")"))
                 elif r.signature:
                     got |= self._class_users(module, r.classes)
                     fixed |= got
@@ -738,8 +744,10 @@ class Selector:
                 own = (None if r.signature or r.is_lambda or not r.chain or not plain
                        else f"M {module} {r.chain[0]}" if len(r.chain) == 1
                        else f"C {module}:{'.'.join(r.chain[:-1])} {r.chain[-1]}")
-                at_import, same_state = self._function_at_import(path, first + r.is_lambda, last,
-                                                                 chosen | got, slack, own)
+                at_import, same_state = (
+                    (set(), True) if quiet else
+                    self._function_at_import(path, first + r.is_lambda, last, chosen | got,
+                                             slack, own))
                 if not got and same_state in ("readers", "readers-unseen"):
                     # Never ran under a test; what its runs at import built differently is
                     # read only by the tests in at_import.
@@ -821,12 +829,14 @@ class Selector:
         """The tests that ran a call of `name` that can leave a `slots` parameter unpassed
         (see `_default_observers`), or None when the name can be reached otherwise."""
         index = self._index()
+        self._observed_at_import = True
         if index is None:
             return None
         if any(alias != name for _, alias in index.data["imports"].get(name, ())):
             return None
         module = _module_of(path)
         out: set[int] = set()
+        at_import = False  # a default-observing call site runs while some module is imported
         for site, allowed, names_only, on_module in index.data["dynamic"]:
             if names_only:
                 continue  # dir(): names, not values
@@ -839,6 +849,7 @@ class Selector:
                 return None  # dispatch that can name this def (`*_sql` tables), or at import
             # an any-name getattr run inside a def: whatever it calls, it calls there
             out |= self.maps.span(site.path, *site.lines)
+            at_import |= bool(self.maps.import_time.modules(site.path, *site.lines))
         for src in sorted({o[0] for o in index._occurrences(name)}):
             if any(o[1] == "str" for o in index._occurrences(name) if o[0] == src):
                 return None
@@ -854,6 +865,8 @@ class Selector:
                 return None
             for first, last in got:
                 out |= self.maps.span(src, first, last)
+                at_import |= bool(self.maps.import_time.modules(src, first, last))
+        self._observed_at_import = at_import
         return out
 
     def _constant_defaults(self, path: str, old_tree: ast.Module,
