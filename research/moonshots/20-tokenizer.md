@@ -10,7 +10,7 @@
 - **The residual on tokenizer commits has two parts:**
   1. **Real readers, ~70 %.** These tests ran that dialect's escape / comment code:
      `tokenizer_core.py:1240` (`numeric_escapes.get(peek)`), `:1324→1388` (`drop_unknown_escapes`)
-     and `:908`. Examples: 4d63 15 tests, 6.1 s; p3ow 13 tests, 4.1 s; gozk 27 tests, 5.1 s. They
+     and `:908`. Examples: 4d63 11 tests, 4.1 s + 2 s floor (all from `:1240`, diag on 0b54a3d); p3ow 13 tests, 4.1 s; gozk 27 tests, 5.1 s. They
      did read the changed value. Only value-level evidence could drop them: which dict key was
      looked up, or whether the tokens changed. Static flow cannot, so **4d63 cannot reach 0 by flow
      refinement.**
@@ -57,12 +57,12 @@
 - **No commit got more expensive in any set.** All deltas are ≤ 0.
 - **PQ noise.** The baseline PQ runs overlapped a heavier box load, so some diffexec replays timed out
   there and not in the new run (e.g. Q rhgj: "diffexec: no answer" → "dropped 58"). The
-  "excl. diffexec noise" figure drops every commit whose reason mentions diffexec / subtest.
+  "excl. diffexec noise" figure drops every commit whose reason mentions diffexec / subtest, so it is a lower bound on the R20 gain (it also drops R20 wins on those commits).
 - **Expected board gain is small: ≈ −1 to −1.5 s per 40 practice-style commits.**
   - Each narrowed site removes a 0.7–1.3 s floor from every name / state-diff commit whose
     attribute name it used to match.
   - Tokenizer-specific wins: 48vt −2.1, w7sj −1.8, p3ow −0.7, probe t04 −2.1.
-  - 4d63 stays at 6.1 s. Its 15 tests all ran `numeric_escapes.get(peek)` under Snowflake (next section).
+  - 4d63 stays at 6.1 s. Before and after, its 11 selected tests all come from `:1240`: they ran `numeric_escapes.get(peek)` under Snowflake (next section).
 
 
 ## Probes (full suite, SKIP_INTEGRATION=0, --continue-on-collection-errors)
