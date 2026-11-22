@@ -54,6 +54,8 @@ BUDGET_S = float(os.environ.get("BR_SUBTEST_S", "12"))
 STAGE = os.environ.get("BR_SUBTEST_STAGE", "1") != "0"  # moon-05 checkpoint verification
 FALLBACK = os.environ.get("BR_SUBTEST_FALLBACK", "0") != "0"  # checkpoint differs → whole query
 FALLBACK_CAP = float(os.environ.get("BR_SUBTEST_FALLBACK_CAP", "1.5"))  # laptop s
+RULES_ON = os.environ.get("BR_SUBTEST_RULES", "1") != "0"  # moon-22 per-rule checkpoints
+RULES_BUILD = os.environ.get("BR_SUBTEST_RULES_BUILD", "1") != "0"
 SHARE = 0.6  # spend at most this share of what dropping saves
 
 
@@ -241,6 +243,248 @@ def _norm(cpu: float, c0: float, c1: float) -> float:
     if os.environ.get("BR_SUBTEST_NOCALIB") == "1" or not CALIB_REF:
         return cpu
     return cpu * CALIB_REF / max(1e-6, (c0 + c1) / 2)
+# ── moon-22: per-optimizer-rule checkpoints inside the optb window ───────────
+#
+# optimize() = glue (ensure_schema, maybe_parse(copy=True), the rule loop) + RULES[0..13];
+# execute() then calls .sql(pretty=True) (step 14). Boundary k = the tree rule k receives
+# (k = 1..14; 14 = the tree .sql() receives). A touched line's "first step" is the lowest step
+# whose window runs it (glue = -1). If every touched optb line first runs in step >= k, rules
+# 0..k-1 run untouched code on the same input as at build → the real test's tree at boundary
+# k is the stored one (checked seed-invariant, see seed_digests). Then
+#   optimize(ck_k, fresh schema, rules=RULES[k:], copy=False) + .sql(pretty=True)
+# under the new code must give the pinned optimized digest d_opt (as moon-05's optb check).
+# Usable boundaries are proven at build: the pinned code from the unpickled checkpoint with a
+# fresh schema reproduces d_opt (covers serde round-trip loss and schema cache state).
+
+NSTEPS = 15  # 14 rules + the debug .sql()
+
+
+def rule_steps(expr, schema_, cov_factory=None, keep=False, timer=False):
+    """optimize(expr, schema_, leave_tables_isolated=True, dialect=None) mirrored step by step
+    (same objects, same kwargs glue), then .sql(pretty=True).
+    → (covs {step: cov}, boundary pickles {k: bytes} | None, boundary digests {k: str},
+       final digest, cpu {step: s})"""
+    import inspect
+    import sqlglot.optimizer.optimizer as O
+    covs, cks, digs, cpu = {}, ({} if keep else None), {}, {}
+
+    def step(idx, fn):
+        cov = cov_factory() if cov_factory else None
+        t0 = time.process_time()
+        if cov:
+            cov.start()
+        try:
+            return fn()
+        finally:
+            if cov:
+                covs[idx] = cov.stop()
+            cpu[idx] = time.process_time() - t0
+
+    def glue():
+        sch = O.ensure_schema(schema_, dialect=None)
+        kw = {"db": None, "catalog": None, "schema": sch, "dialect": None, "sql": None,
+              "isolate_tables": True, "quote_identifiers": False, "leave_tables_isolated": True}
+        return O.exp.maybe_parse(expr, dialect=None, copy=True), kw
+
+    opt, kw = step(-1, glue)
+    for k, rule in enumerate(O.RULES):
+        if k:
+            digs[k] = strict_digest(opt)
+            if keep:
+                cks[k] = ck_dumps(opt)
+        params = inspect.getfullargspec(rule).args
+        rkw = {p: kw[p] for p in params if p in kw}
+        opt = step(k, lambda: rule(opt, **rkw))
+    digs[NSTEPS - 1] = strict_digest(opt)
+    if keep:
+        cks[NSTEPS - 1] = ck_dumps(opt)
+    step(NSTEPS - 1, lambda: opt.sql(pretty=True))
+    return covs, cks, digs, strict_digest(opt), cpu
+
+
+_SLOTS: dict = {}
+
+
+def ck_dumps(tree) -> bytes:
+    """Lossless pickle of an expression tree: every slot / __dict__ attribute of every node as
+    is (args with None values, parent links, _type, _meta, _hash, sharing), bypassing Expr's
+    serde-based __reduce__ (which drops None-valued args). Loading runs no sqlglot code."""
+    import copyreg
+    from sqlglot.expressions import Expr
+
+    class P(pickle.Pickler):
+        def reducer_override(self, obj):
+            if not isinstance(obj, Expr):
+                return NotImplemented
+            cls = type(obj)
+            slots = _SLOTS.get(cls)
+            if slots is None:
+                slots = _SLOTS[cls] = tuple(dict.fromkeys(
+                    n for c in cls.__mro__ for n in c.__dict__.get("__slots__", ())
+                    if n not in ("__dict__", "__weakref__")))
+            st = {n: getattr(obj, n) for n in slots if hasattr(obj, n)}
+            # copyreg.__newobj__ → NEWOBJ (cls.__new__(cls)): no reference to this module
+            return copyreg.__newobj__, (cls,), (getattr(obj, "__dict__", None) or None, st)
+
+    buf = io.BytesIO()
+    P(buf, protocol=pickle.HIGHEST_PROTOCOL).dump(tree)
+    return buf.getvalue()
+
+
+def from_checkpoint(ck: bytes, schema_dict: dict, k: int):
+    """What the run-time child does for boundary k: → optimized tree (after .sql())."""
+    import sqlglot.executor as E
+    import sqlglot.optimizer.optimizer as O
+    e = pickle.loads(ck)
+    sch = E.ensure_schema(schema_dict, dialect=None)
+    oe = E.optimize(e, sch, leave_tables_isolated=True, dialect=None, rules=O.RULES[k:], copy=False)
+    oe.sql(pretty=True)
+    return oe
+
+
+def seed_digests(root: Path) -> dict:
+    """Boundary digests of every executed TPC query under this process's hash seed."""
+    sys.path.insert(0, str(root))
+    sys.setrecursionlimit(1000)
+    from tests.helpers import TPCDS_SCHEMA, TPCH_SCHEMA, load_sql_fixture_pairs
+    from sqlglot import parse_one
+    import sqlglot.executor as E
+    schemas = {"tpch": TPCH_SCHEMA, "tpcds": TPCDS_SCHEMA}
+    out = {}
+    for suite in SUITES:
+        fixture = SUITES[suite] + ("tpc-h.sql" if suite == "tpch" else "tpc-ds.sql")
+        for i, (qmeta, sql, _) in enumerate(load_sql_fixture_pairs(fixture)):
+            if not qmeta.get("execute"):
+                continue
+            try:
+                e = pickle.loads(pickle.dumps(parse_one(sql)))
+                sch = E.ensure_schema(schemas[suite], dialect=None)
+                _, _, digs, dfin, _ = rule_steps(e, sch)
+                out[(suite, i)] = (digs, dfin)
+            except Exception:  # noqa: BLE001
+                out[(suite, i)] = None
+    return out
+
+
+def _seed_runs(root: Path) -> dict:
+    """{(suite, i): [boundary digests per seed]} for seeds 0 (this build), 1, 2 — each in its
+    own interpreter (the hash seed is fixed at start-up)."""
+    import subprocess
+    import tempfile
+    runs = {}
+    for seed in ("1", "2"):
+        with tempfile.NamedTemporaryFile(suffix=".pkl") as tf:
+            env = dict(os.environ, PYTHONHASHSEED=seed)
+            subprocess.run([sys.executable, "-m", "selector.subtest", "seeddig", str(root), tf.name],
+                           cwd=str(REPO), env=env, check=True)
+            with open(tf.name, "rb") as fh:
+                got = pickle.load(fh)
+        for key, v in got.items():
+            runs.setdefault(key, []).append(v)
+    return runs
+
+
+def _build_rules(outs, optb_cov, pexpr, schema_dict, prefix, seed_runs) -> None:
+    """Per-step coverage (first step per line), boundary checkpoints, which are usable, and
+    the CPU to verify from each. Runs inside the query's traced fork."""
+    import sqlglot.executor as E
+
+    def traced_steps():
+        e = pickle.loads(pexpr)
+        sch = E.ensure_schema(schema_dict, dialect=None)
+        covs, cks, digs, dfin, _ = rule_steps(e, sch, lambda: _Cov(prefix), keep=True)
+        cov = _Cov(prefix)
+        cov.start()
+        for ck in cks.values():
+            pickle.loads(ck)
+        ckload = cov.stop()
+        return covs, cks, digs, dfin, ckload
+
+    covs, cks, digs, dfin, ckload = _in_fork(traced_steps)
+    if dfin != outs["d_opt"]:
+        raise RuntimeError("rule mirror differs from optimize()")
+    # lines execute()'s optb window runs that no mirrored step runs: optimize()'s own glue
+    seen: dict[str, set[int]] = {}
+    for c in covs.values():
+        for f, ls in c.items():
+            seen.setdefault(f, set()).update(ls)
+    glue = dict(covs[-1])
+    for f, ls in optb_cov.items():
+        extra = set(ls) - seen.get(f, set())
+        if extra:
+            glue[f] = sorted(set(glue.get(f, ())) | extra)
+    covs[-1] = glue
+    # the checkpoint loads run serde under the new code: treat as glue
+    for f, ls in ckload.items():
+        covs[-1][f] = sorted(set(covs[-1].get(f, ())) | set(ls))
+    outs["fs"] = _first_steps(covs)
+
+    def timed_steps():
+        e = pickle.loads(pexpr)
+        sch = E.ensure_schema(schema_dict, dialect=None)
+        return rule_steps(e, sch)[2:]
+
+    digs2, dfin2, cpu = _in_fork(timed_steps)
+    if digs2 != digs or dfin2 != dfin:
+        raise RuntimeError("rule steps not reproducible")
+    ok, cpu_from = [], {}
+    for k in range(1, NSTEPS):
+        # the same tree at boundary k under other hash seeds (the real test's seed is random)
+        if not seed_runs or len(seed_runs) != 2 or any(
+                r is None or r[0].get(k) != digs[k] or r[1] != dfin for r in seed_runs):
+            continue
+
+        def check(k=k):
+            t0 = time.process_time()
+            oe = from_checkpoint(cks[k], schema_dict, k)
+            t1 = time.process_time()
+            return strict_digest(oe), t1 - t0
+
+        try:
+            d, c = _in_fork(check)
+        except RuntimeError:
+            continue
+        if d == dfin:
+            ok.append(k)
+            cpu_from[k] = c
+    if cpu_from:
+        # one calibration per query (in its own fork, after the timed runs), as stage_timed
+        c1 = _in_fork(_calib)
+        cpu_from = {k: _norm(c, c1, c1) for k, c in cpu_from.items()}
+    outs["ck_ok"] = ok
+    outs["cpu_from"] = cpu_from
+    outs["cpu_steps"] = cpu
+    outs["_cks"] = {k: cks[k] for k in ok}
+
+
+def _first_steps(covs: dict) -> dict:
+    """{file: (sorted lines tuple, first-step tuple)} from {step: {file: lines}}."""
+    first: dict[str, dict[int, int]] = {}
+    for idx in sorted(covs, reverse=True):
+        for f, ls in covs[idx].items():
+            d = first.setdefault(f, {})
+            for ln in ls:
+                d[ln] = idx
+    return {f: (tuple(sorted(d)), bytes(i + 1 for _, i in sorted(d.items())))
+            for f, d in first.items()}
+
+
+def _min_step(fs: dict, spans: dict):
+    """Lowest first step over the touched lines (None: no touched optb line)."""
+    import bisect
+    best = None
+    for path, ss in spans.items():
+        got = fs.get(path)
+        if not got:
+            continue
+        lines, idx = got
+        for first, last in ss:
+            j = bisect.bisect_left(lines, first)
+            while j < len(lines) and lines[j] <= last:
+                v = idx[j] - 1
+                best = v if best is None else min(best, v)
+                j += 1
+    return best
 
 
 # ── build ─────────────────────────────────────────────────────────────────────
@@ -358,6 +602,8 @@ def build(root: Path, out: Path) -> None:
         return cov.stop()
 
     meta["global"] = _in_fork(global_phase)
+    ckdata: dict[str, bytes] = {}
+    seeds = _seed_runs(root) if RULES_BUILD else {}
     tables = {s: make_tables(s) for s in SUITES}
     for suite in SUITES:
         queries = []
@@ -414,6 +660,13 @@ def build(root: Path, out: Path) -> None:
                     phases["win"] = covs
                     outs["d_opt"] = d_opt if (dres == outs["exec"] and d2 == d_opt) else None
                     outs["cpu_stage"] = cpu_stage
+                    if RULES_BUILD and outs["d_opt"]:
+                        try:
+                            _build_rules(outs, covs["optb"], pexpr, schemas[suite], prefix,
+                                         seeds.get((suite, len(queries))))
+                        except RuntimeError:
+                            for k in ("fs", "ck_ok", "cpu_from", "_cks"):
+                                outs.pop(k, None)
                 cov = _Cov(prefix)
                 cov.start()
                 outs["duck"] = transpile(q["sql"], write="duckdb")[0]
@@ -440,6 +693,8 @@ def build(root: Path, out: Path) -> None:
 
             try:
                 phases, outs = _in_fork(traced)
+                for k, data in outs.pop("_cks", {}).items():
+                    ckdata[f"ck/{suite}/{len(queries)}/{k}"] = data
                 if suite == "tpch":
                     phases["opt"], duck, outs["opt"] = _in_fork(traced_opt)
                     if duck != outs["duck"]:
@@ -462,6 +717,8 @@ def build(root: Path, out: Path) -> None:
     tmp = out.with_suffix(".tmp")
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("meta.pkl", pickle.dumps(meta))
+        for name, data in ckdata.items():
+            zf.writestr(name, data)
         for suite in SUITES:
             for name, (cols, rows) in raw[suite].items():
                 zf.writestr(f"{suite}/{name}", marshal.dumps((tuple(cols), rows)))
@@ -736,7 +993,7 @@ class SubTest:
                 if hit:
                     if not q["stable"]:
                         return None
-                    x = (suite, i, kind == "optimized", "full", False, False, False)
+                    x = (suite, i, kind == "optimized", "full", False, False, False, 0)
                     win = ph.get("win")
                     if (STAGE and getattr(self, "stage_ok", False) and kind == "execute"
                             and q["execute"] and win and q["outs"].get("d_opt")):
@@ -747,8 +1004,17 @@ class SubTest:
                         glue = {f: sorted(set(ls) - wl.get(f, set())) for f, ls in ph["exec"].items()}
                         later = any(_hit(win[w], spans) for w in ("prep", "plan", "post"))
                         if not later and not _hit(glue, spans):
+                            optb_hit = _hit(win["optb"], spans)
+                            k = 0
+                            fs = q["outs"].get("fs")
+                            if RULES_ON and optb_hit and fs and q["outs"].get("ck_ok"):
+                                # moon-22: start at the last usable boundary before the first
+                                # step that runs a touched line
+                                first = _min_step(fs, spans)
+                                if first is not None and first > 0:
+                                    k = max((b for b in q["outs"]["ck_ok"] if b <= first), default=0)
                             x = (suite, i, False, "stage", _hit(ph["parse"], spans),
-                                 _hit(win["optb"], spans), _hit(ph["duck"], spans))
+                                 optb_hit, _hit(ph["duck"], spans), k)
                     todo.append(x)
                     cpu += self._cpu(x)
             out[n] = todo
@@ -860,14 +1126,17 @@ class SubTest:
             return set(), f"subtest: keep ({type(e).__name__})"
         if not ok:
             return set(), f"subtest: keep (verification of {len(todo)} queries failed, {self.last_child:.2f}s, est {est:.2f}, cap {cap:.2f})"
+        nr = sum(1 for x in todo if x[3] == "stage" and x[5] and x[7])
         return chosen, (f"subtest: {sorted(chosen)} dropped ({len(todo)} queries re-run,"
-                        f" {self.last_child:.2f}s, est {est:.2f}, cap {cap:.2f})")
+                        f" {self.last_child:.2f}s, est {est:.2f}, cap {cap:.2f}) [rule checkpoints {nr}]")
 
     def _cpu(self, x):
-        suite, i, opt, mode, parse_hit, optb_hit, duck_hit = x
+        suite, i, opt, mode, parse_hit, optb_hit, duck_hit, k = x
         q = self.meta()["suites"][suite][i]
         if mode == "stage":
             # parse / duck transpile: a few ms; optb from the checkpoint: its pinned CPU
+            if optb_hit and k:
+                return 0.02 + q["outs"]["cpu_from"][k]
             return 0.02 + (q["outs"]["cpu_stage"] if optb_hit else 0.0)
         return q["cpu_opt"] if opt else q["cpu_exec"]
 
@@ -966,12 +1235,13 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
     full = []
     fb_cpu = 0.0  # pinned CPU of the queries re-run whole after a checkpoint diverged
     # checkpoint-verified queries first (cheap; a divergence ends the child early)
-    for suite, i, opt, mode, parse_hit, optb_hit, duck_hit in todo:
+    zck = zipfile.ZipFile(store)
+    for suite, i, opt, mode, parse_hit, optb_hit, duck_hit, k in todo:
         if mode != "stage":
             full.append((suite, i, opt))
             continue
         q = meta["suites"][suite][i]
-        signal.setitimer(signal.ITIMER_PROF, 3 * q["outs"]["cpu_stage"] + 0.8)
+        signal.setitimer(signal.ITIMER_PROF, 3 * (q["outs"]["cpu_from"][k] if k else q["outs"]["cpu_stage"]) + 0.8)
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             try:
                 if duck_hit and _transpile(q["sql"], write="duckdb")[0] != q["outs"]["duck"]:
@@ -983,7 +1253,17 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
                         if not FALLBACK and fb_cpu > FALLBACK_CAP: return False
                         full.append((suite, i, opt))  # parse differs: run the whole query
                         continue
-                if optb_hit:
+                if optb_hit and k:
+                    # moon-22: from the stored tree at boundary k, rules k.. under the new code
+                    oe = from_checkpoint(zck.read(f"ck/{suite}/{i}/{k}"), meta["schemas"][suite], k)
+                    if strict_digest(oe) != q["outs"]["d_opt"]:
+                        if os.environ.get("SUBTEST_DEBUG"):
+                            print("subtest rule diff:", suite, i, k, file=sys.stderr)
+                        fb_cpu += q["cpu_exec"]
+                        if not FALLBACK and fb_cpu > FALLBACK_CAP: return False
+                        full.append((suite, i, opt))
+                        continue
+                elif optb_hit:
                     e = pickle.loads(q["outs"]["pexpr"])
                     sch = E.ensure_schema(meta["schemas"][suite], dialect=None)
                     oe = E.optimize(e, sch, leave_tables_isolated=True, dialect=None)
@@ -996,6 +1276,9 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
                         full.append((suite, i, opt))  # optimized tree differs: run it all
                         continue
             except Exception:  # noqa: BLE001
+                if os.environ.get("SUBTEST_DEBUG"):
+                    import traceback
+                    traceback.print_exc(file=sys.__stderr__)
                 return False
     tables: dict = {}
     with zipfile.ZipFile(store) as zf:
@@ -1031,5 +1314,8 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "build":
         build(Path(sys.argv[2]), Path(sys.argv[3]))
+    elif len(sys.argv) == 4 and sys.argv[1] == "seeddig":
+        with open(sys.argv[3], "wb") as fh:
+            pickle.dump(seed_digests(Path(sys.argv[2])), fh)
     else:
         sys.exit("usage: python -m selector.subtest build SQLGLOT_ROOT OUT.zip")
