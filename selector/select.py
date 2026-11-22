@@ -324,13 +324,24 @@ class Selector:
             rest = everything - only
             return base - (pack.cost_ms(pack.pack(rest, ms_of), ms_of) if rest else 0)
 
+        if self._ends_all_every(everything, cands, base):
+            reasons.append(f"{type(pruner).__name__.lower()}: keep (ends ALL anyway)")
+            return per_file
         dropped, note = pruner.prune(self._jobs, self._spans, cands, benefit,
-                                     futile=lambda only: self._ends_all(everything, only))
+                                     futile=lambda only: self._ends_all(everything, only, base))
         if note:
             reasons.append(note)
         return [(p, got - dropped) for p, got in per_file]
 
-    def _ends_all(self, everything: set[int], only: set[int]) -> bool:
+    def _ends_all_every(self, everything: set[int], cands: set[int], base: int) -> bool:
+        """r40: `_ends_all` for every non-empty subset of `cands` (≤ 3 TPC tests): no drop
+        the verifier could choose changes the output (checked before its parent-side work)."""
+        nums = sorted(cands)
+        return bool(nums) and all(self._ends_all(everything, set(sub), base)
+                                  for r in range(1, len(nums) + 1)
+                                  for sub in itertools.combinations(nums, r))
+
+    def _ends_all(self, everything: set[int], only: set[int], base: int | None = None) -> bool:
         """r40: True when the commit's output is ALL even if `only` is dropped: every
         selection the rest of `select` can still give (any of the later pruners' tests
         dropped too, the untraced tests added) costs ≥ ALL_FRACTION × ALL, which
@@ -343,6 +354,8 @@ class Selector:
             ms_of = {n: pack.duration_ms(s) for n, s in self._secs.items()}
             if "_all_cost" not in self.__dict__:
                 self._all_cost = pack.cost_ms(pack.pack(set(self._all), ms_of), ms_of)
+            if base is not None and base < 0.9 * ALL_FRACTION * self._all_cost:
+                return False  # far from ALL (cheap pre-filter; False = verify as before)
             if self._untraced is None:
                 self._untraced = self.maps.untraced()
             later: set[int] = set()
@@ -394,6 +407,9 @@ class Selector:
 
         if benefit(cands) < TPCPATCH_MIN_GAIN_MS:
             return per_file
+        if self._ends_all_every(everything, cands, base):
+            reasons.append("tpc-patched: keep (ends ALL anyway)")
+            return per_file
 
         def keep(why: str):
             reasons.append(f"tpc-patched: keep ({why})")
@@ -438,7 +454,7 @@ class Selector:
             return keep(f"may write shared state: {why}"[:160])
         try:
             dropped, note = st.prune_patched(str(self.sqlglot), patched, spans, cands, benefit,
-                                             True, futile=lambda only: self._ends_all(everything, only))
+                                             True, futile=lambda only: self._ends_all(everything, only, base))
         except Exception as e:  # noqa: BLE001
             return keep(type(e).__name__)
         if note:
