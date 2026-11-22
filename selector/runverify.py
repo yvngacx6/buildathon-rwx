@@ -78,6 +78,21 @@ class _Anomaly(Exception):
     pass
 
 
+CHILD_MEM_MB = int(os.environ.get("BR_RUNVERIFY_CHILD_MB", "768"))
+PARENT_MAX_MB = int(os.environ.get("BR_RUNVERIFY_PARENT_MB", "1500"))
+
+
+def _status_kb(field: str) -> int | None:
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith(field + ":"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def _setup_child(root: str, served: dict[str, str], patched_paths: set[str], cap: float,
                  wfd: int) -> dict:
     """Everything before the first test: limits, stdio, fresh patched imports, guards."""
@@ -90,6 +105,20 @@ def _setup_child(root: str, served: dict[str, str], patched_paths: set[str], cap
         os._exit(3)
     signal.signal(signal.SIGPROF, over)
     signal.setitimer(signal.ITIMER_PROF, cap)
+    # Memory: a runaway test must never get the selector killed. The OOM killer takes this
+    # child first, and its address space may grow by at most CHILD_MEM_MB.
+    try:
+        with open("/proc/self/oom_score_adj", "w") as fh:
+            fh.write("1000")
+    except OSError:
+        pass
+    try:
+        vm = _status_kb("VmSize")
+        if vm:
+            lim = (vm + CHILD_MEM_MB * 1024) * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
+    except (ValueError, OSError):
+        pass
     try:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         lim = int(cap) + 2
@@ -696,6 +725,9 @@ class RunVerify:
             return numbers, f"runverify: skip (est {scorer:.2f}s scorer CPU)"
         if self.spent + scorer > BATCH_S:
             return numbers, "runverify: skip (batch budget)"
+        rss = _status_kb("VmRSS")
+        if rss is None or rss > PARENT_MAX_MB * 1024:
+            return numbers, f"runverify: skip (selector RSS {rss} kB)"
         served = self._served(files)
         if isinstance(served, str):
             return numbers, f"runverify: skip ({served})"
