@@ -79,6 +79,10 @@ def main():
         cls, _, name = k.partition(" ")
         classes.setdefault(cls, {})[name] = uniq.setdefault(tuple(sorted(v)), len(uniq))
     lists = [[b - a for a, b in zip((0,) + t, t)] for t in sorted(uniq, key=uniq.get)]
+    # an untracked name matters only where it shadows a name tracked somewhere (else the
+    # selector's MRO walk finds no tracked entry either way)
+    anywhere = set().union(*tracked.values()) if tracked else set()
+    untracked = {k: v & anywhere for k, v in untracked.items()}
     out = {"tests": ids, "classes": classes, "lists": lists,
            "tracked": {k: sorted(v) for k, v in sorted(tracked.items())},
            "untracked": {k: sorted(v) for k, v in sorted(untracked.items())},
