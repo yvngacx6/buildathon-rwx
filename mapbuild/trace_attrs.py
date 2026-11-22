@@ -144,6 +144,48 @@ def _credit(cls):
     return None
 
 
+# Process-pool work (tests/test_optimizer.py, tests/test_executor.py use spawn pools) must run
+# in THIS interpreter, or its lookups are invisible (found by the first re-score: 2 misses).
+# Same InlinePool as trace_one.py: arguments, initargs and results cross a pickle round trip.
+import concurrent.futures  # noqa: E402
+import concurrent.futures.process  # noqa: E402
+import pickle  # noqa: E402
+
+
+def _roundtrip(x):
+    return pickle.loads(pickle.dumps(x))
+
+
+class InlinePool:
+    def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
+        if initializer is not None:
+            initializer(*_roundtrip(initargs))
+
+    def submit(self, fn, /, *args, **kwargs):
+        fut = concurrent.futures.Future()
+        try:
+            a, k = _roundtrip((args, kwargs))
+            fut.set_result(_roundtrip(fn(*a, **k)))
+        except BaseException as e:  # noqa: BLE001
+            fut.set_exception(e)
+        return fut
+
+    def map(self, fn, *iterables, timeout=None, chunksize=1):
+        return [self.submit(fn, *args).result() for args in zip(*iterables)]
+
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+concurrent.futures.ProcessPoolExecutor = InlinePool
+concurrent.futures.process.ProcessPoolExecutor = InlinePool
+
 import pytest  # noqa: E402
 
 
