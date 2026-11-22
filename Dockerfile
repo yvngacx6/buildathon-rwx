@@ -42,4 +42,6 @@ RUN python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig
       wait $p1 && wait $p2 && wait $p3 && wait $p4; } \
  && chmod -R a+rX /app /opt/sqlglot
 # -S: no site module (the selector needs only the standard library).
+# DIAGNOSTIC r38: drop the 3 TPC tests on commits in these keep categories
+ENV BR_DIAG_TPC_DROP=budget
 CMD ["python", "-S", "-m", "selector"]
