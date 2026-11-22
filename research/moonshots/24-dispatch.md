@@ -18,7 +18,7 @@
   - practice_like total cost: 915.9 → 849.7 s.
   - The R23 gain belongs to R23, not to this moonshot. It is ready and still unmerged.
 - **Instruction-level (bytecode) coverage, run on every B test of practice_like (`itlev.py` + moon-16 `itrace.py`):**
-  saves **6.7 s per 120 commits, about 2.2 s per 40**, as an upper bound.
+  saves **6.7 s per 120 commits, about 2.2 s per 40**, as an upper bound. On private it saves 0.1 s per 264 commits.
   - Two commits make it all: tggb 4.7 s and d0xm 1.8 s.
   - This matches moon-16's ≈ 2 s/40. It is not worth a map.
 - **The lever for B is diffexec store coverage, not dispatch.** 1396 of the 1398 B tests on practice_like were never replayed.
@@ -34,7 +34,7 @@
     2. Hand the B residual (≈ 16 s/40, 92 % of it budget-dead) to whoever owns the diffexec store.
 
 ## 1. Why the gap.py bucket reads 145.5 s here and not ≈172 s
-`gap.py` on practice_like at main 787921b (= 3bec6e9 for selector code) credits 145.5 s to "function map" (32 commits). Another 35.9 s goes to
+`gap.py` on practice_like at main 787921b (3bec6e9 differs only in a state-diff fallback, not in this bucket) credits 145.5 s to "function map" (32 commits). Another 35.9 s goes to
 `shared: function map + …`, mostly import-time map + function map on ehpl and 4gr2. Exclusive + shared is ≈ 181 s, over 36
 commits; the ≈ 172 s in the task is the same bucket on an older HEAD. My split only counts **exclusive** function-map extras (122 s);
 the shared ones also need the other rule relaxed (ehpl / 4gr2: the import-time runs of `TokenizerCore._add`,
@@ -89,8 +89,8 @@ slow tests and resource-class tests. Neither is in this bucket.
   `FAILING-NOT-HIT` is r1hk, a multi-file commit whose failures come from its fixture file.
 - **Caveat.** One process per job, so a lazy cache filled by an earlier test can hide a later test's hit. Treat the
   6.7 s as an upper bound. I did not run per-process confirmation, because I am not proposing the rule.
-- **Private.** Instruction-level numbers are in `24-tools/out/it_private.txt` (same tool) if present. Moon-16 measured
-  6.9 s over 71 labeled function-body commits on the same idea.
+- **Private (264): instruction level saves 0.1 s out of 47.4 s of B** (`24-tools/out/it_private.txt`). Every failing test hit
+  a changed instruction (0 FAILING-NOT-HIT). Moon-16 measured 6.9 s over 71 labeled function-body commits.
 
 ## 4. What B actually needs: diffexec store coverage
 - **Where B sits.** practice_like B = 53.5 s, of which 49.4 s is in functions that `diffexec/build.py choose()` dropped for the
