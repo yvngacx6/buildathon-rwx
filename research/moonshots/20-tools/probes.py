@@ -76,11 +76,11 @@ def answers(out: Path) -> None:
     commits = {}
     for log in sorted((out / "labels").glob("*.log")):
         text = log.read_text(errors="replace")
-        if not re.search(r"^=+ .*(passed|failed|error).* =+$", text, re.M):
+        if not re.search(r"(passed|failed|error).* in [0-9.]+s", text):
             print("INCOMPLETE", log.stem)
             continue
         failing = set()
-        for m in re.finditer(r"^(FAILED|ERROR|SUBFAIL) (\S+)", text, re.M):
+        for m in re.finditer(r"^(FAILED|ERROR|SUBFAIL\w*(?:\[.*\])?) (tests/\S+)", text, re.M):
             tid = m.group(2).split("[")[0]
             if tid in by_id:
                 failing.add(by_id[tid])
