@@ -294,7 +294,8 @@ class SlowVerify:
             self._meta = meta if ok else {}
         return self._meta
 
-    def prune(self, jobs, spans, candidates: set[int], benefit_of) -> tuple[set[int], str]:
+    def prune(self, jobs, spans, candidates: set[int], benefit_of,
+              futile=None) -> tuple[set[int], str]:
         cands = candidates & set(self.numbers)
         if not cands or not spans:
             return set(), ""
@@ -314,6 +315,8 @@ class SlowVerify:
             gain = benefit_of(cands)
             if gain <= 0 or SCORER_SLOWDOWN * 0.5 > min(BUDGET_S, 0.6 * gain / 1000):
                 return set(), "slowverify: keep (not worth it)"
+            if futile is not None and futile(cands):
+                return set(), "slowverify: keep (ends ALL anyway)"
             ok = self.verify(jobs, replay)
         except Exception as e:  # noqa: BLE001
             return set(), f"slowverify: keep ({type(e).__name__})"

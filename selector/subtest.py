@@ -1498,7 +1498,8 @@ class SubTest:
         self.spent += self.last_child
         return not timed_out and status == 0 and b"".join(chunks) == b"OK"
 
-    def prune(self, jobs, spans, candidates: set[int], benefit_of) -> tuple[set[int], str]:
+    def prune(self, jobs, spans, candidates: set[int], benefit_of,
+              futile=None) -> tuple[set[int], str]:
         """jobs: diffexec jobs [(path, new text, prunable)], spans {path: [(first, last)]} of
         the touched statements, candidates: the TPC tests that only these jobs keep."""
         cands = candidates & set(self.numbers)
@@ -1565,6 +1566,9 @@ class SubTest:
             return set(), f"subtest: keep (est {cpu:.1f}s CPU for {sum(map(len, per.values()))} queries{"" if getattr(self, "stage_ok", True) else "; no stage: " + str(self.stage_why)})"
         if not todo:
             return chosen, f"subtest: {sorted(chosen)} dropped (no query runs a touched statement)"
+        if futile is not None and futile(chosen):
+            # r40: the output is ALL with or without the drop: verifying saves nothing
+            return set(), f"subtest: keep (ends ALL anyway; est {est:.2f}{' [net gate]' if net_gate else ''})"
         try:
             cap = min(BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0 + FALLBACK_CAP)
             if net_gate:
@@ -1613,7 +1617,8 @@ class SubTest:
         return False
 
     def prune_patched(self, root: str, patched: dict[str, str], spans: dict,
-                      candidates: set[int], benefit_of, stage_ok: bool) -> tuple[set[int], str]:
+                      candidates: set[int], benefit_of, stage_ok: bool,
+                      futile=None) -> tuple[set[int], str]:
         """r37. The TPC tests of a commit whose .py edits are not all clean function-body
         edits (class / module bodies, definition-time code: no diffexec job): `spans` are the
         OLD-file lines whose run can behave differently (touched function statements, and the
@@ -1652,6 +1657,8 @@ class SubTest:
                            f"{sum(map(len, per.values()))} queries)")
         if not todo:
             return chosen, f"tpc-patched: {sorted(chosen)} dropped (no query runs a changed line)"
+        if futile is not None and futile(chosen):
+            return set(), f"tpc-patched: keep (ends ALL anyway; est {est:.2f})"
         cap = min(PATCHED_BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0)
         meta = self.meta()
         sub = {"schemas": meta["schemas"], "suites": {}}

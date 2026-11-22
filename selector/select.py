@@ -87,6 +87,7 @@ dropped only if that passes with margin (selector/genmem.py).
 from __future__ import annotations
 
 import ast
+import itertools
 import json
 import os
 import re
@@ -323,12 +324,55 @@ class Selector:
             rest = everything - only
             return base - (pack.cost_ms(pack.pack(rest, ms_of), ms_of) if rest else 0)
 
-        dropped, note = pruner.prune(self._jobs, self._spans, cands, benefit)
+        dropped, note = pruner.prune(self._jobs, self._spans, cands, benefit,
+                                     futile=lambda only: self._ends_all(everything, only))
         if note:
             reasons.append(note)
         return [(p, got - dropped) for p, got in per_file]
 
+    def _ends_all(self, everything: set[int], only: set[int]) -> bool:
+        """r40: True when the commit's output is ALL even if `only` is dropped: every
+        selection the rest of `select` can still give (any of the later pruners' tests
+        dropped too, the untraced tests added) costs ≥ ALL_FRACTION × ALL, which
+        __main__ turns into ALL. Verifying `only` then saves nothing: skip it (→ keep).
+        Each such selection is checked (LPT packing is not monotone in the set)."""
+        if os.environ.get("BR_ENDS_ALL", "1") == "0":
+            return False
+        from . import pack
+        try:
+            ms_of = {n: pack.duration_ms(s) for n, s in self._secs.items()}
+            if "_all_cost" not in self.__dict__:
+                self._all_cost = pack.cost_ms(pack.pack(set(self._all), ms_of), ms_of)
+            if self._untraced is None:
+                self._untraced = self.maps.untraced()
+            later: set[int] = set()
+            if self.slowverify is not None:
+                later |= set(self.slowverify.numbers)
+            if self.genmem is not None:
+                later.add(self.genmem.number)
+            later = sorted(later & everything)
+            rest = everything - only
+            for r in range(len(later) + 1):
+                for gone in itertools.combinations(later, r):
+                    final = ((rest - set(gone)) | self._untraced) & self._all
+                    if final == self._all:
+                        continue
+                    if pack.cost_ms(pack.pack(final, ms_of), ms_of) < ALL_FRACTION * self._all_cost:
+                        return False
+            return True
+        except Exception:  # noqa: BLE001  (never skip on a surprise: verify as before)
+            return False
+
     def _tpc_patched(self, per_file, reasons):
+        """r40: `_tpc_patched_` with its own CPU (this process) in its note."""
+        import time
+        t0, n = time.process_time(), len(reasons)
+        out = self._tpc_patched_(per_file, reasons)
+        if len(reasons) > n and reasons[-1].startswith("tpc-patched"):
+            reasons[-1] += f" [sel {time.process_time() - t0:.2f}s]"
+        return out
+
+    def _tpc_patched_(self, per_file, reasons):
         """r37: drop the TPC executor tests of a commit no function-body pruner can take
         (class / module-body edits, definition-time code, state-diff commits) when the
         queries that run a line the commit can change give the pinned outputs on the PATCHED
@@ -394,7 +438,7 @@ class Selector:
             return keep(f"may write shared state: {why}"[:160])
         try:
             dropped, note = st.prune_patched(str(self.sqlglot), patched, spans, cands, benefit,
-                                             True)
+                                             True, futile=lambda only: self._ends_all(everything, only))
         except Exception as e:  # noqa: BLE001
             return keep(type(e).__name__)
         if note:
