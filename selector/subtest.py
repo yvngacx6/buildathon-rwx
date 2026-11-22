@@ -198,26 +198,41 @@ def exec_windows(expr, schema, used, cov_factory=None, swap_until=None):
 CALIB_REF = 0.0  # set below from the reference measurement
 
 
+_CALIB_SQL = ("SELECT a.x, SUM(b.y) AS s FROM a JOIN b ON a.k = b.k AND b.z > 3 "
+              "WHERE a.x IN (SELECT c.x FROM c WHERE c.w < 10) GROUP BY a.x ORDER BY s DESC")
+_CALIB_SCHEMA = {"a": {"x": "INT", "k": "INT"}, "b": {"y": "DOUBLE", "k": "INT", "z": "INT"},
+                 "c": {"x": "INT", "w": "INT"}}
+
+
 def _calib_work() -> int:
-    acc = 0
-    d: dict = {}
-    for i in range(20000):
-        k = ("k", i % 97)
-        d[k] = d.get(k, 0) + i
-        s = f"col{i % 31}".upper()
-        acc += len(s) + (i & 7)
-        lst = [i, s, k]
-        acc += len(lst[1:])
-    return acc + len(d)
+    """A small copy of what the timed runs do: optimize a query with pinned sqlglot (the stage
+    part) and a hash join + aggregate over tuples with generated lambdas (the executor part)."""
+    from sqlglot import parse_one
+    from sqlglot.optimizer import optimize
+    e = optimize(parse_one(_CALIB_SQL), _CALIB_SCHEMA)
+    acc = len(e.sql())
+    left = [(i, i % 101, f"v{i % 13}") for i in range(3000)]
+    right = [(i % 101, float(i), i % 7) for i in range(3000)]
+    index: dict = {}
+    for r in right:
+        index.setdefault(r[0], []).append(r)
+    cond = eval("lambda l, r: r[2] > 3 and l[2] != 'v1'")  # noqa: S307
+    groups: dict = {}
+    for l in left:
+        for r in index.get(l[1], ()):
+            if cond(l, r):
+                groups[l[2]] = groups.get(l[2], 0.0) + r[1]
+    return acc + len(groups)
 
 
 def _calib() -> float:
-    best = float("inf")
+    """Median CPU of 5 runs of the calibration workload."""
+    runs = []
     for _ in range(5):
         t = time.process_time()
         _calib_work()
-        best = min(best, time.process_time() - t)
-    return best
+        runs.append(time.process_time() - t)
+    return sorted(runs)[2]
 
 
 def _norm(cpu: float, c0: float, c1: float) -> float:
