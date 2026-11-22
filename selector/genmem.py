@@ -259,7 +259,8 @@ def _main(argv: list[str]) -> None:
 
 
 _RUN = (f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r}); "
-        "from selector.genmem import _main; _main(sys.argv[1:])")
+        "from selector.genmem import _main; _main(sys.argv[1:]); "
+        "sys.stdout.flush(); import os; os._exit(0)")  # skip the teardown of the imported package
 
 
 def run_child(root: str, patched: dict[str, str], everything: bool,

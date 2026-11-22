@@ -28,6 +28,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_STORE = REPO / "maps" / "diffexec.zip"
+RESOURCE_TABLE = REPO / "index" / "resources.pkl"  # build_resources, at image build
 # Test sources mentioning these observe resources that replay cannot compare.
 RESOURCE_MODULES = {"tracemalloc", "gc", "resource", "time", "timeit", "psutil", "threading",
                     "signal", "faulthandler", "pyperf"}
@@ -51,6 +52,7 @@ class DiffExec:
         from .pack import duration_ms
         self.ms_of = {t["number"]: duration_ms(t["seconds"]) for t in selector.tests}
         self._resource_files: dict[str, set[str]] = {}
+        self._resource_table: dict[str, set[str]] | None = None
         self._class_of: dict[str, str] = {}
         self._mates: dict[str, list[str]] = {}
         for t in selector.tests:
@@ -117,6 +119,10 @@ class DiffExec:
             from diffexec import replay  # noqa: F401
             self._warm = True
         from diffexec import replay
+        try:
+            replay.warm(req)  # once per run and file, not once per child
+        except Exception:  # noqa: BLE001  (the child then does it itself)
+            pass
         t0 = os.times()
         rfd, wfd = os.pipe()
         pid = os.fork()
@@ -324,31 +330,63 @@ class DiffExec:
         """Does the test's class (or module-level test function) name a resource probe?
 
         Coarse on purpose: a use of a resource module (or RESOURCE_ATTRS) anywhere in the test's class marks all
-        tests of that class. Files are parsed lazily, only for candidate tests.
+        tests of that class. Read from the build-time table (index/resources.pkl, pinned test
+        sources); a file missing from it is parsed here, lazily.
         """
         f = tid.split("::")[0]
+        if self._resource_table is None:
+            self._resource_table = {}
+            try:
+                import pickle
+                self._resource_table = pickle.loads(RESOURCE_TABLE.read_bytes())
+            except Exception:  # noqa: BLE001  (no table: parse at run time)
+                pass
         hit = self._resource_files.get(f)
         if hit is None:
-            hit = set()
-            try:
-                tree = ast.parse((self.sel.sqlglot / f).read_bytes())
-            except (OSError, SyntaxError, ValueError):
-                hit = {"*"}
-            else:
-                bound = set()  # local names bound to resource modules or their members
-                for n in ast.walk(tree):
-                    if isinstance(n, ast.Import):
-                        for al in n.names:
-                            if al.name.split(".")[0] in RESOURCE_MODULES:
-                                bound.add((al.asname or al.name).split(".")[0])
-                    elif isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] in RESOURCE_MODULES:
-                        bound.update(al.asname or al.name for al in n.names)
-                for node in tree.body:
-                    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                        names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
-                        attrs = {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
-                        if names & bound or attrs & RESOURCE_ATTRS:
-                            hit.add(node.name)
+            hit = self._resource_table.get(f)
+            if hit is None:
+                hit = resource_names(self.sel.sqlglot / f)
             self._resource_files[f] = hit
         parts = tid.split("::")
         return "*" in hit or (len(parts) > 1 and parts[1] in hit)
+
+
+def resource_names(path: Path) -> set[str]:
+    """Top-level classes / functions of a test file that name a resource probe ({"*"}: the
+    file does not parse)."""
+    hit: set[str] = set()
+    try:
+        tree = ast.parse(path.read_bytes())
+    except (OSError, SyntaxError, ValueError):
+        return {"*"}
+    bound = set()  # local names bound to resource modules or their members
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for al in n.names:
+                if al.name.split(".")[0] in RESOURCE_MODULES:
+                    bound.add((al.asname or al.name).split(".")[0])
+        elif isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] in RESOURCE_MODULES:
+            bound.update(al.asname or al.name for al in n.names)
+    for node in tree.body:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+            attrs = {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
+            if names & bound or attrs & RESOURCE_ATTRS:
+                hit.add(node.name)
+    return hit
+
+
+def build_resources(root: Path, out: Path) -> None:
+    """`_is_resource` for every test file of the pinned source, at image build."""
+    import pickle
+    table = {p.relative_to(root).as_posix(): resource_names(p)
+             for p in sorted((root / "tests").rglob("*.py"))}
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(pickle.dumps(table, pickle.HIGHEST_PROTOCOL))
+
+
+if __name__ == "__main__":  # python -m selector.diffexec resources <sqlglot root> <out.pkl>
+    if sys.argv[1:2] == ["resources"]:
+        build_resources(Path(sys.argv[2]), Path(sys.argv[3]))
+    else:
+        sys.exit("usage: python -m selector.diffexec resources <sqlglot root> <out.pkl>")

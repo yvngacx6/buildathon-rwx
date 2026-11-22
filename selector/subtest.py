@@ -188,6 +188,61 @@ def exec_windows(expr, schema, used, cov_factory=None, swap_until=None):
     return covs, d_opt, digest_table(res)
 
 
+# ── build-machine calibration ────────────────────────────────────────────────────
+#
+# The image build may run on a busy box: CPU seconds measured there are inflated (shared cores,
+# hyper-threads, caches), which made the budget refuse verifications it can afford (a store
+# built at load ~20 had every query 2.4x too expensive). Each timed run is bracketed by a fixed
+# pure-Python workload measured the same way, and the stored CPU is expressed in reference
+# seconds: cpu * CALIB_REF / calib. CALIB_REF is the workload's CPU on the machine the budget
+# constants were tuned on (laptop, idle); BR_SUBTEST_NOCALIB=1 stores raw seconds.
+
+# rwx idle: cpu_exec(tpcds) / calib = 1004; rwx-big at load ~150: 966 (raw CPU 1.72x apart).
+# 11.6 ms maps that ratio onto the laptop-idle 11.4 s the budget constants were tuned with.
+CALIB_REF = 0.0116
+
+
+_CALIB_SQL = ("SELECT a.x, SUM(b.y) AS s FROM a JOIN b ON a.k = b.k AND b.z > 3 "
+              "WHERE a.x IN (SELECT c.x FROM c WHERE c.w < 10) GROUP BY a.x ORDER BY s DESC")
+_CALIB_SCHEMA = {"a": {"x": "INT", "k": "INT"}, "b": {"y": "DOUBLE", "k": "INT", "z": "INT"},
+                 "c": {"x": "INT", "w": "INT"}}
+
+
+def _calib_work() -> int:
+    """A small copy of what the timed runs do: optimize a query with pinned sqlglot (the stage
+    part) and a hash join + aggregate over tuples with generated lambdas (the executor part)."""
+    from sqlglot import parse_one
+    from sqlglot.optimizer import optimize
+    e = optimize(parse_one(_CALIB_SQL), _CALIB_SCHEMA)
+    acc = len(e.sql())
+    left = [(i, i % 101, f"v{i % 13}") for i in range(3000)]
+    right = [(i % 101, float(i), i % 7) for i in range(3000)]
+    index: dict = {}
+    for r in right:
+        index.setdefault(r[0], []).append(r)
+    cond = eval("lambda l, r: r[2] > 3 and l[2] != 'v1'")  # noqa: S307
+    groups: dict = {}
+    for l in left:
+        for r in index.get(l[1], ()):
+            if cond(l, r):
+                groups[l[2]] = groups.get(l[2], 0.0) + r[1]
+    return acc + len(groups)
+
+
+def _calib() -> float:
+    """Median CPU of 5 runs of the calibration workload."""
+    runs = []
+    for _ in range(5):
+        t = time.process_time()
+        _calib_work()
+        runs.append(time.process_time() - t)
+    return sorted(runs)[2]
+
+
+def _norm(cpu: float, c0: float, c1: float) -> float:
+    if os.environ.get("BR_SUBTEST_NOCALIB") == "1" or not CALIB_REF:
+        return cpu
+    return cpu * CALIB_REF / max(1e-6, (c0 + c1) / 2)
 # ── moon-22: per-optimizer-rule checkpoints inside the optb window ───────────
 #
 # optimize() = glue (ensure_schema, maybe_parse(copy=True), the rule loop) + RULES[0..13];
@@ -392,6 +447,10 @@ def _build_rules(outs, optb_cov, pexpr, schema_dict, prefix, seed_runs) -> None:
         if d == dfin:
             ok.append(k)
             cpu_from[k] = c
+    if cpu_from:
+        # one calibration per query (in its own fork, after the timed runs), as stage_timed
+        c1 = _in_fork(_calib)
+        cpu_from = {k: _norm(c, c1, c1) for k, c in cpu_from.items()}
     outs["ck_ok"] = ok
     outs["cpu_from"] = cpu_from
     outs["cpu_steps"] = cpu
@@ -594,7 +653,8 @@ def build(root: Path, out: Path) -> None:
                         oe.sql(pretty=True)
                         d2 = strict_digest(oe)
                         cpu_stage = time.process_time() - t0
-                        return d2, cpu_stage
+                        c1 = _calib()  # after: it must not warm caches for the run
+                        return d2, _norm(cpu_stage, c1, c1)
                     covs, d_opt, dres = _in_fork(windows)
                     d2, cpu_stage = _in_fork(stage_timed)
                     phases["win"] = covs
@@ -628,7 +688,8 @@ def build(root: Path, out: Path) -> None:
                 t1 = time.process_time()
                 b = run_query(q, schemas[suite], tables[suite], True) if suite == "tpch" else None
                 t2 = time.process_time()
-                return a, b, t1 - t0, t2 - t1
+                c1 = _calib()  # after: it must not warm caches for the runs
+                return a, b, _norm(t1 - t0, c1, c1), _norm(t2 - t1, c1, c1), c1
 
             try:
                 phases, outs = _in_fork(traced)
@@ -638,18 +699,19 @@ def build(root: Path, out: Path) -> None:
                     phases["opt"], duck, outs["opt"] = _in_fork(traced_opt)
                     if duck != outs["duck"]:
                         raise RuntimeError("duckdb sql differs between runs")
-                a, b, cpu_exec, cpu_opt = _in_fork(timed)
+                a, b, cpu_exec, cpu_opt, calib = _in_fork(timed)
                 # the untraced run must give the same outputs (else: not deterministic → never used)
                 stable = (a[0] == outs.get("exec")) and (
                     a[1] == (outs["duck"] if q["execute"] else None))
                 if b is not None:
                     stable = stable and b[1] == outs["duck"] and b[2] == outs["opt"]
             except RuntimeError:  # e.g. RecursionError at the worker's limit: never used
-                phases, outs, cpu_exec, cpu_opt, stable = {}, {}, 0.0, 0.0, False
-            q.update(phases=phases, outs=outs, cpu_exec=cpu_exec, cpu_opt=cpu_opt, stable=stable)
+                phases, outs, cpu_exec, cpu_opt, stable, calib = {}, {}, 0.0, 0.0, False, 0.0
+            q.update(phases=phases, outs=outs, cpu_exec=cpu_exec, cpu_opt=cpu_opt, stable=stable,
+                     calib=calib)
             queries.append(q)
             print(f"{suite} {len(queries)} exec={q['execute']} cpu={cpu_exec:.2f}/{cpu_opt:.2f}"
-                  f" stable={stable}", file=sys.stderr)
+                  f" stable={stable} calib={calib * 1000:.1f}ms", file=sys.stderr)
         meta["suites"][suite] = queries
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".tmp")
@@ -691,6 +753,195 @@ def _hit(lines_by_file: dict, spans: dict) -> bool:
                 if ln >= first:
                     return True
     return False
+
+
+# ── stage guard: no checkpoint shortcut for code that may write shared state ─────────────
+#
+# The checkpoint compares the optimized tree, not global state. If a changed function (old or
+# new version; for a nested def, its outermost enclosing def, so closures resolve) can write
+# state that outlives its call, the query goes the whole way (full re-run, as r17):
+#   * `global` / `nonlocal`, setattr / delattr / exec / eval / globals() / vars() / __import__
+#   * a store, del, augmented assignment or mutating method call (append, update, set, ...)
+#     whose base is a non-local object: a module-level name, builtin or import, `cls`, `self`
+#     of a Dialect (instances are cached and shared; parser / generator / tokenizer / scope /
+#     schema objects are made per call), or a local name bound to one of those by alias
+#     (x = MOD.TABLE, from m import X, for x in GLOBAL..., with GLOBAL as x, x = M.get(...));
+#     exp.* builders and .copy() make new objects
+# Parameters and names bound from them / from calls of plain functions count as query-local:
+# the objects the optimizer works on are the query's tree and scopes, compared by the digest.
+# Not covered (documented gap, as r17's cross-query reuse): an unchanged callee that writes
+# global state on the changed function's behalf.
+
+_MUTATORS = {"append", "extend", "insert", "pop", "popitem", "remove", "clear", "update",
+             "setdefault", "add", "discard", "sort", "reverse", "__setitem__", "__delitem__",
+             "__setattr__", "__delattr__", "difference_update", "intersection_update",
+             "symmetric_difference_update", "appendleft", "extendleft", "popleft", "rotate",
+             "move_to_end", "cache_clear", "set", "replace", "append_comments", "add_comments",
+             "pop_comments", "set_meta"}
+_BAD_CALLS = {"setattr", "delattr", "exec", "eval", "globals", "vars", "__import__", "locals"}
+
+
+def _defs(tree):
+    """{(qualname, occurrence): (def node, outermost enclosing def node)}."""
+    out, seen = {}, {}
+
+    def visit(node, prefix, outer):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                name = prefix + (child.name if not isinstance(child, ast.Lambda) else "<lambda>")
+                k = seen.get(name, 0)
+                seen[name] = k + 1
+                out[(name, k)] = (child, outer or child)
+                visit(child, name + ".<locals>.", outer or child)
+            elif isinstance(child, ast.ClassDef):
+                visit(child, prefix + child.name + ".", outer)
+            else:
+                visit(child, prefix, outer)
+
+    visit(tree, "", None)
+    return out
+
+
+def _root(node):
+    """Base name of a.b[c].d(...).e chains (through method calls, not plain-function calls)."""
+    while True:
+        if isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
+            node = node.value
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            f = node.func
+            # sqlglot.expressions builders (exp.column(...), exp.Alias(...)) and .copy() make
+            # new objects
+            if f.attr in ("copy", "deepcopy") or (isinstance(f.value, ast.Name) and f.value.id == "exp"):
+                return node
+            node = f.value
+        else:
+            return node
+
+
+def _writes_shared(fn, self_shared: bool) -> str | None:
+    """Why `fn` (whole subtree) may write state that outlives its call, or None."""
+    nodes = list(ast.walk(fn))
+    params: set[str] = set()
+    for n in nodes:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            a = n.args
+            params.update(p.arg for p in a.posonlyargs + a.args + a.kwonlyargs)
+            params.update(p.arg for p in (a.vararg, a.kwarg) if p is not None)
+    shared_self = "self" if self_shared else None
+
+    # local bindings: name → [value expressions] (None: an import, i.e. a shared module object)
+    binds: dict[str, list] = {}
+
+    def bind(target, value):
+        for x in ast.walk(target):
+            if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
+                binds.setdefault(x.id, []).append(value if isinstance(target, ast.Name) else value)
+
+    for n in nodes:
+        if isinstance(n, (ast.Global, ast.Nonlocal)):
+            return "global / nonlocal"
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            for a in n.names:
+                binds.setdefault((a.asname or a.name).split(".")[0], []).append(None)
+        elif isinstance(n, ast.Assign):
+            for t in n.targets:
+                bind(t, n.value)
+        elif isinstance(n, (ast.AnnAssign, ast.NamedExpr)) and n.value is not None:
+            bind(n.target, n.value)
+        elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+            bind(n.target, n.iter)
+        elif isinstance(n, (ast.With, ast.AsyncWith)):
+            for it in n.items:
+                if it.optional_vars is not None:
+                    bind(it.optional_vars, it.context_expr)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            binds.setdefault(n.name, []).append(ast.Constant(None))
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n is not fn:
+            binds.setdefault(n.name, []).append(ast.Constant(None))
+
+    shared: dict[str, bool] = {}
+
+    def is_shared(name: str, depth: int = 0) -> bool:
+        if name in ("cls",) or name == shared_self:
+            return True
+        if name in params and name not in binds:
+            return False
+        if name not in binds:
+            return True  # module-level name, builtin or closure of the module
+        if name in shared:
+            return shared[name]
+        shared[name] = False  # cycles: assume local until shown otherwise
+        res = False
+        for v in binds[name]:
+            if v is None:
+                res = True  # import
+                break
+            r = _root(v)
+            if isinstance(r, ast.Name) and depth < 20 and r.id != name and is_shared(r.id, depth + 1):
+                res = True
+                break
+        shared[name] = res
+        return res
+
+    def target_shared(t) -> str | None:
+        if isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                why = target_shared(e)
+                if why:
+                    return why
+            return None
+        if isinstance(t, ast.Name):
+            return None
+        r = _root(t)
+        if isinstance(r, ast.Name):
+            return f"writes {r.id}" if is_shared(r.id) else None
+        return "writes through an expression" if not isinstance(r, ast.Call) else None
+
+    for n in nodes:
+        targets = []
+        if isinstance(n, ast.Assign):
+            targets = n.targets
+        elif isinstance(n, (ast.AugAssign, ast.AnnAssign)) and (n.value is not None or isinstance(n, ast.AugAssign)):
+            targets = [n.target]
+        elif isinstance(n, ast.Delete):
+            targets = n.targets
+        elif isinstance(n, (ast.For, ast.AsyncFor)):
+            targets = [n.target]
+        elif isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Name) and f.id in _BAD_CALLS:
+                return f"calls {f.id}"
+            if isinstance(f, ast.Attribute) and f.attr in _MUTATORS:
+                r = _root(f.value)
+                if isinstance(r, ast.Name) and is_shared(r.id):
+                    return f"{f.attr}() on {r.id}"
+        for t in targets:
+            why = target_shared(t)
+            if why:
+                return why
+    return None
+
+
+def stage_guard(root: str, jobs) -> str | None:
+    """None when every changed function (old and new version) of the jobs passes
+    _writes_shared, else the reason (→ no checkpoint shortcut for this commit)."""
+    for path, new_text, _ in jobs:
+        with open(os.path.join(root, path), encoding="utf-8") as fh:
+            old_text = fh.read()
+        old_defs, new_defs = _defs(ast.parse(old_text)), _defs(ast.parse(new_text))
+        for k in set(old_defs) | set(new_defs):
+            o, n = old_defs.get(k), new_defs.get(k)
+            if o is not None and n is not None and ast.dump(o[0]) == ast.dump(n[0]):
+                continue
+            for d in (o, n):
+                if d is None:
+                    continue
+                # Dialect instances are cached and shared; parser / generator / tokenizer /
+                # scope / schema objects are made per call
+                why = _writes_shared(d[1], path.startswith("sqlglot/dialects/") or "Dialect" in k[0])
+                if why:
+                    return f"{k[0]}: {why}"
+    return None
 
 
 class SubTest:
@@ -744,7 +995,8 @@ class SubTest:
                         return None
                     x = (suite, i, kind == "optimized", "full", False, False, False, 0)
                     win = ph.get("win")
-                    if STAGE and kind == "execute" and q["execute"] and win and q["outs"].get("d_opt"):
+                    if (STAGE and getattr(self, "stage_ok", False) and kind == "execute"
+                            and q["execute"] and win and q["outs"].get("d_opt")):
                         wl = {}
                         for w in win.values():
                             for f, ls in w.items():
@@ -773,6 +1025,7 @@ class SubTest:
         meta = self.meta()
         root = str(self.sel.sqlglot)
         _warm(root)
+        _warm_code(root, jobs)
         rfd, wfd = os.pipe()
         t0 = os.times()
         pid = os.fork()
@@ -822,6 +1075,15 @@ class SubTest:
         cands = candidates & set(self.numbers)
         if not cands or not spans:
             return set(), ""
+        self.stage_ok, self.stage_why = False, "off"
+        if STAGE:
+            try:
+                why = (None if os.environ.get("BR_SUBTEST_GUARD") == "0"  # experiments only
+                       else stage_guard(str(self.sel.sqlglot), jobs))
+            except Exception as e:  # noqa: BLE001
+                why = type(e).__name__
+            self.stage_ok = why is None
+            self.stage_why = why
         try:
             got = self.plan(spans, cands)
         except Exception as e:  # noqa: BLE001
@@ -841,7 +1103,7 @@ class SubTest:
                 chosen, est = trial, est + c
                 todo.extend(qs)
         if not chosen:
-            return set(), f"subtest: keep (est {cpu:.1f}s CPU for {sum(map(len, per.values()))} queries)"
+            return set(), f"subtest: keep (est {cpu:.1f}s CPU for {sum(map(len, per.values()))} queries{"" if getattr(self, "stage_ok", True) else "; no stage: " + str(self.stage_why)})"
         if not todo:
             return chosen, f"subtest: {sorted(chosen)} dropped (no query runs a touched statement)"
         try:
@@ -865,19 +1127,28 @@ class SubTest:
         return q["cpu_opt"] if opt else q["cpu_exec"]
 
 
+def _warm_code(root: str, jobs) -> None:
+    """Compile the jobs' pinned and patched files in the parent, once per commit for all the
+    forked verifiers (diffexec replay, subtest, slowverify): see diffexec/replay.py."""
+    try:
+        from diffexec.replay import warm_files
+        warm_files(root, [(path, new_text) for path, new_text, _ in jobs])
+    except Exception:  # noqa: BLE001  (the child compiles them itself)
+        pass
+
+
 def _swap(root: str, jobs) -> str | None:
     """Swap the changed functions' code (as diffexec/replay.py). → bail reason or None."""
     import functools
     import importlib
     import types
     from diffexec import serial
-    from diffexec.replay import _walk
+    from diffexec.replay import _new_code, _old_code, _walk
     swaps = {}
     for path, new_text, _ in jobs:
         filename = os.path.join(root, path)
-        with open(filename, "rb") as fh:
-            old_top = compile(fh.read(), filename, "exec", dont_inherit=True)
-        new_top = compile(new_text.encode(), filename, "exec", dont_inherit=True)
+        old_top = _old_code(filename)  # compiled in the parent before the fork (warm_files)
+        new_top = _new_code(filename, new_text)
         old_codes, new_codes = _walk(old_top), _walk(new_top)
         if old_codes.keys() != new_codes.keys():
             return "functions added / removed"

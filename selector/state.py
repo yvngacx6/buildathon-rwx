@@ -559,7 +559,8 @@ def diff(root: Path, old: Path, patched: dict[str, str]) -> dict | None:
 
 
 _RUN = (f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r}); "
-        "from selector.state import _main; _main(sys.argv[1:])")
+        "from selector.state import _main; _main(sys.argv[1:]); "
+        "sys.stdout.flush(); import os; os._exit(0)")  # skip the teardown of the imported package
 
 
 def _run(args: list[str], stdin: str | None) -> str | None:
