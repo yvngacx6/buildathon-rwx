@@ -134,6 +134,12 @@ DEFINITION_TIME_NAMES = frozenset({"__slots__", "__init_subclass__", "__class_ge
 # Python except by the same metaclass building a subclass.
 TYPEDDICT_KEYS = frozenset({"__total__", "__required_keys__", "__optional_keys__",
                             "__readonly_keys__", "__mutable_keys__"})
+# moon-19 `_never_called`: Python calls these outside a test's traced window (finalizers)
+IMPLICIT_CALLS = frozenset({"__del__"})
+PLAIN_DECORATORS = frozenset({"staticmethod", "classmethod", "property"})
+# names whose use can observe a function's code without calling it
+CODE_INTROSPECTION = ("__code__", "__closure__", "co_code", "co_consts", "getsource",
+                      "getsourcelines", "getclosurevars", "findsource", "dis")
 MAX_HOLDER_ENTRIES = 200  # more entries hold import-time objects of a class: do not restrict
 # Class hierarchies the classes map records (maps/MANIFEST.json notes): a test that made an
 # instance of one of these classes (or used it as a dialect) is credited to it and its bases.
@@ -197,6 +203,8 @@ class Selector:
         self._chains: dict[str, list] = {}
         self._defaults: dict[str, list] = {}
         self._no_default_readers: bool | None = None
+        self._code_reader_tests: tuple = ()  # `_code_readers` memo: (tests or None,)
+        self._attr_meta: tuple | None = None  # `_attr_readers`: (tracked, untracked, always)
         self._families: dict[tuple, list] = {}  # `_related`: owner class → its family
         self._ancestor_memo: dict[tuple, set | None] = {}
         self._test_imports = None  # testimport.Checker, on first use
@@ -787,6 +795,13 @@ class Selector:
                     # Never ran under a test, and its runs at import built the same state.
                     kinds.append(f"unrun def {'.'.join(r.chain) or '<lambda>'}, runs at import:"
                                  " import state unchanged")
+                elif not got and (unrun := self._never_called(path, r, old_tree, new_tree)) is not None:
+                    # moon-19: a body no test ran and no import runs; only code that reads
+                    # function code objects (unrun[0]) can tell the edit apart
+                    got = unrun[0]
+                    fixed |= got
+                    kinds.append(f"unrun def {'.'.join(r.chain) or '<lambda>'}: never called"
+                                 f" ({unrun[1]})")
                 elif not got:
                     # Never ran under a test: may run only at import or class creation.
                     # Treat it as a change to the scope that defines it.
@@ -985,6 +1000,73 @@ class Selector:
             whys.append(f"{f.name}({param})")
         return out, (f"module {module}: {', '.join(sorted(changed))} read only as the default of "
                      f"{', '.join(whys)} → {len(out)} via default-observing calls")
+
+    def _never_called(self, path: str, r: classify.Region, old_tree: ast.Module | None = None,
+                      new_tree: ast.Module | None = None) -> tuple[set[int], str] | None:
+        """moon-19. A body-only edit of a def (plain: no decorator but staticmethod /
+        classmethod / property) or of a lambda whose call lines exclude its creation line,
+        where no test ran a line of the body (lines map) and no module import runs one
+        (import-time map): the new code object is only ever bound, never executed, so a test
+        can observe the edit only by reading the code object itself (`f.__code__`,
+        inspect.getsource, ...): the tests that ran a line naming such an API
+        (`_code_readers`). None: not provable (the caller keeps the definition-time rule)."""
+        if r.signature or r.is_lambda or r.kind != "function":
+            return None
+        first, last = r.span
+        if self.maps.span(path, first, last) or self.maps.import_time.modules(path, first, last):
+            return None
+        scopes = self._old_scopes(path)
+        s = scopes.by_chain.get(r.chain) if r.chain else None
+        if s is not None and s.kind == "def" and s.body_start == first and s.end == last:
+            node = s.node
+            if node.name in IMPLICIT_CALLS:
+                return None
+            if any(not (isinstance(d, ast.Name) and d.id in PLAIN_DECORATORS)
+                   for d in node.decorator_list):
+                return None
+            what = "def"
+        else:
+            lams = [x for x in scopes.scopes if x.kind == "lambda"
+                    and classify.lambda_call_lines(x.node) == (first, last)]
+            if len(lams) != 1 or lams[0].node.lineno >= first:
+                return None
+            if old_tree is not None:
+                # the edit must stay in lambda bodies: parameters and defaults (evaluated at
+                # creation, at import) identical, lambda by lambda (None: body-only already)
+                def heads(tree):
+                    return [ast.dump(x.args) for x in ast.walk(tree) if isinstance(x, ast.Lambda)]
+                if new_tree is None or heads(old_tree) != heads(new_tree):
+                    return None
+            what = "lambda body"
+        readers = self._code_readers()
+        if readers is None:
+            return None
+        loaders = self.maps.loaders(path)  # a code object is reachable only once loaded
+        if loaders is not None:
+            readers &= loaders
+        return readers, f"{what} never ran under a test nor at import"
+
+    def _code_readers(self) -> set[int] | None:
+        """Tests that ran a line naming a code-object / source introspection API; None when
+        sqlglot/ names one at import (its product could be any import-time value)."""
+        if not self._code_reader_tests:
+            index = self._index()
+            got: set[int] | None = set()
+            for name in CODE_INTROSPECTION:
+                for site in index.mentions(name):
+                    if site.when == "run":
+                        got |= self.maps.span(site.path, *site.lines)
+                    elif site.path.startswith("tests/"):
+                        got |= self._by_file.get(site.path, set()) | set(
+                            self.maps.test_imports.get(site.path))
+                    else:
+                        got = None
+                        break
+                if got is None:
+                    break
+            self._code_reader_tests = (got,)
+        found = self._code_reader_tests[0]
+        return set(found) if found is not None else None
 
     def _defaults_unread(self) -> bool:
         """No code in sqlglot/ or tests/ reads a function's defaults (`__defaults__`,
@@ -1216,7 +1298,11 @@ class Selector:
                 raise names.Fallback(f"lambda at line {first} is called at import")
             got = self.maps.span(path, first, last)
             if not got:
-                raise names.Fallback(f"lambda at line {first} never ran under a test")
+                # moon-19: never called under a test nor at import → only code readers
+                unrun = self._never_called(path, classify.Region("function", (), (first, last)))
+                if unrun is None:
+                    raise names.Fallback(f"lambda at line {first} never ran under a test")
+                got = unrun[0]
             direct |= got
         readers: set[int] = set()
         in_tests: set[int] = set()
@@ -1391,7 +1477,8 @@ class Selector:
         free: set[int] = set()  # readers of module globals
         loose: set[int] = set()  # class-attribute readers restricted only by `touch`
         typed: set[int] = set()  # tests that name a TypedDict whose key sets changed
-        untyped = False  # some changed value is not a TypedDict key set
+        untyped = False  # some changed value is not a TypedDict key set (nor attrs-vouched)
+        vouched: set[str] = set()  # changed keys whose every lookup the attrs map recorded
         held: set[int] = set()  # class-attribute readers among tests that can hold the class
         in_tests: set[int] = set()
         n_sites = 0
@@ -1420,7 +1507,13 @@ class Selector:
                 continue
             if attr.startswith("__") and attr.endswith("__"):
                 raise names.Fallback(f"{owner}.{attr} is a special name")
-            untyped = True
+            # moon-19: tests that looked `attr` up through the owner's family (attrs map);
+            # not None: every lookup is accounted for, so no reader at all is a valid answer
+            looked = self._attr_readers(owner, attr, info) if kind == "C" else None
+            if looked is None:
+                untyped = True
+            else:
+                vouched.add(f"{kind} {owner} {attr}")
             if kind == "M":
                 owner_path = self._module_path(owner)
                 if owner_path is None:
@@ -1450,6 +1543,12 @@ class Selector:
                     elif kind == "M":
                         free |= got
                         key_free |= got
+                    elif bucket == "held" and looked is not None:
+                        # a static / getattr read goes through the attribute lookup the
+                        # attrs map recorded: only tests that made that lookup can see it
+                        hit = got & looked if users is None else got & users & looked
+                        held |= hit
+                        key_touched |= hit
                     elif users is None or bucket == "loose":
                         loose |= got
                         key_touched |= got
@@ -1462,7 +1561,8 @@ class Selector:
         got |= typed
         # changed values no test is seen reading (a reader the index is blind to, or none):
         # callers of `_state_readers(…, allow_empty)` let the lines' run-time callers stand in
-        self._state_unread = [k for k, f, t in per_key if not f and not t & touch]
+        self._state_unread = [k for k, f, t in per_key
+                              if not f and not t & touch and k not in vouched]
         if not got and not allow_empty and untyped:
             raise names.Fallback("no test ran a line reading a changed value")
         shown = sorted({f"{o.rsplit(':', 1)[-1]}.{a}" for _, o, a in changed})
@@ -1470,6 +1570,42 @@ class Selector:
         return got, (f"state: {', '.join(shown[:6])}{more} → {n_sites} reader sites "
                      f"(globals {len(free)}, unrestricted {len(loose & touch)}, "
                      f"held {len(held)}, tests {len(in_tests)})")
+
+    def _attr_readers(self, owner: str, attr: str, info: dict) -> set[int] | None:
+        """moon-19. Tests that looked `attr` up (x.attr, cls.attr, getattr, hasattr, super())
+        through `owner` or a subclass of it while they ran, from the attrs map
+        (mapbuild/trace_attrs.py: every plain class entry of every sqlglot class was a
+        recording descriptor). Valid only when, at the pinned commit, the lookup through
+        `owner` resolves to such a recorded entry: walking owner's MRO (state info), the first
+        class defining `attr` must have it tracked; a class the tracer never walked, an
+        import-made (`#`) class, an untracked definition (function, class, descriptor) or no
+        definition at all (a new name: getattr defaults) → None (no restriction).
+        Tests the map does not vouch for (untraced, rebound a tracked entry, failed under
+        the tracer) are always included."""
+        amap = self.maps.attrs
+        if amap is None or owner.endswith("#") or ":" not in owner:
+            return None
+        if self._attr_meta is None:
+            extra = amap.extra
+            number_of = self.maps._number_of
+            traced = {number_of[t] for t in amap.traced_ids() if t in number_of}
+            always = (self.all_numbers() - traced) | set(
+                amap._translate(extra.get("replaced", []) + extra.get("failed", [])))
+            self._attr_meta = ({k: frozenset(v) for k, v in extra["tracked"].items()},
+                               {k: frozenset(v) for k, v in extra["untracked"].items()},
+                               always)
+        tracked, untracked, always = self._attr_meta
+        chain = [owner] + [k for k in (info.get(owner) or {}).get("mro", []) if k]
+        for k in chain:
+            if k.endswith("#") or k not in tracked:
+                return None
+            if attr in tracked[k]:
+                break
+            if attr in untracked.get(k, ()):
+                return None
+        else:
+            return None
+        return set(amap.get(f"{owner} {attr}")) | always
 
     def _site_reads(self, index: nameindex.NameIndex, site: names.Site, attr: str,
                     depth: int = 0, same: frozenset[str] = frozenset()

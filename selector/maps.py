@@ -205,6 +205,9 @@ class Maps:
         self.import_time = ImportTimeMap(directory / "import_time.json.gz",
                                          compiled and compiled / "import_time")
         self.imports = open_map("imports")
+        # moon-19 attrs: class-attribute lookups per test (mapbuild/trace_attrs.py); optional
+        self.attrs = (Map(directory / "attrs.json.gz", number_of, None)
+                      if (directory / "attrs.json.gz").is_file() else None)
         self._unvouched: frozenset[int] | None = None
         self._file_cache: dict[str, frozenset[int]] = {}
 
