@@ -247,10 +247,6 @@ def rule_steps(expr, schema_, cov_factory=None, keep=False, timer=False):
     return covs, cks, digs, strict_digest(opt), cpu
 
 
-def _ck_new(cls):
-    return object.__new__(cls)
-
-
 _SLOTS: dict = {}
 
 
@@ -258,6 +254,7 @@ def ck_dumps(tree) -> bytes:
     """Lossless pickle of an expression tree: every slot / __dict__ attribute of every node as
     is (args with None values, parent links, _type, _meta, _hash, sharing), bypassing Expr's
     serde-based __reduce__ (which drops None-valued args). Loading runs no sqlglot code."""
+    import copyreg
     from sqlglot.expressions import Expr
 
     class P(pickle.Pickler):
@@ -271,7 +268,8 @@ def ck_dumps(tree) -> bytes:
                     n for c in cls.__mro__ for n in c.__dict__.get("__slots__", ())
                     if n not in ("__dict__", "__weakref__")))
             st = {n: getattr(obj, n) for n in slots if hasattr(obj, n)}
-            return _ck_new, (cls,), (getattr(obj, "__dict__", None) or None, st)
+            # copyreg.__newobj__ → NEWOBJ (cls.__new__(cls)): no reference to this module
+            return copyreg.__newobj__, (cls,), (getattr(obj, "__dict__", None) or None, st)
 
     buf = io.BytesIO()
     P(buf, protocol=pickle.HIGHEST_PROTOCOL).dump(tree)
@@ -992,6 +990,9 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
                         full.append((suite, i, opt))  # optimized tree differs: run it all
                         continue
             except Exception:  # noqa: BLE001
+                if os.environ.get("SUBTEST_DEBUG"):
+                    import traceback
+                    traceback.print_exc(file=sys.__stderr__)
                 return False
     tables: dict = {}
     with zipfile.ZipFile(store) as zf:
