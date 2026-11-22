@@ -945,7 +945,13 @@ class Selector:
         self._direct = change.names  # for `_state_floor`, if this falls back later
         self._inert = change  # for `_by_state`: plain assignments of inert values
         direct: set[int] = set()
-        for first, last in change.lambda_spans:  # a lambda body only runs when called
+        for (first, last), line in zip(change.lambda_spans, change.lambda_lines):
+            # a lambda body only runs when called; its own line also runs when it is created
+            if self.maps.import_time.modules(path, first + (first == line), last, line):
+                # called while modules are imported (Parser table lambdas parsing the duckdb
+                # templates at import, test modules parsing at collection): what it built
+                # then outlives the call; the lines map sees only test-time calls (moon-18)
+                raise names.Fallback(f"lambda at line {first} is called at import")
             got = self.maps.span(path, first, last)
             if not got:
                 raise names.Fallback(f"lambda at line {first} never ran under a test")

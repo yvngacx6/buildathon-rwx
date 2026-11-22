@@ -210,6 +210,17 @@ def test_lambda_in_table_uses_the_call_lines(selector):
     assert run(selector, D, "            args,", "            args[1:],") == {LAM}
 
 
+def test_lambda_in_table_called_at_import_falls_back(selector):
+    # moon-18: a table lambda called while modules import (Parser lambdas parsing the duckdb
+    # templates) built state the lines map never credits to a test: no lambda narrowing.
+    line = FILES[D].splitlines().index('        "A": lambda args: make(') + 1
+    real = selector.maps.import_time.modules
+    selector.maps.import_time.modules = lambda path, first, last, start=None: (
+        {"sqlglot.other"} if path == D and start == line else real(path, first, last, start))
+    got = run(selector, D, "            args,", "            args[1:],")
+    assert LAM in got and got != {LAM}
+
+
 def test_unread_name_falls_back(selector):
     assert run(selector, D, "UNREAD = 3", "UNREAD = 4") == CONSERVATIVE_TSQL
 
