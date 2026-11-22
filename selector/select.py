@@ -668,6 +668,11 @@ class Selector:
         fixed = set(chosen)  # tests diffexec may never drop (readers, definition-time users ...)
         prunable: set[int] = set()
         kinds = []
+        if new_text and found and all(r.kind == "module" for r in found):
+            hit = self._constant_defaults(path, old_tree, new_tree)
+            if hit is not None:
+                self._mixed_py = True
+                return chosen | hit[0], hit[1]
         # Every change in the file is a literal default value of a def (`depth: int = 0` →
         # `= 1`): diffexec replays the old code with the new default where a recorded call
         # may have used it (diffexec/replay.py "defaults").
@@ -675,6 +680,7 @@ class Selector:
                     if new_text and any(r.kind == "function" and r.signature for r in found)
                     and self._defaults_unread() else None)
         for r in found:
+            quiet = False  # R-DEF: the edited defaults cannot be observed at import
             if r.kind == "function":
                 self._spans.setdefault(path, []).extend(
                     r.statements if r.statements is not None else [r.span])
@@ -690,11 +696,19 @@ class Selector:
                 else:
                     self._mixed_py = True
                 if r.signature and path in self._defaults:
-                    # literal defaults only: calls are what can observe them (prunable);
-                    # the class users stay as for any signature edit
-                    users = self._class_users(module, r.classes) - got
-                    got |= users
-                    fixed |= users
+                    # literal defaults only (nothing reads `__defaults__`): only a call that
+                    # leaves the parameter out can observe the new value, and every call runs
+                    # the body, so the tests that ran the function bound it (no class users);
+                    # narrower: the tests that ran such a call site (R-DEF, report 16)
+                    seen = self._default_observers(path, old_tree, new_tree, r, defaults)
+                    if seen is not None:
+                        prunable -= got - seen  # (added above, before the narrowing)
+                        got &= seen
+                        # no default-observing call runs at import: every import-time run
+                        # of the def passed the parameters, so it built what it built before
+                        quiet = not self._observed_at_import
+                        kinds.append(f"(default: {len(got)} via default-observing calls"
+                                     + (", none at import)" if quiet else ")"))
                 elif r.signature:
                     got |= self._class_users(module, r.classes)
                     fixed |= got
@@ -734,9 +748,10 @@ class Selector:
                 own = (None if r.signature or r.is_lambda or not r.chain or not plain
                        else f"M {module} {r.chain[0]}" if len(r.chain) == 1
                        else f"C {module}:{'.'.join(r.chain[:-1])} {r.chain[-1]}")
-                at_import, same_state = self._function_at_import(path, first + r.is_lambda, last,
-                                                                 chosen | got, slack, own,
-                                                                 first if r.is_lambda else None)
+                at_import, same_state = (
+                    (set(), True) if quiet else
+                    self._function_at_import(path, first + r.is_lambda, last, chosen | got,
+                                             slack, own, first if r.is_lambda else None))
                 if not got and same_state in ("readers", "readers-unseen"):
                     # Never ran under a test; what its runs at import built differently is
                     # read only by the tests in at_import.
@@ -783,6 +798,166 @@ class Selector:
             self._jobs.append((path, self._source(path) if path in self._defaults else new_text,
                                prunable - fixed))
         return chosen, ", ".join(kinds)
+
+    def _default_observers(self, path: str, old_tree: ast.Module, new_tree: ast.Module,
+                           r: classify.Region, defaults: list) -> set[int] | None:
+        """R-DEF: the tests that ran a call site that can leave an edited default parameter of
+        r's def unpassed (any call whose callee is named like the def, over sqlglot/ and
+        tests/: a superset of its real calls), or None (→ every test that ran the function)
+        when the def can be reached other than through such a call: a dunder (constructors,
+        operators), any other load of the name (bound method handed on, stored in a table,
+        `partial`, an import alias), a string of the name or a getattr pattern matching it
+        (dynamic dispatch, `*_sql`), a call at definition time (its import-time effect is the
+        import-state diff's), or a file that does not parse.
+
+        A call "supplies" a parameter by keyword, or positionally when it passes at least
+        index + 1 positional arguments counting `self` (exact for plain functions,
+        conservative for bound methods); `*args` / `**kwargs` never supply one. A call site's
+        own lines (not its statement's): whenever the call runs, one of them executes, also
+        when it sits in a lambda of a class-body table."""
+        name = r.chain[-1] if r.chain and not r.is_lambda else None
+        if name is None or name.startswith("__"):
+            return None
+        params = {p for n, _, ps in defaults if n == name for p in ps}
+        defs = _edited_defs(old_tree, new_tree, r)
+        index = self._index()
+        if not params or not defs or index is None:
+            return None
+        a = defs[0].args
+        positional = [x.arg for x in a.posonlyargs + a.args]
+        slots = {p: (positional.index(p) if p in positional else None) for p in params}
+        return self._observing_calls(path, name, slots, len(r.chain) > 1)
+
+    def _observing_calls(self, path: str, name: str, slots: dict[str, int | None],
+                         method: bool) -> set[int] | None:
+        """The tests that ran a call of `name` that can leave a `slots` parameter unpassed
+        (see `_default_observers`), or None when the name can be reached otherwise."""
+        index = self._index()
+        self._observed_at_import = True
+        if index is None:
+            return None
+        if any(alias != name for _, alias in index.data["imports"].get(name, ())):
+            return None
+        module = _module_of(path)
+        out: set[int] = set()
+        at_import = False  # a default-observing call site runs while some module is imported
+        for site, allowed, names_only, on_module in index.data["dynamic"]:
+            if names_only:
+                continue  # dir(): names, not values
+            if on_module is not None and (method
+                                          or not re.fullmatch(on_module, module, re.S)):
+                continue  # getattr on modules: reaches module-level defs only
+            if on_module is None and not method:
+                # getattr on objects / classes: a module-level def gets onto one only through
+                # a load of its name, and every load is a call (checked below)
+                continue
+            if allowed is not None and not re.fullmatch(allowed, name, re.S):
+                continue
+            if allowed is not None or site.when != "run":
+                return None  # dispatch that can name this def (`*_sql` tables), or at import
+            # an any-name getattr run inside a def: whatever it calls, it calls there
+            out |= self.maps.span(site.path, *site.lines)
+            at_import |= bool(self.maps.import_time.modules(site.path, *site.lines))
+        for src in sorted({o[0] for o in index._occurrences(name)}):
+            if any(o[1] == "str" for o in index._occurrences(name) if o[0] == src):
+                return None
+            text = self._source(src)
+            try:
+                tree = ast.parse(text) if text is not None else None
+            except SyntaxError:
+                tree = None
+            if tree is None:
+                return None
+            got = _default_call_sites(tree, name, slots)
+            if got is None:
+                return None
+            for first, last in got:
+                out |= self.maps.span(src, first, last)
+                at_import |= bool(self.maps.import_time.modules(src, first, last))
+        self._observed_at_import = at_import
+        return out
+
+    def _constant_defaults(self, path: str, old_tree: ast.Module,
+                           new_tree: ast.Module) -> tuple[set[int], str] | None:
+        """R-DEF for a module constant read only as a default value (`LIMIT = 100` …
+        `def f(x, n=LIMIT)`): the edit is then the same as editing those defaults, so the
+        tests that ran a call leaving them unpassed (`_observing_calls`) ∩ the tests that ran
+        the def. None (→ the usual module-body rules) unless every changed statement is
+        `NAME = literal`, every load of NAME is a default of a def in this file (no import of
+        it elsewhere, no string, no star import, no module getattr that can reach it), no
+        such def runs at import, and nothing reads `__defaults__`."""
+        if len(old_tree.body) != len(new_tree.body) or not self._defaults_unread():
+            return None
+        changed = set()
+        for o, n in zip(old_tree.body, new_tree.body):
+            if ast.dump(o) == ast.dump(n):
+                continue
+            if not (isinstance(o, ast.Assign) and isinstance(n, ast.Assign)
+                    and len(o.targets) == len(n.targets) == 1
+                    and isinstance(o.targets[0], ast.Name)
+                    and ast.dump(o.targets[0]) == ast.dump(n.targets[0])
+                    and _literal(o.value)[0] and _literal(n.value)[0]):
+                return None
+            changed.add(o.targets[0].id)
+        index = self._index()
+        if not changed or index is None:
+            return None
+        module = _module_of(path)
+        leaf = module.rsplit(".", 1)[-1]
+        if any(m.endswith(leaf) for _, m in index.data["stars"]):
+            return None
+        readers: set[int] = set()
+        for site, allowed, names_only, on_module in index.data["dynamic"]:
+            if on_module is not None and re.fullmatch(on_module, module, re.S) and (
+                    allowed is None or any(re.fullmatch(allowed, c, re.S) for c in changed)):
+                if names_only:
+                    continue  # dir(): which names exist, not their values
+                if site.when != "run":
+                    return None  # getattr(module, name) at import
+                # getattr(module, computed name) in a def: the value is read on that line
+                readers |= self.maps.span(site.path, *site.lines)
+        for name in changed:
+            if index.data["imports"].get(name) or any(
+                    o[0] != path or o[1] != "name" for o in index._occurrences(name)):
+                return None
+        # every load of a changed name must be a def's default: (def, param, slot, method)
+        defaults_at: dict[int, tuple] = {}
+        for node, method in _defs_with_owner(old_tree):
+            a = node.args
+            positional = a.posonlyargs + a.args
+            for i, d in enumerate(a.defaults):
+                p = positional[len(positional) - len(a.defaults) + i]
+                defaults_at[id(d)] = (node, p.arg, positional.index(p), method)
+            for p, d in zip(a.kwonlyargs, a.kw_defaults):
+                if d is not None:
+                    defaults_at[id(d)] = (node, p.arg, None, method)
+        targets = {id(s.targets[0]) for s in old_tree.body if isinstance(s, ast.Assign)}
+        uses = []
+        for node in ast.walk(old_tree):
+            if isinstance(node, ast.Name) and node.id in changed:
+                if id(node) in targets:
+                    continue
+                if id(node) not in defaults_at:
+                    return None
+                uses.append(defaults_at[id(node)])
+            elif isinstance(node, (ast.Global, ast.Nonlocal)) and set(node.names) & changed:
+                return None
+        if not uses:
+            return None
+        out: set[int] = set(readers)
+        whys = []
+        for f, param, slot, method in uses:
+            if f.name.startswith("__") or self.maps.import_time.modules(
+                    path, f.body[0].lineno, f.end_lineno):
+                return None
+            seen = self._observing_calls(path, f.name, {param: slot}, method)
+            if seen is None:
+                return None
+            ran = self.maps.span(path, f.body[0].lineno, f.end_lineno)
+            out |= seen & ran
+            whys.append(f"{f.name}({param})")
+        return out, (f"module {module}: {', '.join(sorted(changed))} read only as the default of "
+                     f"{', '.join(whys)} → {len(out)} via default-observing calls")
 
     def _defaults_unread(self) -> bool:
         """No code in sqlglot/ or tests/ reads a function's defaults (`__defaults__`,
@@ -1963,6 +2138,63 @@ def _literal(node: ast.AST | None):
             return False, None
         return True, v
     return False, None
+
+
+def _defs_with_owner(tree: ast.Module):
+    """(def node, is a method) for every def at module level or anywhere in a class body."""
+    for s in tree.body:
+        if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield s, False
+        elif isinstance(s, ast.ClassDef):
+            for c in ast.walk(s):
+                if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    yield c, True
+
+
+def _default_call_sites(tree: ast.Module, name: str,
+                        slots: dict[str, int | None]) -> list[tuple[int, int]] | None:
+    """The line spans of the calls of `name` (`x.name(...)` / `name(...)`) in tree that can
+    leave one of `slots`' parameters unpassed, or None if the name is loaded otherwise (handed
+    on, stored, aliased) or called while a module / class body runs (definition time)."""
+    out: list[tuple[int, int]] = []
+    callees: set[int] = set()
+
+    def supplies(call: ast.Call, param: str, slot: int | None) -> bool:
+        if any(k.arg is None for k in call.keywords) or any(
+                isinstance(x, ast.Starred) for x in call.args):
+            return False
+        if any(k.arg == param for k in call.keywords):
+            return True
+        return slot is not None and len(call.args) >= slot + 1
+
+    def named(node: ast.AST) -> bool:
+        return (isinstance(node, ast.Attribute) and node.attr == name
+                or isinstance(node, ast.Name) and node.id == name)
+
+    def visit(node: ast.AST, run: bool) -> bool:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            a = node.args
+            heads = list(a.defaults) + [d for d in a.kw_defaults if d is not None]
+            if not isinstance(node, ast.Lambda):
+                heads += node.decorator_list + ([node.returns] if node.returns else [])
+            if not all(visit(h, run) for h in heads):
+                return False
+            body = [node.body] if isinstance(node, ast.Lambda) else node.body
+            return all(visit(b, True) for b in body)
+        if isinstance(node, ast.Call) and named(node.func):
+            if not run:
+                return False
+            callees.add(id(node.func))
+            if not all(supplies(node, p, s) for p, s in slots.items()):
+                out.append((node.lineno, node.end_lineno or node.lineno))
+        elif named(node) and id(node) not in callees:
+            return False  # any other load / store of the name
+        elif isinstance(node, ast.alias) and name in (node.name.rsplit(".", 1)[-1], node.asname):
+            if node.asname not in (None, name):
+                return False
+        return all(visit(c, run) for c in ast.iter_child_nodes(node))
+
+    return out if visit(tree, False) else None
 
 
 def _default_changes(old_tree: ast.Module, new_tree: ast.Module) -> list | None:

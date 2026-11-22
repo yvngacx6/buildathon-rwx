@@ -658,3 +658,43 @@ def test_degrade_makes_commits_that_need_the_state_diff_all(selector):
     assert run(selector, text) == ALL
     # edits that need no run-time verification are unchanged
     assert run(selector, edit("sqlglot/lib.py", "LIMIT = 10\n", "LIMIT = 10  # cap\n")) == set()
+
+
+# ── R28 R-DEF: calls that can leave an edited default unpassed ──────────────────────────
+
+def _sites(src, name="f", slots=None):
+    import ast as _ast
+    from selector.select import _default_call_sites
+    return _default_call_sites(_ast.parse(src), name, slots if slots is not None else {"p": 1})
+
+
+def test_rdef_call_that_passes_the_parameter_is_not_a_site():
+    src = "def g(x):\n    f(x, 1)\n    f(x, p=2)\n    return f(\n        x)\n"
+    assert _sites(src) == [(4, 5)]
+
+
+def test_rdef_star_args_and_kwargs_count_as_omitting():
+    assert _sites("def g(a, k):\n    f(*a)\n    f(1, **k)\n") == [(2, 2), (3, 3)]
+
+
+def test_rdef_method_slot_counts_self_conservatively():
+    # def f(self, x, p=True): a bound call passing 2 positionals may or may not reach p
+    src = "def g(o):\n    o.f(1, 2)\n    o.f(1, 2, 3)\n"
+    assert _sites(src, slots={"p": 2}) == [(2, 2)]
+
+
+def test_rdef_keyword_only_parameter_needs_the_keyword():
+    assert _sites("def g():\n    f(1, 2, 3)\n    f(p=1)\n", slots={"p": None}) == [(2, 2)]
+
+
+def test_rdef_any_other_load_or_alias_falls_back():
+    assert _sites("def g(o):\n    h(o.f)\n") is None
+    assert _sites("X = {1: f}\n") is None
+    assert _sites("from m import f as g2\n") is None
+    assert _sites("from m import f\n") == []
+
+
+def test_rdef_definition_time_call_falls_back_but_lambda_body_is_run_time():
+    assert _sites("class C:\n    X = f(1)\n") is None
+    assert _sites("class C:\n    X = {1: lambda self: self.f(2)}\n") == [(2, 2)]
+    assert _sites("def g(x=f()):\n    pass\n") is None
