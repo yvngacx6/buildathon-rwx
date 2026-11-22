@@ -425,9 +425,10 @@ def test_run_time_read_spans_are_the_node_lines():
     assert spans[("Constant", "A")] == (6, 12)  # a constant may be folded: statement lines
     space: dict = {}
     exec(compile(source, "a.py", "exec"), space)
-    mon, tool = sys.monitoring, 4
+    mon = sys.monitoring
     for c, ran, not_ran in ((True, 8, 10), (False, 10, 8)):
         seen: set[int] = set()
+        tool = next(i for i in range(5, -1, -1) if mon.get_tool(i) is None)
         mon.use_tool_id(tool, "r36-test")
         try:
             mon.register_callback(
