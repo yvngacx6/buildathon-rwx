@@ -703,3 +703,29 @@ def test_rdef_definition_time_call_falls_back_but_lambda_body_is_run_time():
     assert _sites("class C:\n    X = f(1)\n") is None
     assert _sites("class C:\n    X = {1: lambda self: self.f(2)}\n") == [(2, 2)]
     assert _sites("def g(x=f()):\n    pass\n") is None
+
+
+# ── R33: verified-inert any-name dynamic sites ──────────────────────────────────────────
+
+def test_r33_inert_dynamic_sites_need_the_verified_text_and_an_unedited_file(tmp_path):
+    from selector.select import _INERT_DYNAMIC, Selector as _S
+    from selector.names import Site
+
+    root = tmp_path / "sg"
+    (root / "sqlglot" / "executor").mkdir(parents=True)
+    lines = ["x"] * 282 + ['    "EXTRACT": null_if_any(lambda this, e: getattr(e, this)),']
+    (root / "sqlglot" / "executor" / "env.py").write_text("\n".join(lines) + "\n")
+    sel = _S.__new__(_S)
+    sel.sqlglot, sel._sources, sel._some_sources, sel._files = root, None, {}, []
+    site = Site("sqlglot/executor/env.py", (283, 283), "run")
+    assert ("sqlglot/executor/env.py", (283, 283)) in _INERT_DYNAMIC
+    assert sel._inert_dynamic(site)
+
+    class _FP:
+        path = "sqlglot/executor/env.py"
+    sel._files = [_FP()]
+    assert not sel._inert_dynamic(site)  # the commit edits the file: no longer verified
+    sel._files, sel._some_sources = [], {}
+    (root / "sqlglot" / "executor" / "env.py").write_text("\n".join(lines[:-1] + ["    other"]) + "\n")
+    assert not sel._inert_dynamic(site)  # different text
+    assert not sel._inert_dynamic(Site("sqlglot/helper.py", (1, 2), "run"))

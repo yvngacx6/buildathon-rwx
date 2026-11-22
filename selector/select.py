@@ -877,6 +877,31 @@ class Selector:
         slots = {p: (positional.index(p) if p in positional else None) for p in params}
         return self._observing_calls(path, name, slots, len(r.chain) > 1)
 
+    def _inert_dynamic(self, site: names.Site) -> bool:
+        """An any-name dynamic site of the pinned source that can never hand back a method or
+        call one (R33, report 16), so it cannot observe an edited default. Every call of a def
+        is either a named call (`_default_call_sites`) or a call of a value that a load of its
+        name (→ no R-DEF) or a dynamic fetch produced; these two fetches produce no method:
+
+          sqlglot/helper.py:151 `subclasses`: `inspect.getmembers(sys.modules[m], pred)` reads
+            the attributes of a MODULE (methods live in class namespaces; a module attribute
+            holding one needs a load of the method's name) and keeps only classes
+            (`pred` = isclass ∧ issubclass ∧ not excluded); nothing it fetches is called.
+          sqlglot/executor/env.py:283 `EXTRACT`: `lambda this, e: getattr(e, this)` returns
+            a date part of a Python value to the executor and never calls it; its line runs
+            at import only because the ENV table (and the lambda) is built there.
+
+        Applies only while the file is unedited and the lines read as verified."""
+        want = _INERT_DYNAMIC.get((site.path, tuple(site.lines)))
+        if want is None or any(fp.path == site.path for fp in self._files or ()):
+            return False
+        text = self._source(site.path)
+        if text is None:
+            return False
+        lines = text.splitlines()
+        first, last = site.lines
+        return all(w in "\n".join(lines[first - 1:last]) for w in want)
+
     def _observing_calls(self, path: str, name: str, slots: dict[str, int | None],
                          method: bool) -> set[int] | None:
         """The tests that ran a call of `name` that can leave a `slots` parameter unpassed
@@ -904,6 +929,8 @@ class Selector:
                 continue
             if allowed is not None or site.when != "run":
                 return None  # dispatch that can name this def (`*_sql` tables), or at import
+            if self._inert_dynamic(site):
+                continue  # verified: can never hand back or call a method (R33)
             # an any-name getattr run inside a def: whatever it calls, it calls there
             out |= self.maps.span(site.path, *site.lines)
             at_import |= bool(self.maps.import_time.modules(site.path, *site.lines))
@@ -2429,6 +2456,17 @@ def _defs_with_owner(tree: ast.Module):
             for c in ast.walk(s):
                 if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     yield c, True
+
+
+# R33: any-name dynamic sites verified to never hand back or call a method (see
+# Selector._inert_dynamic): (path, (first, last)) → snippets those lines must still contain.
+_INERT_DYNAMIC = {
+    ("sqlglot/helper.py", (151, 157)): (
+        "inspect.getmembers(", "sys.modules[module_name],",
+        "lambda obj: inspect.isclass(obj) and issubclass(obj, classes) and obj not in exclude"),
+    ("sqlglot/executor/env.py", (283, 283)): (
+        '"EXTRACT": null_if_any(lambda this, e: getattr(e, this)),',),
+}
 
 
 def _default_call_sites(tree: ast.Module, name: str,
