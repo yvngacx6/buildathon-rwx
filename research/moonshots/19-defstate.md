@@ -75,7 +75,14 @@ earlier test only remove reads); values derived at import are their own changed 
 test_tpcds, 27zk test_qualify_tables). Fixed by running pool work inline with pickle round-trips
 (as trace_one.py) → 0 misses. Probes: 18 one-token flag flips (bool/int/str class constants in
 dialects/parsers/generators/tokens) where B narrows (e.g. dialect.py:653 213 → 11 tests,
-parsers/oracle.py:40 125 → 0): RESULT_B.
+parsers/oracle.py:40 125 → 0): **18/18 consistent**: 15 have failing tests (1–9 each), all kept;
+the three where B selects nothing (oracle.py:40, doris.py:17, drill.py:20) break no test.
+Bypass audit: the only run-time `dir(cls)` / `inspect.getmembers` / registry uses in sqlglot read
+function names or module members (go through getattr / are not class entries); class `__dict__`
+reads are in the dialect metaclass / `__init_subclass__` (import time, covered by the diff);
+`Dialect.classes` loads every dialect first (no dependence on what a worker happened to load).
+Rule-A spans (25 distinct: labeled, P, Q, probes) are zero in `lines`, `lines_phase` and
+`lines_full` of all four coverage builds on rwx-big (mapsA, mapsC, agent-r3, main-r3).
 
 ## Porting notes
 - `maps/attrs.json.gz` must be rebuilt whenever maps are (same image, SKIP_INTEGRATION=0); add
