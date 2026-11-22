@@ -850,8 +850,9 @@ class SubTest:
             return set(), f"subtest: keep ({type(e).__name__})"
         if not ok:
             return set(), f"subtest: keep (verification of {len(todo)} queries failed, {self.last_child:.2f}s)"
+        nr = sum(1 for x in todo if x[3] == "stage" and x[5] and x[7])
         return chosen, (f"subtest: {sorted(chosen)} dropped ({len(todo)} queries re-run,"
-                        f" {self.last_child:.2f}s)")
+                        f" {self.last_child:.2f}s) [rule checkpoints {nr}, est {est:.2f}s]")
 
     def _cpu(self, x):
         suite, i, opt, mode, parse_hit, optb_hit, duck_hit, k = x
