@@ -27,7 +27,8 @@ failure, a class/module fixture error, a test id that does not resolve, a proces
 start (audit hook), a read of a patched file's on-disk copy, the CPU cap (ITIMER_PROF, plus
 RLIMIT_CPU as backstop), a crash. Budgets are CPU only. The child's stdout/stderr go to
 /dev/null; results come back over a pipe. CPU affinity is pinned to the first two CPUs the
-process may use. Switch: BR_RUNVERIFY=0.
+process may use. Switch: BR_RUNVERIFY=1 turns it on (OFF by default: round 24 measured no
+clear net gain under 2x scorer CPU; see the round-24 report).
 """
 
 from __future__ import annotations
@@ -651,7 +652,7 @@ class RunVerify:
 
     @classmethod
     def create(cls, selector):
-        if os.environ.get("BR_RUNVERIFY", "1") == "0" or not hasattr(os, "fork"):
+        if os.environ.get("BR_RUNVERIFY", "0") == "0" or not hasattr(os, "fork"):
             return None
         path = Path(os.environ.get("BR_RUNVERIFY_MAP", DEFAULT_MAP))
         if not path.is_file():
