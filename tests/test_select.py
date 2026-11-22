@@ -226,9 +226,12 @@ def test_signature_change_adds_class_users(selector):
     assert got == {A, C, D, U}
 
 
-def test_function_no_test_ran_is_treated_as_definition_time(selector):
+def test_function_no_test_ran_is_never_called(selector):
+    # R31 (moon-19 rule A): a plain def whose body no test ran and no import runs is never
+    # executed; only code-object readers (none in this fixture) could observe the edit.
+    # Before R31: definition-time → class users ∪ tests that ran the file ({A, C, D, U}).
     got = run(selector, edit("sqlglot/lib.py", "return 1\n", "return 2\n"))
-    assert got == {A, C, D, U}  # class users ∪ tests that ran the file
+    assert got == set()
 
 
 def test_metaclass_method_is_class_body(selector):
