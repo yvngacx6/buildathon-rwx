@@ -75,6 +75,7 @@ class Fallback(Exception):
 class BodyChange:
     names: dict[str, bool] = field(default_factory=dict)  # changed name → copies may be followed
     lambda_spans: list[tuple[int, int]] = field(default_factory=list)  # old-file line spans
+    lambda_lines: list[int] = field(default_factory=list)  # each lambda's own (`lambda`) line
     new_names: set[str] = field(default_factory=set)  # names added or removed (dir() sees them)
     # a changed statement builds a set: its iteration order can follow the literal's order,
     # which the state snapshot (sets digested sorted) does not see
@@ -136,6 +137,7 @@ def body_change(old_body: list[ast.stmt], new_body: list[ast.stmt],
         for o, n, ancestors, lam in _diff(old.value, stmt.value, []):
             if lam is not None:
                 out.lambda_spans.append(_runtime_lines(lam))
+                out.lambda_lines.append(lam.lineno)
                 continue
             if not _inert(n, known) or not _safe_path(ancestors, n):
                 raise Fallback(f"{names[0]}: change at line {getattr(n, 'lineno', '?')} is "

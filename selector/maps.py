@@ -269,12 +269,17 @@ class ImportTimeMap:
         self.path = path
         self._table = _Table(path, compiled)
 
-    def modules(self, path: str, first: int, last: int) -> set[str]:
-        """Modules whose import executes any line in path:first..last."""
+    def modules(self, path: str, first: int, last: int, start: int | None = None) -> set[str]:
+        """Modules whose import executes any line in path:first..last, or (`start`) calls a
+        code object whose first line is `start` (key "<path>:-<line>", PY_START): a lambda's
+        own line is skipped (`first` = its line + 1) because defining it runs that line, and a
+        one-line lambda called at import emits no LINE event of its own."""
         roots = self._table.tests
         out: set[str] = set()
         for line in range(first, last + 1):
             out.update(roots[i] for i in self._table.get(f"{path}:{line}"))
+        if start is not None:
+            out.update(roots[i] for i in self._table.get(f"{path}:-{start}"))
         return out
 
 

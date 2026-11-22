@@ -639,7 +639,8 @@ class Selector:
         if r.kind != "function" or r.signature:
             return None
         first, last = r.span
-        if self.maps.import_time.modules(path, first + r.is_lambda, last):
+        if self.maps.import_time.modules(path, first + r.is_lambda, last,
+                                         first if r.is_lambda else None):
             return None
         return self.maps.span(path, first, last) or None
 
@@ -734,7 +735,8 @@ class Selector:
                        else f"M {module} {r.chain[0]}" if len(r.chain) == 1
                        else f"C {module}:{'.'.join(r.chain[:-1])} {r.chain[-1]}")
                 at_import, same_state = self._function_at_import(path, first + r.is_lambda, last,
-                                                                 chosen | got, slack, own)
+                                                                 chosen | got, slack, own,
+                                                                 first if r.is_lambda else None)
                 if not got and same_state in ("readers", "readers-unseen"):
                     # Never ran under a test; what its runs at import built differently is
                     # read only by the tests in at_import.
@@ -1003,7 +1005,13 @@ class Selector:
         self._direct = change.names  # for `_state_floor`, if this falls back later
         self._inert = change  # for `_by_state`: plain assignments of inert values
         direct: set[int] = set()
-        for first, last in change.lambda_spans:  # a lambda body only runs when called
+        for (first, last), line in zip(change.lambda_spans, change.lambda_lines):
+            # a lambda body only runs when called; its own line also runs when it is created
+            if self.maps.import_time.modules(path, first + (first == line), last, line):
+                # called while modules are imported (Parser table lambdas parsing the duckdb
+                # templates at import, test modules parsing at collection): what it built
+                # then outlives the call; the lines map sees only test-time calls (moon-18)
+                raise names.Fallback(f"lambda at line {first} is called at import")
             got = self.maps.span(path, first, last)
             if not got:
                 raise names.Fallback(f"lambda at line {first} never ran under a test")
@@ -1512,7 +1520,8 @@ class Selector:
     def _function_at_import(self, path: str, first: int, last: int,
                             have: set[int] | None = None,
                             slack: set[int] = frozenset(),
-                            own: str | None = None) -> tuple[set[int], bool]:
+                            own: str | None = None,
+                            start: int | None = None) -> tuple[set[int], bool]:
         """Tests that depend on function lines path:first..last having run while modules
         were imported (`_import_time`: ALL for `import sqlglot`, else the dependents of each
         such module) – unless the import-state diff (selector/state.py) shows that importing
@@ -1536,11 +1545,11 @@ class Selector:
         Returns (tests, True if the state diff showed no change, "readers" if the tests are
         the readers of the changed state, "readers-unseen" if so but some changed value had
         no seen reader (the lines' run-time callers stand in for it), else False)."""
-        modules = self.maps.import_time.modules(path, first, last)
+        modules = self.maps.import_time.modules(path, first, last, start)
         if not modules:
             return set(), False
         try:
-            wide, error = self._import_time(path, first, last), None
+            wide, error = self._import_time(path, first, last, start), None
         except AllTests as exc:
             wide, error = None, exc
         have = have or set()
@@ -1636,9 +1645,11 @@ class Selector:
             self._test_imports = Checker(self.sqlglot)
         return self._test_imports.explained_for(module, path, first, last)
 
-    def _import_time(self, path: str, first: int, last: int) -> set[int]:
-        """Tests that depend on lines path:first..last having run while modules were imported."""
-        modules = self.maps.import_time.modules(path, first, last)
+    def _import_time(self, path: str, first: int, last: int,
+                     start: int | None = None) -> set[int]:
+        """Tests that depend on lines path:first..last (or a code object starting on line
+        `start`, `ImportTimeMap.modules`) having run while modules were imported."""
+        modules = self.maps.import_time.modules(path, first, last, start)
         if ImportTimeMap.ROOT in modules:
             raise AllTests(f"{path}:{first}-{last} runs during `import sqlglot`")
         got: set[int] = set()

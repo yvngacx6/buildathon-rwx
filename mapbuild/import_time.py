@@ -44,8 +44,17 @@ def on_line(code, line):
     if f.startswith(root):
         hits.add((f[len(root):], line))
     return mon.DISABLE
+def on_start(code, offset):
+    # A call of a code object: key "<path>:-<first line>". LINE alone misses a one-line
+    # lambda / def called at import (no LINE event for a code object's first line), and its
+    # line is in the map anyway because the defining statement ran it (moon-18).
+    f = code.co_filename
+    if f.startswith(root):
+        hits.add((f[len(root):], -code.co_firstlineno))
+    return mon.DISABLE
 mon.register_callback(TOOL, mon.events.LINE, on_line)
-mon.set_events(TOOL, mon.events.LINE)
+mon.register_callback(TOOL, mon.events.PY_START, on_start)
+mon.set_events(TOOL, mon.events.LINE | mon.events.PY_START)
 ok = True
 try:
     __import__(mod)

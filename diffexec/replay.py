@@ -124,6 +124,19 @@ def uses_match(code) -> bool:
     return False
 
 
+def exception_detail(e: BaseException) -> bytes:
+    """What a test can read off a raised exception beyond its type and str(): its args, its
+    attributes (`ParseError.errors`, `TokenError.start` / `end`) and the type / str of its
+    `__cause__`. The store's effect digest holds only type and str(e), so a patch that changes
+    only an attribute (`e.errors[0]["into_expression"] = ...` in `Parser.parse_into`) replayed
+    equal; old and new runs now must also agree on this. Unpicklable → raises → not ok."""
+    from diffexec import serial
+    cause = e.__cause__
+    return serial.digest_cmp((e.args, dict(getattr(e, "__dict__", None) or {}),
+                              None if cause is None else (type(cause).__module__,
+                                                          type(cause).__qualname__, str(cause))))
+
+
 _KINDS = ("SETUP", "CALL", "TEARDOWN")
 
 
@@ -364,10 +377,12 @@ def run_request(req: dict) -> dict:
                 serial.TOUCHED[0] = False
                 if stubs:
                     _watch_calls(True)
+                exc_detail = None
                 try:
                     outcome = ("ret", fn(*args, **kwargs))
                 except Exception as e:  # noqa: BLE001
                     outcome = ("exc", type(e).__module__, type(e).__qualname__, str(e))
+                    exc_detail = exception_detail(e)
                 finally:
                     if stubs:
                         _watch_calls(False)
@@ -377,7 +392,8 @@ def run_request(req: dict) -> dict:
             raise serial.ElidedAccess()  # an elided container was used: the call is not ok
         cpu = time.process_time() - t0
         digest = serial.digest_cmp((tuple(vals), outcome))
-        side = (handler.got, [(w.category.__name__, str(w.message)) for w in warned], stdout.getvalue())
+        side = (handler.got, [(w.category.__name__, str(w.message)) for w in warned], stdout.getvalue(),
+                exc_detail)
         return digest, side, cpu
 
     n_blobs = n_ok = 0
