@@ -1200,7 +1200,8 @@ class Selector:
         free: set[int] = set()  # readers of module globals
         loose: set[int] = set()  # class-attribute readers restricted only by `touch`
         typed: set[int] = set()  # tests that name a TypedDict whose key sets changed
-        untyped = False  # some changed value is not a TypedDict key set
+        untyped = False  # some changed value is not a TypedDict key set (nor attrs-vouched)
+        vouched: set[str] = set()  # changed keys whose every lookup the attrs map recorded
         held: set[int] = set()  # class-attribute readers among tests that can hold the class
         in_tests: set[int] = set()
         n_sites = 0
@@ -1229,7 +1230,13 @@ class Selector:
                 continue
             if attr.startswith("__") and attr.endswith("__"):
                 raise names.Fallback(f"{owner}.{attr} is a special name")
-            untyped = True
+            # moon-19: tests that looked `attr` up through the owner's family (attrs map);
+            # not None: every lookup is accounted for, so no reader at all is a valid answer
+            looked = self._attr_readers(owner, attr, info) if kind == "C" else None
+            if looked is None:
+                untyped = True
+            else:
+                vouched.add(f"{kind} {owner} {attr}")
             if kind == "M":
                 owner_path = self._module_path(owner)
                 if owner_path is None:
@@ -1243,8 +1250,6 @@ class Selector:
                 owner_path, chain, users = owners[owner]
                 touch |= self.maps.whole_file(owner_path) | self._class_users(
                     _module_of(owner_path), [chain])
-            # moon-19: tests that looked `attr` up through the owner's family (attrs map)
-            looked = self._attr_readers(owner, attr, info) if kind == "C" else None
             same = frozenset(found.get("same", {}).get(f"{kind} {owner} {attr}", ()))
             key_free: set[int] = set()
             key_touched: set[int] = set()
@@ -1279,7 +1284,8 @@ class Selector:
         got |= typed
         # changed values no test is seen reading (a reader the index is blind to, or none):
         # callers of `_state_readers(…, allow_empty)` let the lines' run-time callers stand in
-        self._state_unread = [k for k, f, t in per_key if not f and not t & touch]
+        self._state_unread = [k for k, f, t in per_key
+                              if not f and not t & touch and k not in vouched]
         if not got and not allow_empty and untyped:
             raise names.Fallback("no test ran a line reading a changed value")
         shown = sorted({f"{o.rsplit(':', 1)[-1]}.{a}" for _, o, a in changed})
