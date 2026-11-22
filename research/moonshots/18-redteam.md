@@ -1,9 +1,15 @@
 # Moonshot 18 — red-team of the run-time pruners
 
-**Verdict: one real soundness hole found and fixed (diffexec ignores exception attributes);
-no end-to-end miss on current main from the 15 mutants labeled. The hash-seed, statement-rule,
-r13 default-replay and r19 import-fn arguments held under attack.** Fix on branch `moon-18`
-(`diffexec/replay.py` `exception_detail` + unit test). Labeled-set check: see "Regression" below.
+**Verdict: two real holes, both fixed on `moon-18` (870fb6b); 0 misses and byte-identical
+selections on all 566 labeled commits.**
+1. **Import-time one-line lambdas (end-to-end MISSES on main: 3 of 5 probes).** A one-line lambda
+   called while modules import (Parser table lambdas parsing the duckdb templates; test modules
+   parsing at collection) emits PY_START but no LINE event of its own, and the selector skips a
+   lambda's own line (defining it runs that line). The class-table path (`names lambda bodies`)
+   never checked import time at all. Fixed: import_time map gets PY_START keys `<path>:-<line>`;
+   lambda regions / class-table lambda spans called at import go to the import-state diff / fallback.
+2. **diffexec ignores exception attributes** (latent: replay-level proof, no end-to-end miss today).
+The hash-seed, statement-rule, r13 default-replay and r19 import-fn arguments held under attack.
 
 ## Method
 
@@ -41,6 +47,40 @@ detail raises → the blob is not ok (keeps tests). Unit test:
 Forced replay after the fix: x_into_list 926/928 ok, the two failing tests "bad"; x_into_none
 910/928 ok, the three tests reading `into_expression` "bad"; the other 485 phases stay ok.
 
-## Regression
+## Hole 1: one-line lambdas called at import (from moonshot 11's observation)
 
-REGRESSION_PLACEHOLDER
+Pinned-image import of every sqlglot module: 41 one-line code objects are called at import
+(~27 lambdas: Parser table lambdas at parser.py 419, 1162, 1228–1306, 1586–1644, nested lambdas in
+`_parse_join` etc., `highlight_sql`, `Dot.build`, `subclasses`; the rest genexprs).
+Probes (`spec3.json`, full suite labeled on rwx-big, selector in the pinned image):
+
+| Probe | main: selected / failing / MISSED | fixed: selected / MISSED |
+|---|---|---|
+| l_cast_strict (`"CAST": … _parse_cast(not self.STRICT_CAST)`) | 194 / 142 / **3** (test_optimize, test_qualify_columns, test_ref_type) | 1281 / 0 |
+| l_true_false (`TokenType.TRUE` → `Boolean(this=False)`) | 76 / 70 / **3** | ALL / 0 |
+| l_datatype_schema (`exp.DataType` lambda `allow_identifiers=True`) | 342 / 28 / **16+** (incl. test_execute_tpcds, dialect test-file collection errors) | ALL / 0 |
+| l_count_bigint (`"COUNT"` `big_int=False`) | 63 / 6 / 0 | 1271 / 0 |
+| l_join_alias (nested lambda in `_parse_join`) | 1047 / 1 / 0 | 1047 / 0 |
+
+Fix: `mapbuild/import_time.py` records PY_START as `<path>:-<first line>`; the map was rebuilt on
+rwx-big (positive keys reproduce all 27,788 old keys exactly, so only the 1,971 start keys were
+merged into the committed map; MANIFEST updated). `ImportTimeMap.modules(path, first, last, start)`;
+lambda regions (`_function_at_import`, `_test_helper_function`) pass the lambda's line as `start`;
+`names.BodyChange.lambda_lines` + `_by_names`: a table lambda called at import → `Fallback`.
+Unit tests: `test_import_time_map_start_keys_cover_one_line_lambdas`,
+`test_lambda_in_table_called_at_import_falls_back`.
+
+## Regression (rwx-big, pinned image, scorer flags; main d48ac42/bd16852 vs moon-18)
+
+| Set | commits | differing selections | main s / misses | moon-18 s / misses |
+|---|---|---|---|---|
+| sample | 30 | 0 | 115.1 / 0 | 115.1 / 0 |
+| private | 264 | 0 | 2417.2 / 0 | 2417.2 / 0 |
+| private41 | 41 | 0 | 388.9 / 0 | 388.9 / 0 |
+| adversarial | 46 | 0 | 1063.2 / 0 | 1063.2 / 0 |
+| adversarial2 | 65 | 0 | 937.4 / 0 | 937.4 / 0 |
+| practice_like | 120 | 0 | 989.6 / 0 | 989.6 / 0 |
+
+Recommendation: merge moon-18 (no cost on any labeled set; closes a class of real misses that
+practice-like one-token edits of Parser table lambdas would hit). Add the 5 l_* probes and the
+2 x_into_* probes to the adversarial set.
