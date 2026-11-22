@@ -372,15 +372,23 @@ def _seed_runs(root: Path) -> dict:
     import subprocess
     import tempfile
     runs = {}
-    for seed in ("1", "2"):
-        with tempfile.NamedTemporaryFile(suffix=".pkl") as tf:
+    # moon-26: both interpreters side by side (independent; the build has spare cores)
+    with tempfile.TemporaryDirectory() as td:
+        procs = []
+        for seed in ("1", "2"):
             env = dict(os.environ, PYTHONHASHSEED=seed)
-            subprocess.run([sys.executable, "-m", "selector.subtest", "seeddig", str(root), tf.name],
-                           cwd=str(REPO), env=env, check=True)
-            with open(tf.name, "rb") as fh:
+            f = os.path.join(td, f"{seed}.pkl")
+            procs.append((f, subprocess.Popen(
+                [sys.executable, "-m", "selector.subtest", "seeddig", str(root), f],
+                cwd=str(REPO), env=env)))
+        for f, proc in procs:
+            if proc.wait() != 0:
+                raise subprocess.CalledProcessError(proc.returncode, "seeddig")
+        for f, _ in procs:
+            with open(f, "rb") as fh:
                 got = pickle.load(fh)
-        for key, v in got.items():
-            runs.setdefault(key, []).append(v)
+            for key, v in got.items():
+                runs.setdefault(key, []).append(v)
     return runs
 
 
@@ -574,6 +582,13 @@ def _in_fork(fn):
     return pickle.loads(data)
 
 
+_BUILD_ONE = None
+
+
+def _build_one_entry(i):
+    return _BUILD_ONE(_BUILD_ITEMS[i])
+
+
 def build(root: Path, out: Path) -> None:
     root = root.resolve()
     sys.path.insert(0, str(root))
@@ -605,11 +620,21 @@ def build(root: Path, out: Path) -> None:
     ckdata: dict[str, bytes] = {}
     seeds = _seed_runs(root) if RULES_BUILD else {}
     tables = {s: make_tables(s) for s in SUITES}
+    items = []
     for suite in SUITES:
-        queries = []
         fixture = SUITES[suite] + ("tpc-h.sql" if suite == "tpch" else "tpc-ds.sql")
-        for qmeta, sql, optimized in load_sql_fixture_pairs(fixture):
-            q = {"sql": sql, "optimized": optimized, "execute": bool(qmeta.get("execute"))}
+        for qi, (qmeta, sql, optimized) in enumerate(load_sql_fixture_pairs(fixture)):
+            items.append((suite, qi, {"sql": sql, "optimized": optimized,
+                                      "execute": bool(qmeta.get("execute"))}))
+
+    global _BUILD_ITEMS
+    _BUILD_ITEMS = items
+
+    def one(item):
+        """One query, everything in fresh forks of this process → (q, its checkpoints)."""
+        suite, qi, q = item
+        ckq = {}
+        if True:
 
             def traced(q=q):
                 from sqlglot import find_tables, parse_one, transpile
@@ -663,7 +688,7 @@ def build(root: Path, out: Path) -> None:
                     if RULES_BUILD and outs["d_opt"]:
                         try:
                             _build_rules(outs, covs["optb"], pexpr, schemas[suite], prefix,
-                                         seeds.get((suite, len(queries))))
+                                         seeds.get((suite, qi)))
                         except RuntimeError:
                             for k in ("fs", "ck_ok", "cpu_from", "_cks"):
                                 outs.pop(k, None)
@@ -694,7 +719,7 @@ def build(root: Path, out: Path) -> None:
             try:
                 phases, outs = _in_fork(traced)
                 for k, data in outs.pop("_cks", {}).items():
-                    ckdata[f"ck/{suite}/{len(queries)}/{k}"] = data
+                    ckq[f"ck/{suite}/{qi}/{k}"] = data
                 if suite == "tpch":
                     phases["opt"], duck, outs["opt"] = _in_fork(traced_opt)
                     if duck != outs["duck"]:
@@ -709,10 +734,31 @@ def build(root: Path, out: Path) -> None:
                 phases, outs, cpu_exec, cpu_opt, stable, calib = {}, {}, 0.0, 0.0, False, 0.0
             q.update(phases=phases, outs=outs, cpu_exec=cpu_exec, cpu_opt=cpu_opt, stable=stable,
                      calib=calib)
-            queries.append(q)
-            print(f"{suite} {len(queries)} exec={q['execute']} cpu={cpu_exec:.2f}/{cpu_opt:.2f}"
-                  f" stable={stable} calib={calib * 1000:.1f}ms", file=sys.stderr)
-        meta["suites"][suite] = queries
+        return q, ckq
+
+    # moon-26: queries are independent (each runs in fresh forks of this process, which runs
+    # nothing between them), so a fork pool of BR_SUBTEST_JOBS workers runs them side by side;
+    # results come back in fixture order.
+    jobs = max(1, int(os.environ.get("BR_SUBTEST_JOBS", "1")))
+    global _BUILD_ONE
+    _BUILD_ONE = one
+    if jobs > 1:
+        import multiprocessing as mp
+        pool = mp.get_context("fork").Pool(jobs)
+        results = pool.imap(_build_one_entry, range(len(items)), chunksize=1)
+    else:
+        pool, results = None, map(_build_one_entry, range(len(items)))
+    for (suite, qi, _), (q, ckq) in zip(items, results):
+        ckdata.update(ckq)
+        queries = meta["suites"].setdefault(suite, [])
+        assert len(queries) == qi
+        queries.append(q)
+        print(f"{suite} {len(queries)} exec={q['execute']} cpu={q['cpu_exec']:.2f}/{q['cpu_opt']:.2f}"
+              f" stable={q['stable']} calib={q['calib'] * 1000:.1f}ms", file=sys.stderr)
+    if pool is not None:
+        pool.close()
+        pool.join()
+    _BUILD_ONE = None
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".tmp")
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
