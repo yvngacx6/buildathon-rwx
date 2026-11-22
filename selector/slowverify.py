@@ -294,8 +294,21 @@ class SlowVerify:
             self._meta = meta if ok else {}
         return self._meta
 
+    def may_drop(self, spans) -> bool:
+        """r40: False when `prune` keeps test_max_nodes on these spans for a static reason
+        (no store, a slow phase runs a touched statement, a frontier call not replayable)."""
+        try:
+            meta = self.meta()
+            if not meta or not spans:
+                return False
+            if any(_hit(meta["phases"][name]["lines"], spans) for name in SLOW):
+                return False
+            return all(f["ok"] for n in SLOW for f in meta["phases"][n]["frontier"])
+        except Exception:  # noqa: BLE001
+            return True
+
     def prune(self, jobs, spans, candidates: set[int], benefit_of,
-              futile=None) -> tuple[set[int], str]:
+              real_gain=None) -> tuple[set[int], str]:
         cands = candidates & set(self.numbers)
         if not cands or not spans:
             return set(), ""
@@ -315,7 +328,7 @@ class SlowVerify:
             gain = benefit_of(cands)
             if gain <= 0 or SCORER_SLOWDOWN * 0.5 > min(BUDGET_S, 0.6 * gain / 1000):
                 return set(), "slowverify: keep (not worth it)"
-            if futile is not None and futile(cands):
+            if real_gain is not None and real_gain(cands) <= 0:
                 return set(), "slowverify: keep (ends ALL anyway)"
             ok = self.verify(jobs, replay)
         except Exception as e:  # noqa: BLE001

@@ -328,7 +328,7 @@ class Selector:
             reasons.append(f"{type(pruner).__name__.lower()}: keep (ends ALL anyway)")
             return per_file
         dropped, note = pruner.prune(self._jobs, self._spans, cands, benefit,
-                                     futile=lambda only: self._ends_all(everything, only, base))
+                                     real_gain=lambda only: self._real_gain(everything, only))
         if note:
             reasons.append(note)
         return [(p, got - dropped) for p, got in per_file]
@@ -342,39 +342,60 @@ class Selector:
                                   for sub in itertools.combinations(nums, r))
 
     def _ends_all(self, everything: set[int], only: set[int], base: int | None = None) -> bool:
-        """r40: True when the commit's output is ALL even if `only` is dropped: every
-        selection the rest of `select` can still give (any of the later pruners' tests
-        dropped too, the untraced tests added) costs ≥ ALL_FRACTION × ALL, which
-        __main__ turns into ALL. Verifying `only` then saves nothing: skip it (→ keep).
-        Each such selection is checked (LPT packing is not monotone in the set)."""
+        """r40: True when the commit's output is ALL even if `only` is dropped (verifying
+        `only` then saves nothing: skip it, → keep)."""
+        from . import pack
+        if base is not None:
+            if "_all_cost" not in self.__dict__:
+                ms_of = {n: pack.duration_ms(s) for n, s in self._secs.items()}
+                self._all_cost = pack.cost_ms(pack.pack(set(self._all), ms_of), ms_of)
+            if base < 0.9 * ALL_FRACTION * self._all_cost:
+                return False  # far from ALL (cheap pre-filter; False = verify as before)
+        return self._real_gain(everything, only) <= 0
+
+    def _real_gain(self, everything: set[int], only: set[int]) -> float:
+        """r40: what dropping `only` saves on the scorer (ms), the most it can: the output's
+        cost with and without the drop, each as __main__ emits it (≥ ALL_FRACTION × ALL →
+        ALL), over every selection the rest of `select` can still give (the later pruners'
+        tests dropped or not, the untraced tests added; each is checked since LPT packing is
+        not monotone in the set; an upper bound). `benefit_of` misses the ALL rule both ways (1 s "saved" on
+        an ALL commit; 2 s saved, not 1, when the drop gets it under the ALL line). Any
+        surprise → inf (verify as before)."""
         if os.environ.get("BR_ENDS_ALL", "1") == "0":
-            return False
+            return float("inf")
         from . import pack
         try:
             ms_of = {n: pack.duration_ms(s) for n, s in self._secs.items()}
             if "_all_cost" not in self.__dict__:
                 self._all_cost = pack.cost_ms(pack.pack(set(self._all), ms_of), ms_of)
-            if base is not None and base < 0.9 * ALL_FRACTION * self._all_cost:
-                return False  # far from ALL (cheap pre-filter; False = verify as before)
+            all_cost = self._all_cost
             if self._untraced is None:
                 self._untraced = self.maps.untraced()
             later: set[int] = set()
-            if self.slowverify is not None:
+            # test_max_nodes: slowverify runs after subtest only on function-body jobs, and
+            # keeps it for static reasons first (may_drop)
+            if (self.slowverify is not None and self._jobs and not self._mixed_py
+                    and not self._defaults and self.slowverify.may_drop(self._spans)):
                 later |= set(self.slowverify.numbers)
             if self.genmem is not None:
                 later.add(self.genmem.number)
-            later = sorted(later & everything)
-            rest = everything - only
-            for r in range(len(later) + 1):
-                for gone in itertools.combinations(later, r):
-                    final = ((rest - set(gone)) | self._untraced) & self._all
-                    if final == self._all:
-                        continue
-                    if pack.cost_ms(pack.pack(final, ms_of), ms_of) < ALL_FRACTION * self._all_cost:
-                        return False
-            return True
-        except Exception:  # noqa: BLE001  (never skip on a surprise: verify as before)
-            return False
+            later_l = sorted((later & everything) - only)
+
+            def emitted(sel: set[int]) -> int:
+                final = (sel | self._untraced) & self._all
+                if final == self._all:
+                    return all_cost
+                c = pack.cost_ms(pack.pack(final, ms_of), ms_of) if final else 0
+                return all_cost if c >= ALL_FRACTION * all_cost else c
+
+            # the later pruners may decide differently with and without the drop: the
+            # dearest output kept against the cheapest output dropped
+            outs = [set(gone) for r in range(len(later_l) + 1)
+                    for gone in itertools.combinations(later_l, r)]
+            return (max(emitted(everything - g) for g in outs)
+                    - min(emitted(everything - only - g) for g in outs))
+        except Exception:  # noqa: BLE001
+            return float("inf")
 
     def _tpc_patched(self, per_file, reasons):
         """r40: `_tpc_patched_` with its own CPU (this process) in its note."""
@@ -454,7 +475,7 @@ class Selector:
             return keep(f"may write shared state: {why}"[:160])
         try:
             dropped, note = st.prune_patched(str(self.sqlglot), patched, spans, cands, benefit,
-                                             True, futile=lambda only: self._ends_all(everything, only, base))
+                                             True, real_gain=lambda only: self._real_gain(everything, only))
         except Exception as e:  # noqa: BLE001
             return keep(type(e).__name__)
         if note:

@@ -64,11 +64,13 @@ NET_SHARE = float(os.environ.get("BR_SUBTEST_NET", "0.95"))
 NET_EST_MAX = float(os.environ.get("BR_SUBTEST_NET_MAX", "13"))  # laptop s, whole child
 NET_CPU_FACTOR = float(os.environ.get("BR_SUBTEST_NET_CPU_FACTOR", str(SCORER_SLOWDOWN)))
 NET_CAP_SHARE = float(os.environ.get("BR_SUBTEST_NET_CAP_SHARE", "1.0"))  # child CPU cap / saving
-# r40: the net gate's choice is verified only when it saves at least this much (ms): below,
-# the child's measured CPU (~2x its est on small sets: P noyh / wv8c 0.6-0.8 s for ~1 s
-# saved) charged at 2x costs more than the drop saves. Applied after the choice: it only
-# turns a verification into a keep, never picks another subset.
-NET_MIN_GAIN_MS = float(os.environ.get("BR_SUBTEST_NET_MIN_MS", "3000"))
+# r40: the net gate's choice is verified only when it saves at least this much (ms) on the
+# emitted output (select.Selector._real_gain: the ALL rule applied; P/Q 9wjf, kpkn, xmr1,
+# zybt "save" 1.4 s by benefit_of but end ALL either way; P noyh / wv8c save 2 s, not 1, as
+# the drop gets them under the ALL line). Small sets' child CPU runs ~2x its est (0.6-1.2 s
+# for est 0.34-0.42). Applied after the choice: it only turns a verification into a keep,
+# never picks another subset.
+NET_MIN_GAIN_MS = float(os.environ.get("BR_SUBTEST_NET_MIN_MS", "1500"))
 # r40: the queries to re-run go cheapest (estimated CPU) first, whole re-runs inline with the
 # checkpoint-verified ones: a divergence ends the child before the dearer queries run (pl
 # h917: 98 stage queries passed in 2.9 s before a ~0 s full query failed). Order only: a
@@ -1509,7 +1511,7 @@ class SubTest:
         return not timed_out and status == 0 and b"".join(chunks) == b"OK"
 
     def prune(self, jobs, spans, candidates: set[int], benefit_of,
-              futile=None) -> tuple[set[int], str]:
+              real_gain=None) -> tuple[set[int], str]:
         """jobs: diffexec jobs [(path, new text, prunable)], spans {path: [(first, last)]} of
         the touched statements, candidates: the TPC tests that only these jobs keep."""
         cands = candidates & set(self.numbers)
@@ -1572,14 +1574,16 @@ class SubTest:
                             best = (net, set(subset), todo, est)
             _, chosen, todo, est = best
             net_gate = bool(chosen)
-            if net_gate and todo and NET_SHARE < 100 and benefit_of(chosen) < NET_MIN_GAIN_MS:
-                return set(), (f"subtest: keep (net gate: saves {benefit_of(chosen) / 1000:.2f}s"
-                               f" < {NET_MIN_GAIN_MS / 1000:.1f}s, est {est:.2f})")
+            if net_gate and todo and NET_SHARE < 100:
+                saves = real_gain(chosen) if real_gain is not None else benefit_of(chosen)
+                if saves < NET_MIN_GAIN_MS:
+                    return set(), (f"subtest: keep (net gate: saves {saves / 1000:.2f}s"
+                                   f" < {NET_MIN_GAIN_MS / 1000:.1f}s, est {est:.2f})")
         if not chosen:
             return set(), f"subtest: keep (est {cpu:.1f}s CPU for {sum(map(len, per.values()))} queries{"" if getattr(self, "stage_ok", True) else "; no stage: " + str(self.stage_why)})"
         if not todo:
             return chosen, f"subtest: {sorted(chosen)} dropped (no query runs a touched statement)"
-        if futile is not None and futile(chosen):
+        if real_gain is not None and real_gain(chosen) <= 0:
             # r40: the output is ALL with or without the drop: verifying saves nothing
             return set(), f"subtest: keep (ends ALL anyway; est {est:.2f}{' [net gate]' if net_gate else ''})"
         try:
@@ -1633,7 +1637,7 @@ class SubTest:
 
     def prune_patched(self, root: str, patched: dict[str, str], spans: dict,
                       candidates: set[int], benefit_of, stage_ok: bool,
-                      futile=None) -> tuple[set[int], str]:
+                      real_gain=None) -> tuple[set[int], str]:
         """r37. The TPC tests of a commit whose .py edits are not all clean function-body
         edits (class / module bodies, definition-time code: no diffexec job): `spans` are the
         OLD-file lines whose run can behave differently (touched function statements, and the
@@ -1672,7 +1676,7 @@ class SubTest:
                            f"{sum(map(len, per.values()))} queries)")
         if not todo:
             return chosen, f"tpc-patched: {sorted(chosen)} dropped (no query runs a changed line)"
-        if futile is not None and futile(chosen):
+        if real_gain is not None and real_gain(chosen) <= 0:
             return set(), f"tpc-patched: keep (ends ALL anyway; est {est:.2f})"
         cap = min(PATCHED_BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0)
         if ORDERED:
