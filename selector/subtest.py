@@ -1322,6 +1322,37 @@ def _writes_shared(fn, self_shared: bool) -> str | None:
     return None
 
 
+_OLD_DEFS: dict[tuple[str, str], tuple[dict, list[bytes]]] = {}
+
+
+def _pinned_defs(root: str, path: str) -> tuple[dict, list[bytes]]:
+    """r41: `_defs` of the pinned (old) file and its lines as bytes, once per file and run
+    (the source does not change; read-only use: no caller mutates the trees)."""
+    key = (root, path)
+    hit = _OLD_DEFS.get(key)
+    if hit is None:
+        with open(os.path.join(root, path), encoding="utf-8") as fh:
+            old_text = fh.read()
+        hit = _OLD_DEFS[key] = (_defs(ast.parse(old_text)), old_text.encode("utf-8").splitlines(True))
+    return hit
+
+
+def _def_source(lines: list[bytes], node) -> bytes | None:
+    """The exact source of a def / lambda node (first decorator to its end; col offsets
+    are UTF-8 byte offsets), or None. Equal sources ⇒ equal `ast.dump`."""
+    try:
+        first = node
+        for d in getattr(node, "decorator_list", ()):
+            if (d.lineno, d.col_offset) < (first.lineno, first.col_offset):
+                first = d
+        a, ca, b, cb = first.lineno, first.col_offset, node.end_lineno, node.end_col_offset
+        if a == b:
+            return lines[a - 1][ca:cb]
+        return lines[a - 1][ca:] + b"".join(lines[a:b - 1]) + lines[b - 1][:cb]
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
 def stage_guard(root: str, jobs, defaults: dict | None = None,
                 skip: set | None = None) -> str | None:
     """None when every changed function (old and new version) of the jobs passes
@@ -1333,9 +1364,9 @@ def stage_guard(root: str, jobs, defaults: dict | None = None,
     __init_subclass__) the caller showed no TPC test runs: they run at class creation, whose
     products the import-state diff holds."""
     for path, new_text, _ in jobs:
-        with open(os.path.join(root, path), encoding="utf-8") as fh:
-            old_text = fh.read()
-        old_defs, new_defs = _defs(ast.parse(old_text)), _defs(ast.parse(new_text))
+        old_defs, old_lines = _pinned_defs(root, path)
+        new_defs = _defs(ast.parse(new_text))
+        new_lines = new_text.encode("utf-8").splitlines(True)
         for name, line, _params in (defaults or {}).get(path, ()):
             hits = [d for k, d in old_defs.items() if k[0].split(".")[-1] == name
                     and min([d[0].lineno] + [x.lineno for x in d[0].decorator_list]) == line]
@@ -1346,8 +1377,10 @@ def stage_guard(root: str, jobs, defaults: dict | None = None,
                 return f"{name}: {why}"
         for k in set(old_defs) | set(new_defs):
             o, n = old_defs.get(k), new_defs.get(k)
-            if o is not None and n is not None and ast.dump(o[0]) == ast.dump(n[0]):
-                continue
+            if o is not None and n is not None:
+                so = _def_source(old_lines, o[0])
+                if (so is not None and so == _def_source(new_lines, n[0])) or ast.dump(o[0]) == ast.dump(n[0]):
+                    continue
             if skip and any((path, q) in skip for q in _outer_names(k[0])):
                 continue
             for d in (o, n):

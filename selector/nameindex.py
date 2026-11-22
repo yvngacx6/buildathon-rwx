@@ -83,6 +83,8 @@ class NameIndex:
     def __init__(self, data: dict) -> None:
         self.data = data
         self._occ: dict[str, list] = {}
+        self._check_memo: dict[tuple, tuple] = {}
+        self._by_suffix: dict[str, list] | None = None
 
     def _occurrences(self, key: str) -> list:
         hit = self._occ.get(key)
@@ -150,7 +152,40 @@ class NameIndex:
 
         Returns the class's family: itself and every subclass (by spelled base), as
         (path, chain).
-        """
+
+        r41: memoized (the tables do not change during a run; a Tokenizer-state commit asks
+        for ~70 classes, often the same ones from `_tpc_spans` and `_state_readers`)."""
+        key = (path, type(chain).__name__, tuple(chain))
+        hit = self._check_memo.get(key)
+        if hit is None:
+            try:
+                hit = (True, self._check_class(path, chain))
+            except Fallback as e:
+                hit = (False, str(e))
+            self._check_memo[key] = hit
+        if not hit[0]:
+            raise Fallback(hit[1])
+        return list(hit[1])
+
+    def _subclass_candidates(self, want: str) -> list[tuple[str, tuple[str, ...]]]:
+        """Every class entry with a dotted base `s` where `s == want` or
+        `s.endswith("." + want)`, in the order of a scan of `classes` (r41: an index by
+        dotted-suffix instead of a scan of every class per family member)."""
+        if self._by_suffix is None:
+            idx: dict[str, list] = {}
+            for entries in self.data["classes"].values():
+                for p, ch, _, dotted, _ in entries:
+                    item = (p, tuple(ch))
+                    keys = set()
+                    for s in dotted:
+                        parts = s.split(".")
+                        keys.update(".".join(parts[i:]) for i in range(len(parts)))
+                    for k in keys:
+                        idx.setdefault(k, []).append(item)
+            self._by_suffix = idx
+        return self._by_suffix.get(want, [])
+
+    def _check_class(self, path: str, chain: tuple[str, ...]) -> list[tuple[str, tuple[str, ...]]]:
         classes = self.data["classes"]
         start = [e for e in classes.get(chain[-1], ()) if e[0] == path and tuple(e[1]) == chain]
         if not start:
@@ -174,14 +209,11 @@ class NameIndex:
         todo_chains = [chain]
         while todo_chains:  # subclasses: a base spelled `...Name` (top level) / `...Outer.Inner`
             want = ".".join(todo_chains.pop())
-            for entries in classes.values():
-                for p, ch, _, dotted, _ in entries:
-                    ch = tuple(ch)
-                    if (p, ch) in family:
-                        continue
-                    if any(s == want or s.endswith("." + want) for s in dotted):
-                        family.append((p, ch))
-                        todo_chains.append(ch[-1:] if len(ch) == 1 else ch)
+            for p, ch in self._subclass_candidates(want):
+                if (p, ch) in family:
+                    continue
+                family.append((p, ch))
+                todo_chains.append(ch[-1:] if len(ch) == 1 else ch)
         return family
 
     def _identity(self, name: str, call: bool) -> bool:

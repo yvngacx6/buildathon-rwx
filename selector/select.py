@@ -316,7 +316,7 @@ class Selector:
         cands &= set().union(*(got for _, got in per_file))
         if not cands:
             return per_file
-        ms_of = {n: pack.duration_ms(s) for n, s in self._secs.items()}
+        ms_of = self._ms_of()
         everything = set().union(*(got for _, got in per_file))
         base = pack.cost_ms(pack.pack(everything, ms_of), ms_of)
 
@@ -333,6 +333,14 @@ class Selector:
             reasons.append(note)
         return [(p, got - dropped) for p, got in per_file]
 
+    def _ms_of(self) -> dict[int, int]:
+        """r41: {number: duration ms} of tests.json, built once (read-only for every user)."""
+        got = self.__dict__.get("_ms_of_memo")
+        if got is None:
+            from . import pack
+            got = self._ms_of_memo = {n: pack.duration_ms(s) for n, s in self._secs.items()}
+        return got
+
     def _ends_all_every(self, everything: set[int], cands: set[int], base: int) -> bool:
         """r40: `_ends_all` for every non-empty subset of `cands` (≤ 3 TPC tests): no drop
         the verifier could choose changes the output (checked before its parent-side work)."""
@@ -347,7 +355,7 @@ class Selector:
         from . import pack
         if base is not None:
             if "_all_cost" not in self.__dict__:
-                ms_of = {n: pack.duration_ms(s) for n, s in self._secs.items()}
+                ms_of = self._ms_of()
                 self._all_cost = pack.cost_ms(pack.pack(set(self._all), ms_of), ms_of)
             if base < 0.9 * ALL_FRACTION * self._all_cost:
                 return False  # far from ALL (cheap pre-filter; False = verify as before)
@@ -365,7 +373,7 @@ class Selector:
             return float("inf")
         from . import pack
         try:
-            ms_of = {n: pack.duration_ms(s) for n, s in self._secs.items()}
+            ms_of = self._ms_of()
             if "_all_cost" not in self.__dict__:
                 self._all_cost = pack.cost_ms(pack.pack(set(self._all), ms_of), ms_of)
             all_cost = self._all_cost
@@ -419,7 +427,7 @@ class Selector:
         cands = set(st.numbers) & everything
         if not cands:
             return per_file
-        ms_of = {n: pack.duration_ms(s) for n, s in self._secs.items()}
+        ms_of = self._ms_of()
         base = pack.cost_ms(pack.pack(everything, ms_of), ms_of)
 
         def benefit(only):
@@ -609,7 +617,7 @@ class Selector:
         everything = set().union(*(got for _, got in per_file))
         if n not in everything:
             return per_file
-        ms_of = {k: pack.duration_ms(s) for k, s in self._secs.items()}
+        ms_of = self._ms_of()
         base = pack.cost_ms(pack.pack(everything, ms_of), ms_of)
 
         def benefit(only):
