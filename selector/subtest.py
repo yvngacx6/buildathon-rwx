@@ -54,6 +54,8 @@ BUDGET_S = float(os.environ.get("BR_SUBTEST_S", "12"))
 STAGE = os.environ.get("BR_SUBTEST_STAGE", "1") != "0"  # moon-05 checkpoint verification
 FALLBACK = os.environ.get("BR_SUBTEST_FALLBACK", "0") != "0"  # checkpoint differs → whole query
 FALLBACK_CAP = float(os.environ.get("BR_SUBTEST_FALLBACK_CAP", "1.5"))  # laptop s
+RULES_ON = os.environ.get("BR_SUBTEST_RULES", "1") != "0"  # moon-22 per-rule checkpoints
+RULES_BUILD = os.environ.get("BR_SUBTEST_RULES_BUILD", "1") != "0"
 SHARE = 0.6  # spend at most this share of what dropping saves
 
 
@@ -149,9 +151,290 @@ def strict_digest(root) -> str:
     return h.hexdigest()
 
 
-def exec_windows(expr, schema, used, cov_factory=None, swap_until=None):
+# ── moon-25: code-generation checkpoint inside the executor ───────────────────────────────
+#
+# PythonExecutor turns every plan expression into Python source with its generator
+# (self.generator.generate(expr) → str, then compile), and _register_subquery keys subquery
+# plans by query.sql(). Both are pure expression → string steps: the executor reads only the
+# returned string (the input is copied first, see Generator.generate). At build time the post
+# window records, for every such call, a lossless pickle of the input (root parent dropped: the
+# generator copies its input, so a copy without parent is all it sees), the output and the
+# call depth; coverage is split into lines run inside these calls ("post_in") and outside.
+# Run time: when the touched statements run in post only inside these calls (and nowhere in
+# prep / plan / post outside / glue), and the optimized tree checkpoint is equal (or optb is
+# untouched), the executor's run is identical to the pinned one up to the first generate call;
+# replaying every call (same order, same generator construction path, one shared instance as
+# the executor has, plus once more on a fresh instance per call) and getting the same strings
+# and generator state proves by induction that it stays identical, i.e. the result is the
+# pinned one. Changes to Generator.generate / Expr.copy / Expr.__deepcopy__ (which decide
+# whether the generator sees the uncopied, parented input) never use this mode.
+
+GEN = os.environ.get("BR_SUBTEST_GEN", "1") != "0"
+_EXPR_SLOTS: dict = {}
+
+
+def _slots(cls):
+    s = _EXPR_SLOTS.get(cls)
+    if s is None:
+        s = _EXPR_SLOTS[cls] = tuple(dict.fromkeys(
+            n for c in cls.__mro__ for n in c.__dict__.get("__slots__", ())
+            if n not in ("__dict__", "__weakref__")))
+    return s
+
+
+def freeze_expr(root) -> bytes:
+    """Lossless pickle of an expression (every slot: args with None values and key order,
+    _hash, _type, _meta, comments, parent links), the root's parent dropped."""
+    import copyreg
+    from sqlglot.expressions import Expr
+
+    class P(pickle.Pickler):
+        def reducer_override(self, obj):
+            if not isinstance(obj, Expr):
+                return NotImplemented
+            cls = type(obj)
+            st = {n: getattr(obj, n) for n in _slots(cls) if hasattr(obj, n)}
+            if obj is root:
+                st["parent"] = None
+            return copyreg.__newobj__, (cls,), (getattr(obj, "__dict__", None) or None, st)
+
+    buf = io.BytesIO()
+    P(buf, protocol=pickle.HIGHEST_PROTOCOL).dump(root)
+    return buf.getvalue()
+
+
+def _hashes(root) -> str:
+    """Digest of the cached _hash of every node (copy() carries it over; eq / hash read it)."""
+    from sqlglot.expressions import Expr
+    h = hashlib.blake2b(digest_size=8)
+    seen, stack = set(), [root]
+    while stack:
+        n = stack.pop()
+        if not isinstance(n, Expr) or id(n) in seen:
+            continue
+        seen.add(id(n))
+        h.update(repr(getattr(n, "_hash", None)).encode())
+        t = getattr(n, "_type", None)
+        if t is not None:
+            stack.append(t)
+        for v in n.args.values():
+            stack.extend(v if type(v) is list else (v,))
+    return h.hexdigest()
+
+
+def gen_state(gen) -> str:
+    """Digest of a generator instance's state (slots; closures by their cell contents, e.g. the
+    _next_name counter; object addresses stripped)."""
+    import re
+    import types
+    h = hashlib.blake2b(digest_size=16)
+    for n in _slots(type(gen)):
+        if not hasattr(gen, n):
+            h.update(f"{n}:unset".encode())
+            continue
+        v = getattr(gen, n)
+        if n == "_dispatch":
+            r = repr(sorted((getattr(k, "__qualname__", str(k)), getattr(f, "__qualname__", str(f)))
+                            for k, f in v.items()))
+        elif isinstance(v, types.FunctionType):
+            r = repr((v.__qualname__, [c.cell_contents for c in (v.__closure__ or ())]))
+        elif n == "dialect":
+            r = type(v).__qualname__
+        else:
+            r = repr(v)
+        h.update(f"{n}:{re.sub(r' at 0x[0-9a-f]+', '', r)}".encode())
+    return h.hexdigest()
+
+
+def _depth() -> int:
+    f, n = sys._getframe(1), 0
+    while f is not None:
+        n += 1
+        f = f.f_back
+    return n
+
+
+def _at_depth(want: int, fn):
+    """Call fn with at least `want` frames below it (a patched generator that recurses deeper
+    must hit the recursion limit no later than it would in the recorded run)."""
+    def pad(k):
+        if k <= 0:
+            return fn()
+        return pad(k - 1)
+    return pad(want - _depth())
+
+
+class GenRecorder:
+    """Hooks Generator.generate during the post window: records the executor generator's calls
+    ("py") and query.sql() from _register_subquery ("sql"); any other call, a nested call, an
+    exception or copy=False makes the query ineligible."""
+
+    def __init__(self):
+        self.calls = []
+        self.bad = None
+        self.depth = [0]
+        self.py_gen = None
+
+    def install(self):
+        from sqlglot.generator import Generator
+        from sqlglot.generators.python import PythonGenerator
+        if PythonGenerator.generate is not Generator.generate:
+            self.bad = "PythonGenerator overrides generate"
+        self.orig = Generator.__dict__["generate"]
+        rec = self
+
+        def generate(gen, expression, copy=True):
+            if rec.depth[0]:
+                rec.bad = rec.bad or "nested generate"
+                return rec.orig(gen, expression, copy)
+            f1 = sys._getframe(1)
+            if gen is rec.py_gen and f1.f_code.co_qualname == "PythonExecutor.generate":
+                kind = "py"
+            elif (f1.f_code.co_qualname == "Dialect.generate"
+                  and f1.f_back.f_code.co_qualname.endswith(".sql")
+                  and f1.f_back.f_back.f_code.co_qualname == "PythonExecutor._register_subquery"
+                  and type(gen).__name__ == "Generator"):
+                kind = "sql"
+            else:
+                kind = None
+                rec.bad = rec.bad or f"generate from {f1.f_code.co_qualname}"
+            if copy is not True:
+                rec.bad = rec.bad or "copy=False"
+            rec.depth[0] = 2  # recorder's own work: not coverage of the query
+            try:
+                fz = freeze_expr(expression) if kind else b""
+            except Exception as e:  # noqa: BLE001
+                rec.bad = rec.bad or f"freeze: {type(e).__name__}"
+                fz = b""
+            d_in = strict_digest(expression) + _hashes(expression) if kind else ""
+            depth = _depth()
+            rec.depth[0] = 1
+            try:
+                out = rec.orig(gen, expression, copy)
+            except BaseException:
+                rec.bad = rec.bad or "generate raised"
+                raise
+            finally:
+                rec.depth[0] = 0
+            if kind:
+                rec.depth[0] = 2
+                d_after = strict_digest(expression) + _hashes(expression)
+                rec.depth[0] = 0
+                if d_after != d_in:
+                    rec.bad = rec.bad or "input mutated"
+                rec.calls.append((kind, fz, d_in, depth, out))
+            return out
+
+        Generator.generate = generate
+
+    def uninstall(self):
+        from sqlglot.generator import Generator
+        Generator.generate = self.orig
+
+
+class _SplitCov:
+    """Post-window coverage split into lines run inside the recorded generate calls and lines
+    run outside. A location is DISABLEd only on an outside hit (final: it counts as outside);
+    inside hits keep it enabled, so a later outside hit is still seen."""
+
+    TOOL = 4
+
+    def __init__(self, prefix: str, depth: list):
+        self.prefix = prefix
+        self.inside: dict[str, set[int]] = {}
+        self.outside: dict[str, set[int]] = {}
+        self.dep = depth
+
+    def start(self):
+        mon = sys.monitoring
+        mon.use_tool_id(self.TOOL, "subtest")
+        prefix, ins, outs, plen, dep = self.prefix, self.inside, self.outside, len(self.prefix), self.dep
+        DISABLE = mon.DISABLE
+
+        def line(code, lineno):
+            fn = code.co_filename
+            if fn.startswith(prefix):
+                if dep[0] == 2:
+                    return None
+                if dep[0]:
+                    ins.setdefault(fn[plen:], set()).add(lineno)
+                    return None
+                outs.setdefault(fn[plen:], set()).add(lineno)
+            return DISABLE
+
+        mon.register_callback(self.TOOL, mon.events.LINE, line)
+        mon.set_events(self.TOOL, mon.events.LINE)
+        mon.restart_events()
+
+    def stop(self):
+        mon = sys.monitoring
+        mon.set_events(self.TOOL, 0)
+        mon.register_callback(self.TOOL, mon.events.LINE, None)
+        mon.free_tool_id(self.TOOL)
+        out = {k: sorted(v) for k, v in self.outside.items()}
+        inside_only = {}
+        for k, v in self.inside.items():
+            only = sorted(v - self.outside.get(k, set()))
+            if only:
+                inside_only[k] = only
+        union = {k: sorted(set(out.get(k, ())) | set(self.inside.get(k, ())))
+                 for k in set(out) | set(self.inside)}
+        return union, out, inside_only
+
+
+def gen_replay(calls, iso: bool = True) -> bool:
+    """Replay recorded generate calls with the code in place; True when every output string and
+    the final generator state equal the recorded ones."""
+    import sqlglot.executor as E
+    calls, state = calls
+    py = E.PythonExecutor().generator
+    for kind, fz, d_in, depth, out in calls:
+        e = pickle.loads(fz)
+        if strict_digest(e) + _hashes(e) != d_in:
+            return False
+        fn = (lambda e=e: py.generate(e)) if kind == "py" else (lambda e=e: e.sql())
+        if _at_depth(depth, fn) != out:
+            return False
+    if gen_state(py) != state:
+        return False
+    if iso:
+        # outputs must not depend on what earlier calls left in the shared instance (the
+        # executor's call order follows set iteration over plan steps)
+        for kind, fz, d_in, depth, out in calls:
+            if kind != "py":
+                continue
+            e = pickle.loads(fz)
+            g = E.PythonExecutor().generator
+            if _at_depth(depth, lambda: g.generate(e)) != out:
+                return False
+    return True
+
+
+def gen_forbidden(root: str) -> dict:
+    """{relpath: lines} of the functions that decide whether the generator sees its input
+    uncopied (with the pinned parent): touching them disables the generate checkpoint."""
+    import inspect
+    from sqlglot import exp
+    from sqlglot.generator import Generator
+    from sqlglot.dialects.dialect import Dialect
+    out: dict[str, list[int]] = {}
+    cls = type(exp.column("a"))
+    fns = [Generator.generate, Dialect.generate]
+    for c in cls.__mro__:
+        for n in ("copy", "__deepcopy__", "sql"):
+            if n in c.__dict__:
+                fns.append(c.__dict__[n])
+    for f in fns:
+        f = inspect.unwrap(f)
+        lines, first = inspect.getsourcelines(f)
+        path = os.path.relpath(inspect.getsourcefile(f), root)
+        out.setdefault(path, []).extend(range(first, first + len(lines)))
+    return {k: sorted(set(v)) for k, v in out.items()}
+
+
+def exec_windows(expr, schema, used, cov_factory=None, swap_until=None, gen_prefix=None):
     """execute(expr, schema=schema, tables=used) window by window.
-    → ({window: coverage}, result digest)."""
+    → ({window: coverage}, result digest[, generate calls])."""
     import sqlglot.executor as E
     covs = {}
 
@@ -182,8 +465,22 @@ def exec_windows(expr, schema, used, cov_factory=None, swap_until=None):
     oe = window("optb", optb)
     d_opt = strict_digest(oe)
     plan = window("plan", lambda: E.Plan(oe))
-    res = window("post", lambda: pickle.loads(pickle.dumps(E.PythonExecutor(tables=tables_).execute(plan))))
-    return covs, d_opt, digest_table(res)
+    if gen_prefix is None:
+        res = window("post", lambda: pickle.loads(pickle.dumps(E.PythonExecutor(tables=tables_).execute(plan))))
+        return covs, d_opt, digest_table(res)
+    rec = GenRecorder()
+    cov = _SplitCov(gen_prefix, rec.depth)
+    rec.install()
+    cov.start()
+    try:
+        ex = E.PythonExecutor(tables=tables_)
+        rec.py_gen = ex.generator
+        res = pickle.loads(pickle.dumps(ex.execute(plan)))
+    finally:
+        covs["post"], covs["post_out"], covs["post_in"] = cov.stop()
+        rec.uninstall()
+    calls = None if rec.bad else (rec.calls, gen_state(ex.generator))
+    return covs, d_opt, digest_table(res), (calls, rec.bad)
 
 
 # ── build-machine calibration ────────────────────────────────────────────────────
@@ -241,6 +538,256 @@ def _norm(cpu: float, c0: float, c1: float) -> float:
     if os.environ.get("BR_SUBTEST_NOCALIB") == "1" or not CALIB_REF:
         return cpu
     return cpu * CALIB_REF / max(1e-6, (c0 + c1) / 2)
+# ── moon-22: per-optimizer-rule checkpoints inside the optb window ───────────
+#
+# optimize() = glue (ensure_schema, maybe_parse(copy=True), the rule loop) + RULES[0..13];
+# execute() then calls .sql(pretty=True) (step 14). Boundary k = the tree rule k receives
+# (k = 1..14; 14 = the tree .sql() receives). A touched line's "first step" is the lowest step
+# whose window runs it (glue = -1). If every touched optb line first runs in step >= k, rules
+# 0..k-1 run untouched code on the same input as at build → the real test's tree at boundary
+# k is the stored one (checked seed-invariant, see seed_digests). Then
+#   optimize(ck_k, fresh schema, rules=RULES[k:], copy=False) + .sql(pretty=True)
+# under the new code must give the pinned optimized digest d_opt (as moon-05's optb check).
+# Usable boundaries are proven at build: the pinned code from the unpickled checkpoint with a
+# fresh schema reproduces d_opt (covers serde round-trip loss and schema cache state).
+
+NSTEPS = 15  # 14 rules + the debug .sql()
+
+
+def rule_steps(expr, schema_, cov_factory=None, keep=False, timer=False):
+    """optimize(expr, schema_, leave_tables_isolated=True, dialect=None) mirrored step by step
+    (same objects, same kwargs glue), then .sql(pretty=True).
+    → (covs {step: cov}, boundary pickles {k: bytes} | None, boundary digests {k: str},
+       final digest, cpu {step: s})"""
+    import inspect
+    import sqlglot.optimizer.optimizer as O
+    covs, cks, digs, cpu = {}, ({} if keep else None), {}, {}
+
+    def step(idx, fn):
+        cov = cov_factory() if cov_factory else None
+        t0 = time.process_time()
+        if cov:
+            cov.start()
+        try:
+            return fn()
+        finally:
+            if cov:
+                covs[idx] = cov.stop()
+            cpu[idx] = time.process_time() - t0
+
+    def glue():
+        sch = O.ensure_schema(schema_, dialect=None)
+        kw = {"db": None, "catalog": None, "schema": sch, "dialect": None, "sql": None,
+              "isolate_tables": True, "quote_identifiers": False, "leave_tables_isolated": True}
+        return O.exp.maybe_parse(expr, dialect=None, copy=True), kw
+
+    opt, kw = step(-1, glue)
+    for k, rule in enumerate(O.RULES):
+        if k:
+            digs[k] = strict_digest(opt)
+            if keep:
+                cks[k] = ck_dumps(opt)
+        params = inspect.getfullargspec(rule).args
+        rkw = {p: kw[p] for p in params if p in kw}
+        opt = step(k, lambda: rule(opt, **rkw))
+    digs[NSTEPS - 1] = strict_digest(opt)
+    if keep:
+        cks[NSTEPS - 1] = ck_dumps(opt)
+    step(NSTEPS - 1, lambda: opt.sql(pretty=True))
+    return covs, cks, digs, strict_digest(opt), cpu
+
+
+_SLOTS: dict = {}
+
+
+def ck_dumps(tree) -> bytes:
+    """Lossless pickle of an expression tree: every slot / __dict__ attribute of every node as
+    is (args with None values, parent links, _type, _meta, _hash, sharing), bypassing Expr's
+    serde-based __reduce__ (which drops None-valued args). Loading runs no sqlglot code."""
+    import copyreg
+    from sqlglot.expressions import Expr
+
+    class P(pickle.Pickler):
+        def reducer_override(self, obj):
+            if not isinstance(obj, Expr):
+                return NotImplemented
+            cls = type(obj)
+            slots = _SLOTS.get(cls)
+            if slots is None:
+                slots = _SLOTS[cls] = tuple(dict.fromkeys(
+                    n for c in cls.__mro__ for n in c.__dict__.get("__slots__", ())
+                    if n not in ("__dict__", "__weakref__")))
+            st = {n: getattr(obj, n) for n in slots if hasattr(obj, n)}
+            # copyreg.__newobj__ → NEWOBJ (cls.__new__(cls)): no reference to this module
+            return copyreg.__newobj__, (cls,), (getattr(obj, "__dict__", None) or None, st)
+
+    buf = io.BytesIO()
+    P(buf, protocol=pickle.HIGHEST_PROTOCOL).dump(tree)
+    return buf.getvalue()
+
+
+def from_checkpoint(ck: bytes, schema_dict: dict, k: int):
+    """What the run-time child does for boundary k: → optimized tree (after .sql())."""
+    import sqlglot.executor as E
+    import sqlglot.optimizer.optimizer as O
+    e = pickle.loads(ck)
+    sch = E.ensure_schema(schema_dict, dialect=None)
+    oe = E.optimize(e, sch, leave_tables_isolated=True, dialect=None, rules=O.RULES[k:], copy=False)
+    oe.sql(pretty=True)
+    return oe
+
+
+def seed_digests(root: Path) -> dict:
+    """Boundary digests of every executed TPC query under this process's hash seed."""
+    sys.path.insert(0, str(root))
+    sys.setrecursionlimit(1000)
+    from tests.helpers import TPCDS_SCHEMA, TPCH_SCHEMA, load_sql_fixture_pairs
+    from sqlglot import parse_one
+    import sqlglot.executor as E
+    schemas = {"tpch": TPCH_SCHEMA, "tpcds": TPCDS_SCHEMA}
+    out = {}
+    for suite in SUITES:
+        fixture = SUITES[suite] + ("tpc-h.sql" if suite == "tpch" else "tpc-ds.sql")
+        for i, (qmeta, sql, _) in enumerate(load_sql_fixture_pairs(fixture)):
+            if not qmeta.get("execute"):
+                continue
+            try:
+                e = pickle.loads(pickle.dumps(parse_one(sql)))
+                sch = E.ensure_schema(schemas[suite], dialect=None)
+                _, _, digs, dfin, _ = rule_steps(e, sch)
+                out[(suite, i)] = (digs, dfin)
+            except Exception:  # noqa: BLE001
+                out[(suite, i)] = None
+    return out
+
+
+def _seed_runs(root: Path) -> dict:
+    """{(suite, i): [boundary digests per seed]} for seeds 0 (this build), 1, 2 — each in its
+    own interpreter (the hash seed is fixed at start-up)."""
+    import subprocess
+    import tempfile
+    runs = {}
+    # moon-26: both interpreters side by side (independent; the build has spare cores)
+    with tempfile.TemporaryDirectory() as td:
+        procs = []
+        for seed in ("1", "2"):
+            env = dict(os.environ, PYTHONHASHSEED=seed)
+            f = os.path.join(td, f"{seed}.pkl")
+            procs.append((f, subprocess.Popen(
+                [sys.executable, "-m", "selector.subtest", "seeddig", str(root), f],
+                cwd=str(REPO), env=env)))
+        for f, proc in procs:
+            if proc.wait() != 0:
+                raise subprocess.CalledProcessError(proc.returncode, "seeddig")
+        for f, _ in procs:
+            with open(f, "rb") as fh:
+                got = pickle.load(fh)
+            for key, v in got.items():
+                runs.setdefault(key, []).append(v)
+    return runs
+
+
+def _build_rules(outs, optb_cov, pexpr, schema_dict, prefix, seed_runs) -> None:
+    """Per-step coverage (first step per line), boundary checkpoints, which are usable, and
+    the CPU to verify from each. Runs inside the query's traced fork."""
+    import sqlglot.executor as E
+
+    def traced_steps():
+        e = pickle.loads(pexpr)
+        sch = E.ensure_schema(schema_dict, dialect=None)
+        covs, cks, digs, dfin, _ = rule_steps(e, sch, lambda: _Cov(prefix), keep=True)
+        cov = _Cov(prefix)
+        cov.start()
+        for ck in cks.values():
+            pickle.loads(ck)
+        ckload = cov.stop()
+        return covs, cks, digs, dfin, ckload
+
+    covs, cks, digs, dfin, ckload = _in_fork(traced_steps)
+    if dfin != outs["d_opt"]:
+        raise RuntimeError("rule mirror differs from optimize()")
+    # lines execute()'s optb window runs that no mirrored step runs: optimize()'s own glue
+    seen: dict[str, set[int]] = {}
+    for c in covs.values():
+        for f, ls in c.items():
+            seen.setdefault(f, set()).update(ls)
+    glue = dict(covs[-1])
+    for f, ls in optb_cov.items():
+        extra = set(ls) - seen.get(f, set())
+        if extra:
+            glue[f] = sorted(set(glue.get(f, ())) | extra)
+    covs[-1] = glue
+    # the checkpoint loads run serde under the new code: treat as glue
+    for f, ls in ckload.items():
+        covs[-1][f] = sorted(set(covs[-1].get(f, ())) | set(ls))
+    outs["fs"] = _first_steps(covs)
+
+    def timed_steps():
+        e = pickle.loads(pexpr)
+        sch = E.ensure_schema(schema_dict, dialect=None)
+        return rule_steps(e, sch)[2:]
+
+    digs2, dfin2, cpu = _in_fork(timed_steps)
+    if digs2 != digs or dfin2 != dfin:
+        raise RuntimeError("rule steps not reproducible")
+    ok, cpu_from = [], {}
+    for k in range(1, NSTEPS):
+        # the same tree at boundary k under other hash seeds (the real test's seed is random)
+        if not seed_runs or len(seed_runs) != 2 or any(
+                r is None or r[0].get(k) != digs[k] or r[1] != dfin for r in seed_runs):
+            continue
+
+        def check(k=k):
+            t0 = time.process_time()
+            oe = from_checkpoint(cks[k], schema_dict, k)
+            t1 = time.process_time()
+            return strict_digest(oe), t1 - t0
+
+        try:
+            d, c = _in_fork(check)
+        except RuntimeError:
+            continue
+        if d == dfin:
+            ok.append(k)
+            cpu_from[k] = c
+    if cpu_from:
+        # one calibration per query (in its own fork, after the timed runs), as stage_timed
+        c1 = _in_fork(_calib)
+        cpu_from = {k: _norm(c, c1, c1) for k, c in cpu_from.items()}
+    outs["ck_ok"] = ok
+    outs["cpu_from"] = cpu_from
+    outs["cpu_steps"] = cpu
+    outs["_cks"] = {k: cks[k] for k in ok}
+
+
+def _first_steps(covs: dict) -> dict:
+    """{file: (sorted lines tuple, first-step tuple)} from {step: {file: lines}}."""
+    first: dict[str, dict[int, int]] = {}
+    for idx in sorted(covs, reverse=True):
+        for f, ls in covs[idx].items():
+            d = first.setdefault(f, {})
+            for ln in ls:
+                d[ln] = idx
+    return {f: (tuple(sorted(d)), bytes(i + 1 for _, i in sorted(d.items())))
+            for f, d in first.items()}
+
+
+def _min_step(fs: dict, spans: dict):
+    """Lowest first step over the touched lines (None: no touched optb line)."""
+    import bisect
+    best = None
+    for path, ss in spans.items():
+        got = fs.get(path)
+        if not got:
+            continue
+        lines, idx = got
+        for first, last in ss:
+            j = bisect.bisect_left(lines, first)
+            while j < len(lines) and lines[j] <= last:
+                v = idx[j] - 1
+                best = v if best is None else min(best, v)
+                j += 1
+    return best
 
 
 # ── build ─────────────────────────────────────────────────────────────────────
@@ -330,6 +877,13 @@ def _in_fork(fn):
     return pickle.loads(data)
 
 
+_BUILD_ONE = None
+
+
+def _build_one_entry(i):
+    return _BUILD_ONE(_BUILD_ITEMS[i])
+
+
 def build(root: Path, out: Path) -> None:
     root = root.resolve()
     sys.path.insert(0, str(root))
@@ -358,12 +912,25 @@ def build(root: Path, out: Path) -> None:
         return cov.stop()
 
     meta["global"] = _in_fork(global_phase)
+    meta["gen_forbid"] = gen_forbidden(str(root))
+    ckdata: dict[str, bytes] = {}
+    seeds = _seed_runs(root) if RULES_BUILD else {}
     tables = {s: make_tables(s) for s in SUITES}
+    items = []
     for suite in SUITES:
-        queries = []
         fixture = SUITES[suite] + ("tpc-h.sql" if suite == "tpch" else "tpc-ds.sql")
-        for qmeta, sql, optimized in load_sql_fixture_pairs(fixture):
-            q = {"sql": sql, "optimized": optimized, "execute": bool(qmeta.get("execute"))}
+        for qi, (qmeta, sql, optimized) in enumerate(load_sql_fixture_pairs(fixture)):
+            items.append((suite, qi, {"sql": sql, "optimized": optimized,
+                                      "execute": bool(qmeta.get("execute"))}))
+
+    global _BUILD_ITEMS
+    _BUILD_ITEMS = items
+
+    def one(item):
+        """One query, everything in fresh forks of this process → (q, its checkpoints)."""
+        suite, qi, q = item
+        ckq = {}
+        if True:
 
             def traced(q=q):
                 from sqlglot import find_tables, parse_one, transpile
@@ -393,10 +960,11 @@ def build(root: Path, out: Path) -> None:
                         cov.start()
                         u = {t.name: tables[suite][t.name] for t in find_tables(e3)}
                         ft = cov.stop()
-                        covs, d_opt, dres = exec_windows(e3, schemas[suite], u, lambda: _Cov(prefix))
+                        covs, d_opt, dres, gen = exec_windows(e3, schemas[suite], u, lambda: _Cov(prefix),
+                                                              gen_prefix=prefix)
                         covs["prep"] = {k: sorted(set(v) | set(ft.get(k, ()))) for k, v in
                                         list(covs["prep"].items()) + list(ft.items())}
-                        return covs, d_opt, dres
+                        return covs, d_opt, dres, gen
 
                     def stage_timed():
                         t0 = time.process_time()
@@ -409,11 +977,33 @@ def build(root: Path, out: Path) -> None:
                         cpu_stage = time.process_time() - t0
                         c1 = _calib()  # after: it must not warm caches for the run
                         return d2, _norm(cpu_stage, c1, c1)
-                    covs, d_opt, dres = _in_fork(windows)
+                    covs, d_opt, dres, (gcalls, gbad) = _in_fork(windows)
                     d2, cpu_stage = _in_fork(stage_timed)
                     phases["win"] = covs
                     outs["d_opt"] = d_opt if (dres == outs["exec"] and d2 == d_opt) else None
                     outs["cpu_stage"] = cpu_stage
+                    if RULES_BUILD and outs["d_opt"]:
+                        try:
+                            _build_rules(outs, covs["optb"], pexpr, schemas[suite], prefix,
+                                         seeds.get((suite, qi)))
+                        except RuntimeError:
+                            for k in ("fs", "ck_ok", "cpu_from", "_cks"):
+                                outs.pop(k, None)
+                    # moon-25: the recorded generate calls must replay with the pinned code
+                    # (fresh fork, as the run-time child does) to be used
+                    outs["gen"], outs["gen_cpu"], outs["gen_why"] = None, 0.0, gbad
+                    if gcalls is not None and dres == outs["exec"]:
+                        def gen_timed():
+                            t0 = time.process_time()
+                            ok = gen_replay(gcalls)
+                            cpu = time.process_time() - t0
+                            c1 = _calib()  # after: it must not warm caches for the run
+                            return ok, _norm(cpu, c1, c1)
+                        ok, gcpu = _in_fork(gen_timed)
+                        if ok:
+                            outs["gen"], outs["gen_cpu"] = pickle.dumps(gcalls), gcpu
+                        else:
+                            outs["gen_why"] = "pinned replay differs"
                 cov = _Cov(prefix)
                 cov.start()
                 outs["duck"] = transpile(q["sql"], write="duckdb")[0]
@@ -440,6 +1030,8 @@ def build(root: Path, out: Path) -> None:
 
             try:
                 phases, outs = _in_fork(traced)
+                for k, data in outs.pop("_cks", {}).items():
+                    ckq[f"ck/{suite}/{qi}/{k}"] = data
                 if suite == "tpch":
                     phases["opt"], duck, outs["opt"] = _in_fork(traced_opt)
                     if duck != outs["duck"]:
@@ -454,14 +1046,39 @@ def build(root: Path, out: Path) -> None:
                 phases, outs, cpu_exec, cpu_opt, stable, calib = {}, {}, 0.0, 0.0, False, 0.0
             q.update(phases=phases, outs=outs, cpu_exec=cpu_exec, cpu_opt=cpu_opt, stable=stable,
                      calib=calib)
-            queries.append(q)
-            print(f"{suite} {len(queries)} exec={q['execute']} cpu={cpu_exec:.2f}/{cpu_opt:.2f}"
-                  f" stable={stable} calib={calib * 1000:.1f}ms", file=sys.stderr)
-        meta["suites"][suite] = queries
+        return q, ckq
+
+    # moon-26: queries are independent (each runs in fresh forks of this process, which runs
+    # nothing between them), so a fork pool of BR_SUBTEST_JOBS workers runs them side by side;
+    # results come back in fixture order.
+    jobs = max(1, int(os.environ.get("BR_SUBTEST_JOBS", "1")))
+    global _BUILD_ONE
+    _BUILD_ONE = one
+    if jobs > 1:
+        import multiprocessing as mp
+        pool = mp.get_context("fork").Pool(jobs)
+        results = pool.imap(_build_one_entry, range(len(items)), chunksize=1)
+    else:
+        pool, results = None, map(_build_one_entry, range(len(items)))
+    for (suite, qi, _), (q, ckq) in zip(items, results):
+        ckdata.update(ckq)
+        queries = meta["suites"].setdefault(suite, [])
+        assert len(queries) == qi
+        queries.append(q)
+        print(f"{suite} {len(queries)} exec={q['execute']} cpu={q['cpu_exec']:.2f}/{q['cpu_opt']:.2f}"
+              f" stable={q['stable']} calib={q['calib'] * 1000:.1f}ms"
+              f" gen={len(g) if (g := q['outs'].get('gen')) else 0}B/{q['outs'].get('gen_cpu', 0):.3f}s"
+              f" {q['outs'].get('gen_why') or ''}", file=sys.stderr)
+    if pool is not None:
+        pool.close()
+        pool.join()
+    _BUILD_ONE = None
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".tmp")
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("meta.pkl", pickle.dumps(meta))
+        for name, data in ckdata.items():
+            zf.writestr(name, data)
         for suite in SUITES:
             for name, (cols, rows) in raw[suite].items():
                 zf.writestr(f"{suite}/{name}", marshal.dumps((tuple(cols), rows)))
@@ -736,7 +1353,7 @@ class SubTest:
                 if hit:
                     if not q["stable"]:
                         return None
-                    x = (suite, i, kind == "optimized", "full", False, False, False)
+                    x = (suite, i, kind == "optimized", "full", False, False, False, 0, False)
                     win = ph.get("win")
                     if (STAGE and getattr(self, "stage_ok", False) and kind == "execute"
                             and q["execute"] and win and q["outs"].get("d_opt")):
@@ -745,10 +1362,28 @@ class SubTest:
                             for f, ls in w.items():
                                 wl.setdefault(f, set()).update(ls)
                         glue = {f: sorted(set(ls) - wl.get(f, set())) for f, ls in ph["exec"].items()}
-                        later = any(_hit(win[w], spans) for w in ("prep", "plan", "post"))
+                        later = any(_hit(win[w], spans) for w in ("prep", "plan"))
+                        gen_hit = False
+                        if _hit(win["post"], spans):
+                            # moon-25: post touched only inside the recorded generate calls
+                            if (GEN and q["outs"].get("gen") and "post_out" in win
+                                    and not _hit(win["post_out"], spans)
+                                    and not _hit(meta.get("gen_forbid") or {"?": [0]}, spans)):
+                                gen_hit = True
+                            else:
+                                later = True
                         if not later and not _hit(glue, spans):
+                            optb_hit = _hit(win["optb"], spans)
+                            k = 0
+                            fs = q["outs"].get("fs")
+                            if RULES_ON and optb_hit and fs and q["outs"].get("ck_ok"):
+                                # moon-22: start at the last usable boundary before the first
+                                # step that runs a touched line
+                                first = _min_step(fs, spans)
+                                if first is not None and first > 0:
+                                    k = max((b for b in q["outs"]["ck_ok"] if b <= first), default=0)
                             x = (suite, i, False, "stage", _hit(ph["parse"], spans),
-                                 _hit(win["optb"], spans), _hit(ph["duck"], spans))
+                                 optb_hit, _hit(ph["duck"], spans), k, gen_hit)
                     todo.append(x)
                     cpu += self._cpu(x)
             out[n] = todo
@@ -860,15 +1495,20 @@ class SubTest:
             return set(), f"subtest: keep ({type(e).__name__})"
         if not ok:
             return set(), f"subtest: keep (verification of {len(todo)} queries failed, {self.last_child:.2f}s, est {est:.2f}, cap {cap:.2f})"
+        nr = sum(1 for x in todo if x[3] == "stage" and x[5] and x[7])
         return chosen, (f"subtest: {sorted(chosen)} dropped ({len(todo)} queries re-run,"
-                        f" {self.last_child:.2f}s, est {est:.2f}, cap {cap:.2f})")
+                        f" {self.last_child:.2f}s, est {est:.2f}, cap {cap:.2f}) [rule checkpoints {nr}]")
 
     def _cpu(self, x):
-        suite, i, opt, mode, parse_hit, optb_hit, duck_hit = x
+        suite, i, opt, mode, parse_hit, optb_hit, duck_hit, k, gen_hit = x
         q = self.meta()["suites"][suite][i]
         if mode == "stage":
-            # parse / duck transpile: a few ms; optb from the checkpoint: its pinned CPU
-            return 0.02 + (q["outs"]["cpu_stage"] if optb_hit else 0.0)
+            # parse / duck transpile: a few ms; optb from the checkpoint: its pinned CPU;
+            # generate replay (moon-25): its pinned CPU
+            g = q["outs"]["gen_cpu"] + 0.01 if gen_hit else 0.0
+            if optb_hit and k:
+                return 0.02 + q["outs"]["cpu_from"][k] + g
+            return 0.02 + (q["outs"]["cpu_stage"] if optb_hit else 0.0) + g
         return q["cpu_opt"] if opt else q["cpu_exec"]
 
 
@@ -966,12 +1606,14 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
     full = []
     fb_cpu = 0.0  # pinned CPU of the queries re-run whole after a checkpoint diverged
     # checkpoint-verified queries first (cheap; a divergence ends the child early)
-    for suite, i, opt, mode, parse_hit, optb_hit, duck_hit in todo:
+    zck = zipfile.ZipFile(store)
+    for suite, i, opt, mode, parse_hit, optb_hit, duck_hit, k, gen_hit in todo:
         if mode != "stage":
             full.append((suite, i, opt))
             continue
         q = meta["suites"][suite][i]
-        signal.setitimer(signal.ITIMER_PROF, 3 * q["outs"]["cpu_stage"] + 0.8)
+        signal.setitimer(signal.ITIMER_PROF, 3 * ((q["outs"]["cpu_from"][k] if k else q["outs"]["cpu_stage"])
+                                                  + q["outs"].get("gen_cpu", 0.0)) + 0.8)
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             try:
                 if duck_hit and _transpile(q["sql"], write="duckdb")[0] != q["outs"]["duck"]:
@@ -983,7 +1625,17 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
                         if not FALLBACK and fb_cpu > FALLBACK_CAP: return False
                         full.append((suite, i, opt))  # parse differs: run the whole query
                         continue
-                if optb_hit:
+                if optb_hit and k:
+                    # moon-22: from the stored tree at boundary k, rules k.. under the new code
+                    oe = from_checkpoint(zck.read(f"ck/{suite}/{i}/{k}"), meta["schemas"][suite], k)
+                    if strict_digest(oe) != q["outs"]["d_opt"]:
+                        if os.environ.get("SUBTEST_DEBUG"):
+                            print("subtest rule diff:", suite, i, k, file=sys.stderr)
+                        fb_cpu += q["cpu_exec"]
+                        if not FALLBACK and fb_cpu > FALLBACK_CAP: return False
+                        full.append((suite, i, opt))
+                        continue
+                elif optb_hit:
                     e = pickle.loads(q["outs"]["pexpr"])
                     sch = E.ensure_schema(meta["schemas"][suite], dialect=None)
                     oe = E.optimize(e, sch, leave_tables_isolated=True, dialect=None)
@@ -995,7 +1647,17 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
                         if not FALLBACK and fb_cpu > FALLBACK_CAP: return False
                         full.append((suite, i, opt))  # optimized tree differs: run it all
                         continue
+                if gen_hit and not gen_replay(pickle.loads(q["outs"]["gen"])):
+                    if os.environ.get("SUBTEST_DEBUG"):
+                        print("subtest gen diff:", suite, i, file=sys.stderr)
+                    fb_cpu += q["cpu_exec"]
+                    if not FALLBACK and fb_cpu > FALLBACK_CAP: return False
+                    full.append((suite, i, opt))  # generated code differs: run it all
+                    continue
             except Exception:  # noqa: BLE001
+                if os.environ.get("SUBTEST_DEBUG"):
+                    import traceback
+                    traceback.print_exc(file=sys.__stderr__)
                 return False
     tables: dict = {}
     with zipfile.ZipFile(store) as zf:
@@ -1031,5 +1693,8 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "build":
         build(Path(sys.argv[2]), Path(sys.argv[3]))
+    elif len(sys.argv) == 4 and sys.argv[1] == "seeddig":
+        with open(sys.argv[3], "wb") as fh:
+            pickle.dump(seed_digests(Path(sys.argv[2])), fh)
     else:
         sys.exit("usage: python -m selector.subtest build SQLGLOT_ROOT OUT.zip")
