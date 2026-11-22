@@ -62,6 +62,8 @@ SHARE = 0.6  # spend at most this share of what dropping saves
 # estimate stays under NET_SHARE x its saving (fail-fast: a divergent query ends the child).
 NET_SHARE = float(os.environ.get("BR_SUBTEST_NET", "0.95"))
 NET_EST_MAX = float(os.environ.get("BR_SUBTEST_NET_MAX", "13"))  # laptop s, whole child
+NET_CPU_FACTOR = float(os.environ.get("BR_SUBTEST_NET_CPU_FACTOR", str(SCORER_SLOWDOWN)))
+NET_CAP_SHARE = float(os.environ.get("BR_SUBTEST_NET_CAP_SHARE", "1.0"))  # child CPU cap / saving
 
 
 # ── shared: what the test does for one query ─────────────────────────────────
@@ -1522,7 +1524,7 @@ class SubTest:
                     for n in subset:
                         todo.extend(x for x in per[n] if x not in todo)
                     est = sum(self._cpu(x) for x in todo) + (0.3 if todo else 0.0)
-                    spend = SCORER_SLOWDOWN * est
+                    spend = NET_CPU_FACTOR * est
                     gain = benefit_of(set(subset))
                     if gain > 0 and est <= NET_EST_MAX and spend <= NET_SHARE * gain / 1000:
                         net = gain / 1000 - spend
@@ -1540,7 +1542,7 @@ class SubTest:
                 # past the saving every outcome loses (the child's CPU is charged 2x)
                 # (raw CPU where it runs: on the scorer that is what is charged)
                 cap = min(2.5 * est + 1.0 + FALLBACK_CAP,
-                          benefit_of(chosen) / 1000 if NET_SHARE < 100 else 99)
+                          NET_CAP_SHARE * benefit_of(chosen) / 1000 if NET_SHARE < 100 else 99)
             ok = self.verify(jobs, todo, cap)
         except Exception as e:  # noqa: BLE001
             return set(), f"subtest: keep ({type(e).__name__})"
