@@ -1635,26 +1635,8 @@ class SubTest:
                         return True
         return False
 
-    def prune_patched(self, root: str, patched: dict[str, str], spans: dict,
-                      candidates: set[int], benefit_of, stage_ok: bool,
-                      real_gain=None) -> tuple[set[int], str]:
-        """r37. The TPC tests of a commit whose .py edits are not all clean function-body
-        edits (class / module bodies, definition-time code: no diffexec job): `spans` are the
-        OLD-file lines whose run can behave differently (touched function statements, and the
-        lines reading every value the import-state diff shows changed). The queries that run
-        one are re-run in a fresh interpreter importing the PATCHED package and must give the
-        pinned outputs; the others run identical code on identical state."""
-        cands = candidates & set(self.numbers)
-        if not cands:
-            return set(), ""
-        self.stage_ok, self.stage_why = stage_ok, (None if stage_ok else "guard")
-        try:
-            got = self.plan(spans, cands)
-        except Exception as e:  # noqa: BLE001
-            return set(), f"tpc-patched: keep ({type(e).__name__})"
-        if got is None:
-            return set(), "tpc-patched: keep (set-up touched / unknown / unstable)"
-        per, cpu = got
+    def patched_best(self, per: dict, benefit_of) -> tuple:
+        """r37 gate: (net, chosen subset, todo, est) of the best subset (chosen empty: none)."""
         import itertools
         best = (0.0, set(), [], 0.0)
         nums = sorted(per)
@@ -1670,7 +1652,32 @@ class SubTest:
                     net = gain / 1000 - spend
                     if net > best[0]:
                         best = (net, set(subset), todo, est)
-        _, chosen, todo, est = best
+        return best
+
+    def prune_patched(self, root: str, patched: dict[str, str], spans: dict,
+                      candidates: set[int], benefit_of, stage_ok: bool,
+                      real_gain=None, planned=None) -> tuple[set[int], str]:
+        """r37. The TPC tests of a commit whose .py edits are not all clean function-body
+        edits (class / module bodies, definition-time code: no diffexec job): `spans` are the
+        OLD-file lines whose run can behave differently (touched function statements, and the
+        lines reading every value the import-state diff shows changed). The queries that run
+        one are re-run in a fresh interpreter importing the PATCHED package and must give the
+        pinned outputs; the others run identical code on identical state."""
+        cands = candidates & set(self.numbers)
+        if not cands:
+            return set(), ""
+        self.stage_ok, self.stage_why = stage_ok, (None if stage_ok else "guard")
+        if planned is not None:  # r40: planned by the caller with the same stage_ok
+            got = planned
+        else:
+            try:
+                got = self.plan(spans, cands)
+            except Exception as e:  # noqa: BLE001
+                return set(), f"tpc-patched: keep ({type(e).__name__})"
+        if got is None:
+            return set(), "tpc-patched: keep (set-up touched / unknown / unstable)"
+        per, cpu = got
+        _, chosen, todo, est = self.patched_best(per, benefit_of)
         if not chosen:
             return set(), (f"tpc-patched: keep (est {cpu:.1f}s CPU for "
                            f"{sum(map(len, per.values()))} queries)")

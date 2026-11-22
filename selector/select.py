@@ -464,6 +464,15 @@ class Selector:
                 return keep(spans)
             if st.unrecorded(spans, cands):
                 return keep("a changed line ran outside the recorded queries")
+            # r40: plan (as prune_patched will, stage guard passed) before the stage guard:
+            # no subset within budget → keep without the guard's CPU (09if: 0.27 s)
+            st.stage_ok, st.stage_why = True, None
+            planned = st.plan(spans, cands)
+            if planned is None:
+                return keep("set-up touched / unknown / unstable")
+            if not st.patched_best(planned[0], benefit)[1]:
+                return keep(f"est {planned[1]:.1f}s CPU for "
+                            f"{sum(map(len, planned[0].values()))} queries")
             from .subtest import stage_guard
             why = stage_guard(str(self.sqlglot), [(p, t, None) for p, t in patched.items()],
                               skip=self._tpc_guard_skip)
@@ -475,7 +484,8 @@ class Selector:
             return keep(f"may write shared state: {why}"[:160])
         try:
             dropped, note = st.prune_patched(str(self.sqlglot), patched, spans, cands, benefit,
-                                             True, real_gain=lambda only: self._real_gain(everything, only))
+                                             True, real_gain=lambda only: self._real_gain(everything, only),
+                                             planned=planned)
         except Exception as e:  # noqa: BLE001
             return keep(type(e).__name__)
         if note:
