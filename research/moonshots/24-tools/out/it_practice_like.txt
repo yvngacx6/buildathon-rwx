@@ -1,0 +1,29 @@
+  06t7       B   2.0s/ 385  ran changed instr  385  droppable    0  saves   0.0s  (pre-test hit)
+  0rza       B   0.3s/   2  ran changed instr    2  droppable    0  saves   0.0s
+  1k2u       B   1.8s/  90  ran changed instr   25  droppable   65  saves   0.0s
+  1o11       B   4.2s/  95  ran changed instr   95  droppable    0  saves   0.0s
+  67nj       B   0.0s/   1  ran changed instr    1  droppable    0  saves   0.0s
+  7ozv       B   0.0s/   5  ran changed instr    4  droppable    1  saves   0.0s
+  7zco       B   0.0s/   1  ran changed instr    1  droppable    0  saves   0.0s  (pre-test hit)
+  8ma9       B   0.7s/  10  ran changed instr   10  droppable    0  saves   0.0s
+  d0xm       B   5.8s/  48  ran changed instr   17  droppable   31  saves   1.8s
+  dmei       B   0.0s/   1  ran changed instr    1  droppable    0  saves   0.0s
+  dnc2       B   2.2s/   7  ran changed instr    6  droppable    1  saves   0.2s
+  fj9k       B   0.0s/   2  ran changed instr    2  droppable    0  saves   0.0s
+  fkb3       B   0.0s/   3  ran changed instr    3  droppable    0  saves   0.0s
+  gv9h       B   6.3s/  96  ran changed instr   96  droppable    0  saves   0.0s
+  gxye       B   0.2s/   1  ran changed instr    1  droppable    0  saves   0.0s
+  hjcs       B   2.0s/  93  ran changed instr   93  droppable    0  saves   0.0s
+  i2me       B   2.1s/   1  ran changed instr    1  droppable    0  saves   0.0s
+  j9oq       B   1.4s/  14  ran changed instr   14  droppable    0  saves   0.0s
+  jg4u       B   0.0s/  17  ran changed instr   17  droppable    0  saves   0.0s
+  lxx5       B   2.0s/  35  ran changed instr   35  droppable    0  saves   0.0s
+  mvsp       B   0.5s/  12  ran changed instr   12  droppable    0  saves   0.0s
+  nfoh       B   0.0s/  32  ran changed instr   11  droppable   21  saves   0.0s
+  ptlz       B   0.0s/   2  ran changed instr    2  droppable    0  saves   0.0s
+  q407       B   2.1s/  30  ran changed instr   30  droppable    0  saves   0.0s  (pre-test hit)
+  q4bl       B   2.1s/   1  ran changed instr    1  droppable    0  saves   0.0s
+  r1hk       B   0.0s/   1  ran changed instr    1  droppable    0  saves   0.0s  FAILING-NOT-HIT 2/2
+  tggb       B   7.1s/  14  ran changed instr    2  droppable   12  saves   4.7s
+  z8gc       B  10.8s/ 399  ran changed instr  399  droppable    0  saves   0.0s
+== /shared/eval_data/practice_like: B 53.5s, instruction-level saves 6.7s
