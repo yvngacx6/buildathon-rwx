@@ -477,6 +477,7 @@ class Selector:
                 entry = f"{kind} {owner} {attr}"
                 same_parts = frozenset(found.get("same", {}).get(entry, ()))
                 start = len(rec)
+                ran: set[int] = set()  # tests that ran any site line (import-time ones too)
                 for site in index.sites(attr, owner_path, chain, True):
                     at = len(rec)
                     for bucket, got in self._site_reads(index, site, attr, same=same_parts):
@@ -487,8 +488,9 @@ class Selector:
                         # is itself in the diff, read at its own sites. A module first
                         # imported during a query runs it there too, but on the patched
                         # import it builds exactly that diff entry.
+                        for path, a, b in rec[at:]:
+                            ran |= real_span(path, a, b)
                         del rec[at:]
-                ran: set[int] = set()
                 for path, a, b in rec[start:]:
                     ran |= real_span(path, a, b)
                 if cands - ran:
@@ -498,6 +500,9 @@ class Selector:
                     by_key = self._key_readers(entry, found)
                     if by_key is not None and (by_key & cands) - ran:
                         return f"{attr}: key-level reader with no site line"
+                    looked = self._attr_readers(owner, attr, info) if kind == "C" else None
+                    if looked is not None and (looked & cands) - ran:
+                        return f"{attr}: looked up where no site line shows"
         finally:
             del maps.span
         for path, a, b in rec:
