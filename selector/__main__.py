@@ -5,6 +5,8 @@ Environment overrides (for local evaluation):
   BR_SQLGLOT  sqlglot checkout at the pinned commit   (default /opt/sqlglot)
   BR_MAPS     directory with the generated maps       (default <repo>/maps)
   BR_DEADLINE_SCALE  multiplies the time budget (tests: 0.02 forces both late phases)
+  BR_DIAG_TPC_DROP   DIAGNOSTIC r38 (default off): comma list of Selector.diag_tpc_category
+                     categories; drop the 3 TPC executor tests on commits in them
 
 Safety (research/moonshots/09-final.md R1 / R4): a run that is killed or crashes prints
 nothing, which makes it invalid. So every path out of `main` prints exactly one line per
@@ -181,6 +183,10 @@ def _run(out: Output, t0: float) -> None:
         _log(f"selector unavailable ({type(exc).__name__}: {exc}): ALL for every commit")
         return
 
+    # DIAGNOSTIC r38 (BR_DIAG_TPC_DROP, default off): the 3 TPC executor tests
+    diag_drop = {c.strip() for c in os.environ.get("BR_DIAG_TPC_DROP", "").split(",") if c.strip()}
+    diag_tpc = {t["number"] for t in tests if t["id"].split("::")[-1]
+                in ("test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch")}
     degraded = False
     for i, patch_file in enumerate(patches):
         commit = out.commits[i]
@@ -199,6 +205,15 @@ def _run(out: Output, t0: float) -> None:
                 # Nearly the price of ALL: take ALL, which cannot miss.
                 numbers, workers = everything, all_workers
                 reason = f"ALL (selection ~ALL cost) {reason}"
+            if diag_drop:  # DIAGNOSTIC r38: not a selection rule (may miss)
+                kept = numbers & diag_tpc
+                if kept:
+                    cat = selector.diag_tpc_category(kept, reason.startswith("ALL"))
+                    if cat in diag_drop:
+                        numbers = numbers - kept
+                        workers = pack.pack(numbers, ms_of)
+                    reason = (f"DIAG38 tpc={cat} {'DROPPED' if cat in diag_drop else 'kept'}"
+                              f" {len(kept)}; {reason}")
         except Exception as exc:  # noqa: BLE001  never crash: any surprise means run everything
             numbers, workers = everything, all_workers
             reason = f"ALL (error: {type(exc).__name__}: {exc})"

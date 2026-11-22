@@ -268,6 +268,7 @@ class Selector:
         self._chains = {}  # diffexec: changed function chains per file
         self._defaults = {}  # diffexec: default-only files → [(name, first line, {param: (old, new)})]
         self._spans = {}  # subtest: OLD-file spans of the touched statements per file
+        self._diag_st = None  # DIAGNOSTIC r38: subtest's fate (diag_tpc_category)
         per_file: list[tuple[str, set[int]]] = []
         try:
             for fp in files:
@@ -306,6 +307,12 @@ class Selector:
         cands = set(pruner.numbers)
         for p, got in per_file:
             cands -= got - prunable.get(p, set())
+        # DIAGNOSTIC r38 (diag_tpc_category): TPC tests a non-prunable rule fixed; the note
+        if pruner is self.subtest:
+            fixed = set()
+            for p, got in per_file:
+                fixed |= (got - prunable.get(p, set())) & set(pruner.numbers)
+            self._diag_st = {"fixed": fixed, "note": ""}
         cands &= set().union(*(got for _, got in per_file))
         if not cands:
             return per_file
@@ -320,7 +327,39 @@ class Selector:
         dropped, note = pruner.prune(self._jobs, self._spans, cands, benefit)
         if note:
             reasons.append(note)
+        if pruner is self.subtest and self._diag_st is not None:  # DIAGNOSTIC r38
+            self._diag_st["note"] = note or ""
         return [(p, got - dropped) for p, got in per_file]
+
+    def diag_tpc_category(self, kept_tpc: set[int], all_taken: bool) -> str:
+        """DIAGNOSTIC r38 (not a selection rule): why the last `select` kept the TPC tests
+        `kept_tpc`, in r35's tpcagg.py categories. all / nojob / mixed / default / off /
+        fixed / nocand / setup / guard / budget / verify / partial / other."""
+        if all_taken:
+            return "all"
+        st = self._diag_st
+        if st is None:
+            if not self._jobs:
+                return "nojob"
+            if self._mixed_py:
+                return "mixed"
+            if self._defaults:
+                return "default"
+            return "off" if self.subtest is None else "other"
+        if st["fixed"] and st["fixed"] >= kept_tpc:
+            return "fixed"
+        n = st["note"]
+        if not n:
+            return "nocand"
+        if "set-up touched" in n:
+            return "setup"
+        if "keep (est" in n:
+            return "guard" if "no stage" in n else "budget"
+        if "verification" in n:
+            return "verify"
+        if "dropped" in n:
+            return "partial"
+        return "other"
 
     def _genmem(self, per_file, reasons):
         """Drop test_generator_memory when its body passes on the patched package
