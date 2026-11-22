@@ -202,6 +202,12 @@ def _run(out: Output, t0: float) -> None:
         except Exception as exc:  # noqa: BLE001  never crash: any surprise means run everything
             numbers, workers = everything, all_workers
             reason = f"ALL (error: {type(exc).__name__}: {exc})"
+        drop = os.environ.get("BR_DIAG_DROP_IDS")
+        if drop:  # DIAGNOSTIC ONLY (practice-board experiment): drop the named tests
+            ids = {t["number"] for t in tests if t["id"].split("::")[-1] in drop.split(",")}
+            if set(numbers) & ids:
+                numbers = set(numbers) - ids
+                workers = pack.pack(numbers, ms_of)
         out.lines[i] = json.dumps({"commit": commit, "workers": workers})
         cost = pack.cost_ms(workers, ms_of) / 1000
         _log(f"[{commit}] {len(numbers)} tests, {len(workers)} workers, {cost:.1f}s :: {reason}")
