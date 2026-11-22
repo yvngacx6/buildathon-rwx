@@ -19,6 +19,11 @@ M = {
     "a25n": ("sqlglot/generators/python.py",
              '            return self.func(e.key, *values)\n\n        if',
              '            self._next_name()\n            return self.func(e.key, *values)\n\n        if'),
+    # same, without shifting lines (the swap keys code objects by first line): same strings,
+    # the _next_name counter advances → only the final generator state differs
+    "a25s": ("sqlglot/generators/python.py",
+             '                return self.func(e.key, values)\n',
+             '                return self.func(e.key, values) if self._next_name() else None\n'),
     # identify never restored after no_identify: state leaks into later calls
     "a25i": ("sqlglot/generator.py",
              '        self.identify = original\n',
