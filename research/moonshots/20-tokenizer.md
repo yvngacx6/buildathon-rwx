@@ -33,7 +33,7 @@
         bound exactly once in the whole source, and `self` is the method's never-rebound
         receiver.
     - **Result.** The site may read only those names. 3 of 21 dynamic sites are narrowed (the
-      three above). The 9 → 12 count includes the existing `.*_sql` patterns.
+      three above). With the existing `.*_sql` patterns, 9 of 21 sites are now narrowed (was 6).
   - **R20b, `bool()` truth flow.** `TokenizerCore(has_bit_strings=bool(self.BIT_STRINGS))` used to
     stop at `bool(...)`, so every tokenizing test ∩ users was selected. It now follows to the
     `has_bit_strings` read sites with flow tag `"truth"`:
