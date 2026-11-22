@@ -27,7 +27,7 @@ new moonshot angle is started in its slot.
 | 19 | Def-time / state-diff buckets | moon-19 | done | ✓ Never-called bodies + attribute-lookup map: practice_like −52 s, P −8.7/40, Q −10.7/40, 0 misses (42 probes) → porting as R31. |
 | 20 | Tokenizer settings read sites | moon-20 | done | ✓ Constructor hop already existed; added constant-name getattr narrowing + bool() truth flow: −1…−1.5 s/40, 0 misses → merged in cand-e. |
 | 21 | Key-level state diff | moon-21 | done | ✓ Per-key dict diffs + key-lookup map: practice_like −22 s, P/Q −5/40, 0 misses (19 probes) → porting as R32. |
-| 22 | Per-optimizer-rule TPC checkpoints (3–5x cheaper re-runs) | moon-22 | running | |
+| 22 | Per-optimizer-rule TPC checkpoints | moon-22 | done | ~ Sound (18/18 ground truth), −3…−6 s/40 on P/Q but 0 on practice_like and +67 s Docker build (risk vs 600 s cap at 2x scorer). Parked unless build headroom allows. |
 | 23 | Final-day plan + final_check.sh | moon-23 | done | ✓ eval/final_check.sh (13 checks, EC2-only); main PASS. Build 171–188 s on rwx (≈2x on scorer → watch 600 s cap). Freeze 03:00, pick final ≈04:00. |
 | 24 | Dispatch precision | moon-24 | done | ✗ Dispatch pairs are coarser than statement coverage (R23 already captures it); instruction-level ≤2 s/40. Remaining waste = unrecorded functions, but moon-04 showed recording them saves ~0. |
 | 25 | Executor generate() checkpoint | moon-25 | done | ~ Sound (16/16 drops pass, 7/7 keeps fail) but ≈ −1 s/40 and +10–14 s build. Parked. |
