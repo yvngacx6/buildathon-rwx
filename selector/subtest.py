@@ -1199,6 +1199,7 @@ def _defs(tree):
                 visit(child, prefix, outer)
 
     visit(tree, "", None)
+    visit = None  # noqa: F841  r41c: break visit's self-reference (gc is off: it held `out`)
     return out
 
 
@@ -1297,29 +1298,35 @@ def _writes_shared(fn, self_shared: bool) -> str | None:
             return f"writes {r.id}" if is_shared(r.id) else None
         return "writes through an expression" if not isinstance(r, ast.Call) else None
 
-    for n in nodes:
-        targets = []
-        if isinstance(n, ast.Assign):
-            targets = n.targets
-        elif isinstance(n, (ast.AugAssign, ast.AnnAssign)) and (n.value is not None or isinstance(n, ast.AugAssign)):
-            targets = [n.target]
-        elif isinstance(n, ast.Delete):
-            targets = n.targets
-        elif isinstance(n, (ast.For, ast.AsyncFor)):
-            targets = [n.target]
-        elif isinstance(n, ast.Call):
-            f = n.func
-            if isinstance(f, ast.Name) and f.id in _BAD_CALLS:
-                return f"calls {f.id}"
-            if isinstance(f, ast.Attribute) and f.attr in _MUTATORS:
-                r = _root(f.value)
-                if isinstance(r, ast.Name) and is_shared(r.id):
-                    return f"{f.attr}() on {r.id}"
-        for t in targets:
-            why = target_shared(t)
-            if why:
-                return why
-    return None
+    # r41c: is_shared / target_shared call themselves (closure cells): with the cycle
+    # collector off (__main__) that cycle would keep `binds` (nodes of `fn`) alive for the
+    # run; cleared on the way out.
+    try:
+        for n in nodes:
+            targets = []
+            if isinstance(n, ast.Assign):
+                targets = n.targets
+            elif isinstance(n, (ast.AugAssign, ast.AnnAssign)) and (n.value is not None or isinstance(n, ast.AugAssign)):
+                targets = [n.target]
+            elif isinstance(n, ast.Delete):
+                targets = n.targets
+            elif isinstance(n, (ast.For, ast.AsyncFor)):
+                targets = [n.target]
+            elif isinstance(n, ast.Call):
+                f = n.func
+                if isinstance(f, ast.Name) and f.id in _BAD_CALLS:
+                    return f"calls {f.id}"
+                if isinstance(f, ast.Attribute) and f.attr in _MUTATORS:
+                    r = _root(f.value)
+                    if isinstance(r, ast.Name) and is_shared(r.id):
+                        return f"{f.attr}() on {r.id}"
+            for t in targets:
+                why = target_shared(t)
+                if why:
+                    return why
+        return None
+    finally:
+        is_shared = target_shared = None  # noqa: F841
 
 
 _OLD_DEFS: dict[tuple[str, str], tuple[dict, list[bytes]]] = {}
