@@ -96,7 +96,7 @@ A, B, C, D, U = range(5)
 ALL = set(range(5))
 
 MAPS = {
-    "lines": {"sqlglot/lib.py:10": [C], "sqlglot/lib.py:13": [C], "sqlglot/lib.py:14": [D],
+    "lines": {"sqlglot/lib.py:10": [C], "sqlglot/lib.py:11": [C], "sqlglot/lib.py:13": [C], "sqlglot/lib.py:14": [D],
               "sqlglot/other.py:4": [A], "sqlglot/parser.py:5": [B],
               "sqlglot/fifth.py:5": [B], "sqlglot/sixth.py:2": [C], "tests/helpers.py:5": [A], "sqlglot/seventh.py:5": [D],
               "sqlglot/ninth.py:5": [A],
@@ -254,8 +254,9 @@ def test_new_method_is_a_class_body_change(selector):
 
 
 def test_private_module_constant_selects_tests_that_read_it(selector):
-    # LIMIT is read only in the `if` of Dialect.parse (lines 10-12), which test C ran
-    # (selector/names.py; tests/test_names.py covers the narrowing in detail).
+    # LIMIT is read only on line 11 of Dialect.parse, which test C ran (r36: a name read is
+    # observed on its own lines, sys.monitoring LINE events; tests/test_names.py covers the
+    # narrowing in detail).
     assert run(selector, edit("sqlglot/lib.py", "LIMIT = 10", "LIMIT = 11")) == {C, U}
 
 

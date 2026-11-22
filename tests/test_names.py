@@ -392,3 +392,50 @@ def test_how_a_read_uses_the_value(code, use):
     parents = {id(c): p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
     node = next(n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "A")
     assert _use(node, parents) == use
+
+
+def test_run_time_read_spans_are_the_node_lines():
+    """r36: a run-time name / attribute read is observed on its own lines (sys.monitoring LINE
+    events, as the lines map records them), not on its whole statement's: a read in a branch
+    not taken runs no line of its own; a read that runs fires a LINE event on one of them."""
+    from selector import names
+
+    source = ("class C:\n"
+              "    A = 1\n"
+              "    B = 2\n\n"
+              "    def f(self, c):\n"
+              "        x = g(\n"
+              "            1,\n"
+              "            self.A\n"
+              "            if c\n"
+              "            else self.B,\n"
+              "            'A',\n"
+              "        )\n"
+              "        return x\n\n\n"
+              "def g(*a):\n"
+              "    return a\n")
+    index = names.Index({"sqlglot/__init__.py": "", "sqlglot/a.py": source})
+    spans = {(type(node).__name__, getattr(node, "attr", getattr(node, "value", None))):
+             index._site("sqlglot/a.py", node, ctx, stmt).lines
+             for node, ctx, stmt in index.walk("sqlglot/a.py")
+             if getattr(node, "attr", None) in ("A", "B")
+             or getattr(node, "value", None) == "A"}
+    assert spans[("Attribute", "A")] == (8, 8)
+    assert spans[("Attribute", "B")] == (10, 10)
+    assert spans[("Constant", "A")] == (6, 12)  # a constant may be folded: statement lines
+    space: dict = {}
+    exec(compile(source, "a.py", "exec"), space)
+    mon, tool = sys.monitoring, 4
+    for c, ran, not_ran in ((True, 8, 10), (False, 10, 8)):
+        seen: set[int] = set()
+        mon.use_tool_id(tool, "r36-test")
+        try:
+            mon.register_callback(
+                tool, mon.events.LINE,
+                lambda code, line: seen.add(line) if code.co_filename == "a.py" else None)
+            mon.set_events(tool, mon.events.LINE)
+            space["C"]().f(c)
+        finally:
+            mon.set_events(tool, 0)
+            mon.free_tool_id(tool)
+        assert ran in seen and not_ran not in seen, (c, sorted(seen))
