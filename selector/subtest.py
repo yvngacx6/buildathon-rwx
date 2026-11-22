@@ -56,7 +56,12 @@ FALLBACK = os.environ.get("BR_SUBTEST_FALLBACK", "0") != "0"  # checkpoint diffe
 FALLBACK_CAP = float(os.environ.get("BR_SUBTEST_FALLBACK_CAP", "1.5"))  # laptop s
 RULES_ON = os.environ.get("BR_SUBTEST_RULES", "1") != "0"  # moon-22 per-rule checkpoints
 RULES_BUILD = os.environ.get("BR_SUBTEST_RULES_BUILD", "1") != "0"
+TAIL = os.environ.get("BR_SUBTEST_TAIL", "1") != "0"  # r39: Plan + executor from the final tree
 SHARE = 0.6  # spend at most this share of what dropping saves
+# r39 net gate: a subset the SHARE gate refuses is still verified when the scorer-charged
+# estimate stays under NET_SHARE x its saving (fail-fast: a divergent query ends the child).
+NET_SHARE = float(os.environ.get("BR_SUBTEST_NET", "0.95"))
+NET_EST_MAX = float(os.environ.get("BR_SUBTEST_NET_MAX", "13"))  # laptop s, whole child
 
 
 # ── shared: what the test does for one query ─────────────────────────────────
@@ -1395,6 +1400,14 @@ class SubTest:
                                     k = max((b for b in q["outs"]["ck_ok"] if b <= first), default=0)
                             x = (suite, i, False, "stage", _hit(ph["parse"], spans),
                                  optb_hit, _hit(ph["duck"], spans), k, gen_hit)
+                        elif (TAIL and NSTEPS - 1 in (q["outs"].get("ck_ok") or ())
+                                and not _hit(win["prep"], spans) and not _hit(win["optb"], spans)
+                                and not _hit(glue, spans) and not _hit(ph["parse"], spans)
+                                and not _hit(ph["duck"], spans)):
+                            # r39: only Plan / PythonExecutor run a touched line: their input
+                            # (the optimized tree, the ensured tables) is the pinned one, so
+                            # run just them from the stored final tree
+                            x = (suite, i, False, "tail", False, False, False, NSTEPS - 1, False)
                     todo.append(x)
                     cpu += self._cpu(x)
             out[n] = todo
@@ -1500,19 +1513,41 @@ class SubTest:
                     if net > best[0]:
                         best = (net, set(subset), todo, est)
         _, chosen, todo, est = best
+        net_gate = False
+        if not chosen and NET_SHARE > 0:
+            best = (0.0 if NET_SHARE < 100 else -1e9, set(), [], 0.0)  # >= 100: measuring only
+            for r in range(1, len(nums) + 1):
+                for subset in itertools.combinations(nums, r):
+                    todo = []
+                    for n in subset:
+                        todo.extend(x for x in per[n] if x not in todo)
+                    est = sum(self._cpu(x) for x in todo) + (0.3 if todo else 0.0)
+                    spend = SCORER_SLOWDOWN * est
+                    gain = benefit_of(set(subset))
+                    if gain > 0 and est <= NET_EST_MAX and spend <= NET_SHARE * gain / 1000:
+                        net = gain / 1000 - spend
+                        if net > best[0]:
+                            best = (net, set(subset), todo, est)
+            _, chosen, todo, est = best
+            net_gate = bool(chosen)
         if not chosen:
             return set(), f"subtest: keep (est {cpu:.1f}s CPU for {sum(map(len, per.values()))} queries{"" if getattr(self, "stage_ok", True) else "; no stage: " + str(self.stage_why)})"
         if not todo:
             return chosen, f"subtest: {sorted(chosen)} dropped (no query runs a touched statement)"
         try:
             cap = min(BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0 + FALLBACK_CAP)
+            if net_gate:
+                # past the saving every outcome loses (the child's CPU is charged 2x)
+                # (raw CPU where it runs: on the scorer that is what is charged)
+                cap = min(2.5 * est + 1.0 + FALLBACK_CAP,
+                          benefit_of(chosen) / 1000 if NET_SHARE < 100 else 99)
             ok = self.verify(jobs, todo, cap)
         except Exception as e:  # noqa: BLE001
             return set(), f"subtest: keep ({type(e).__name__})"
         if not ok:
             return set(), f"subtest: keep (verification of {len(todo)} queries failed, {self.last_child:.2f}s, est {est:.2f}, cap {cap:.2f})"
         nr = sum(1 for x in todo if x[3] == "stage" and x[5] and x[7])
-        return chosen, (f"subtest: {sorted(chosen)} dropped ({len(todo)} queries re-run,"
+        return chosen, (f"subtest: {sorted(chosen)} dropped{' [net gate]' if net_gate else ''} ({len(todo)} queries re-run,"
                         f" {self.last_child:.2f}s, est {est:.2f}, cap {cap:.2f}) [rule checkpoints {nr}]")
 
     def _cpu(self, x):
@@ -1525,6 +1560,8 @@ class SubTest:
             if optb_hit and k:
                 return 0.02 + q["outs"]["cpu_from"][k] + g
             return 0.02 + (q["outs"]["cpu_stage"] if optb_hit else 0.0) + g
+        if mode == "tail":
+            return max(q["cpu_exec"] - q["outs"]["cpu_stage"], 0.0) + q["outs"]["cpu_from"][k]
         return q["cpu_opt"] if opt else q["cpu_exec"]
 
 
@@ -1630,6 +1667,33 @@ def _warm(root: str) -> None:
     from diffexec import replay, serial  # noqa: F401
 
 
+def _run_tail(q, schema_dict, tables, zf, suite, i):
+    """r39 "tail" mode: execute()'s plan / post windows (exec_windows) on the stored final
+    optimized tree, its prep window on the query's tables. Only for queries whose touched
+    statements run in neither parse, prep, optimize, duckdb transpile nor the glue: those
+    windows give the pinned results, so this is what the test computes. → result digest."""
+    import sqlglot.executor as E
+    from sqlglot import find_tables, parse_one
+    from sqlglot.executor.table import Table
+    oe = from_checkpoint(zf.read(f"ck/{suite}/{i}/{NSTEPS - 1}"), schema_dict, NSTEPS - 1)
+    if strict_digest(oe) != q["outs"]["d_opt"]:
+        return None
+    used = {}
+    for t in find_tables(parse_one(q["sql"])):
+        key = (suite, t.name)
+        if key not in tables:
+            cols, rows = marshal.loads(zf.read(f"{suite}/{t.name}"))
+            tables[key] = Table(columns=cols, rows=rows)
+        used[t.name] = tables[key]
+    tables_ = E.ensure_tables(used, dialect=None)
+    schema_ = E.ensure_schema(schema_dict, dialect=None)
+    if tables_.supported_table_args and tables_.supported_table_args != schema_.supported_table_args:
+        return None
+    plan = E.Plan(oe)
+    res = pickle.loads(pickle.dumps(E.PythonExecutor(tables=tables_).execute(plan)))
+    return digest_table(res)
+
+
 def _child(root, jobs, todo, meta, store, budget, defaults=None) -> bool:
     import signal
     sys.setrecursionlimit(1000)  # the pool worker's default (this stack is deeper: stricter)
@@ -1653,7 +1717,7 @@ def _child(root, jobs, todo, meta, store, budget, defaults=None) -> bool:
     zck = zipfile.ZipFile(store)
     for suite, i, opt, mode, parse_hit, optb_hit, duck_hit, k, gen_hit in todo:
         if mode != "stage":
-            full.append((suite, i, opt))
+            full.append((suite, i, opt, mode == "tail"))
             continue
         q = meta["suites"][suite][i]
         signal.setitimer(signal.ITIMER_PROF, 3 * ((q["outs"]["cpu_from"][k] if k else q["outs"]["cpu_stage"])
@@ -1667,7 +1731,7 @@ def _child(root, jobs, todo, meta, store, budget, defaults=None) -> bool:
                     if strict_digest(e) != q["outs"]["d_parse"]:
                         fb_cpu += q["cpu_exec"]
                         if not FALLBACK and fb_cpu > FALLBACK_CAP: return False
-                        full.append((suite, i, opt))  # parse differs: run the whole query
+                        full.append((suite, i, opt, False))  # parse differs: run the whole query
                         continue
                 if optb_hit and k:
                     # moon-22: from the stored tree at boundary k, rules k.. under the new code
@@ -1677,7 +1741,7 @@ def _child(root, jobs, todo, meta, store, budget, defaults=None) -> bool:
                             print("subtest rule diff:", suite, i, k, file=sys.stderr)
                         fb_cpu += q["cpu_exec"]
                         if not FALLBACK and fb_cpu > FALLBACK_CAP: return False
-                        full.append((suite, i, opt))
+                        full.append((suite, i, opt, False))
                         continue
                 elif optb_hit:
                     e = pickle.loads(q["outs"]["pexpr"])
@@ -1689,14 +1753,14 @@ def _child(root, jobs, todo, meta, store, budget, defaults=None) -> bool:
                             print("subtest stage diff:", suite, i, file=sys.stderr)
                         fb_cpu += q["cpu_exec"]
                         if not FALLBACK and fb_cpu > FALLBACK_CAP: return False
-                        full.append((suite, i, opt))  # optimized tree differs: run it all
+                        full.append((suite, i, opt, False))  # optimized tree differs: run it all
                         continue
                 if gen_hit and not gen_replay(pickle.loads(q["outs"]["gen"])):
                     if os.environ.get("SUBTEST_DEBUG"):
                         print("subtest gen diff:", suite, i, file=sys.stderr)
                     fb_cpu += q["cpu_exec"]
                     if not FALLBACK and fb_cpu > FALLBACK_CAP: return False
-                    full.append((suite, i, opt))  # generated code differs: run it all
+                    full.append((suite, i, opt, False))  # generated code differs: run it all
                     continue
             except Exception:  # noqa: BLE001
                 if os.environ.get("SUBTEST_DEBUG"):
@@ -1705,11 +1769,25 @@ def _child(root, jobs, todo, meta, store, budget, defaults=None) -> bool:
                 return False
     tables: dict = {}
     with zipfile.ZipFile(store) as zf:
-        for suite, i, opt in full:
+        for suite, i, opt, tail in full:
             q = meta["suites"][suite][i]
             # each query (with its table loading): at most 3x its pinned CPU + 0.8 s, else the
             # child ends (→ keep)
             signal.setitimer(signal.ITIMER_PROF, 3 * (q["cpu_opt"] if opt else q["cpu_exec"]) + 0.8)
+            if tail:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        got = _run_tail(q, meta["schemas"][suite], tables, zf, suite, i)
+                    except Exception:  # noqa: BLE001
+                        if os.environ.get("SUBTEST_DEBUG"):
+                            import traceback
+                            traceback.print_exc(file=sys.__stderr__)
+                        return False
+                if got != q["outs"].get("exec"):
+                    if os.environ.get("SUBTEST_DEBUG"):
+                        print("subtest tail diff:", suite, i, file=sys.stderr)
+                    return False
+                continue
             tabs = {}
             if q["execute"] and not opt:
                 from sqlglot import find_tables, parse_one
