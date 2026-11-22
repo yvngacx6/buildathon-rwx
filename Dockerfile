@@ -29,12 +29,13 @@ ENV PYTHONDONTWRITEBYTECODE=1
 #  * the phase lines and errors.py frontier calls of test_max_nodes (selector/slowverify.py)
 #  * which test classes probe resources (selector/diffexec.py `_is_resource`)
 # The four store builders are independent single-threaded processes (none reads another's
-# output): run them side by side on the build's cores. Each job's status is checked (a bare
+# output): run them side by side on the build's cores (subtest, the long pole, also runs its
+# queries in 3 forked workers). Each job's status is checked (a bare
 # `wait` would hide a failure).
 RUN python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')" \
     /opt/sqlglot/sqlglot /app/selector /app/diffexec \
  && python -m selector.maps build /app/maps /app/index/maps \
- && { PYTHONHASHSEED=0 python -m selector.subtest build /opt/sqlglot /app/index/subtest.zip & p1=$!; \
+ && { PYTHONHASHSEED=0 BR_SUBTEST_JOBS=3 python -m selector.subtest build /opt/sqlglot /app/index/subtest.zip & p1=$!; \
       PYTHONHASHSEED=0 python -m selector.slowverify build /opt/sqlglot /app/index/slowverify.pkl & p2=$!; \
       python -m selector.nameindex build /opt/sqlglot /app/index/names.pkl & p3=$!; \
       python -m selector.diffexec resources /opt/sqlglot /app/index/resources.pkl & p4=$!; \
