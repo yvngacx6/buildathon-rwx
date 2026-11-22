@@ -23,10 +23,11 @@ new moonshot angle is started in its slot.
 | 15 | Per-fixture-case slicing | moon-15 | done | ~ Sound (0 misses, 75/75 drops really pass) but ≈ −2 s/40 net and +3 min build. Parked; maybe bundle with V1 later. |
 | 16 | Code-commit over-selection | moon-16 | done | ✓ R-DEF (literal-default edits → callers that use the default): −13…−17 s/40, 0 misses → R28. Next: tokenizer-settings read sites (moon-20), key-level state diff (moon-21). |
 | 17 | Determinism audit | moon-17 | done | ✓ Only wall-clock guards flip (tggb +18 s, op07, ktz3 under load). CPU caps decide + timing re-check → R30 (r30-determinism). 66ks flip was a mis-comparison. |
-| 18 | Red-team soundness review of all run-time pruners (diffexec, subtest, slowverify, genmem, r19 import-fn, statement rule) | moon-18 | running | |
+| 18 | Red-team of run-time pruners | moon-18 | done | ✓ Found 2 real holes (one-line lambdas run at import → 3/5 probes missed on main; diffexec exception attrs) and fixed both; 0 cost on labeled sets. Merged into cand-a. |
 | 19 | 'Conservative def-time' + 'state diff' buckets on practice_like (~87 s): sound narrowing | moon-19 | running | |
 | 20 | Tokenizer settings → TokenizerCore(...) read sites ∩ dialect users | moon-20 | running | |
 | 21 | Key-level state diff for class-creation hooks & import-run builders | moon-21 | running | |
 | 22 | Per-optimizer-rule TPC checkpoints (3–5x cheaper re-runs) | moon-22 | running | |
 | 23 | Final-day plan: freeze, pick, and late-merge risk policy (what to submit when, verification checklist) | moon-23 | running | |
 | 24 | Dispatch precision: per-test (class, method) maps for *_sql generator dispatch and parser tables (function-map bucket ≈172 s on practice_like) | moon-24 | running | |
+| 25 | Executor-touched TPC commits: PythonExecutor.generate checkpoint (record generate() in/out per query, replay patched generate) | moon-25 | running | |
