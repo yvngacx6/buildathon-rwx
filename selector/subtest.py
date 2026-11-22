@@ -895,6 +895,19 @@ def build(root: Path, out: Path) -> None:
     from sqlglot.executor.table import Table
     import sqlglot.optimizer  # noqa: F401
     import sqlglot.dialects.duckdb  # noqa: F401
+    if os.environ.get("BR_SUBTEST_PREIMPORT", "1") != "0":
+        # r37: every module loaded first, as in the test worker (collection imported them):
+        # else the first executed query imports athena / trino / presto / hive / mysql lazily
+        # in every per-query fork, and their module / class-body lines (one-line lambdas
+        # there are also reader sites) fill the exec phase as if the query ran them
+        import importlib
+        import pkgutil
+        for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+            if m.name != "sqlglot.__main__":
+                try:
+                    importlib.import_module(m.name)
+                except Exception:  # noqa: BLE001
+                    pass
     prefix = str(root) + "/"
     schemas = {"tpch": TPCH_SCHEMA, "tpcds": TPCDS_SCHEMA}
     raw = {s: _load_fixture_tables(root, s, schemas[s]) for s in SUITES}
