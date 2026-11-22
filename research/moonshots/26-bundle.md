@@ -14,7 +14,7 @@
 - **Head merges origin/cand-i** (r34, a select.py change that does not overlap). Unit tests: 225/225.
   imgcheck of 79146f1: 0 misses on all six sets.
   - Sims equal ffddeb3's, except adversarial2: 867.1 → 845.8, which is r34's own gain.
-  - final_check on 79146f1: FINAL_FC.
+  - final_check on 79146f1: **PASS** (C4 114.0 s = 228 s at 2x; practice_like CPU 34.01 s, private 61.29 s, C7 P 17.10 s, C7 Q 24.87 s with sim 479.7; guard 0; the only WARN is "not on main").
 - **Same-box A/B, idle rwx (final_check sets, one container at a time, scorer flags;
   `research/moonshots/26/abcpu.sh`).** base = cand-h b048c6a, new = ffddeb3. `gen0` = new with
   `BR_SUBTEST_GEN=0` (moon-25 off). `off` = new with moon-22 and moon-25 off. Container child CPU, sim s:
@@ -93,7 +93,7 @@ Build times (rwx, `research/moonshots/26/btime.sh` = final_check C4 command):
 | 8754be6 | parallel RUN + moon-22 | 150.5 s |
 | d013d8d | + subtest pool (3) + parallel seeds | 111.4 s |
 | ffddeb3 | + moon-25 | 113.5 s |
-| 79146f1 | + merge origin/cand-i (r34) = head code | FINAL_BT |
+| 79146f1 | + merge origin/cand-i (r34) = head code | 114.0 s (final_check C4) |
 
 The remaining build is ≈ throughput-bound: ≈ 240 CPU-s of builders on 4 vCPU (2 physical cores).
 Further wins would need less CPU (e.g. nameindex 35 s), not more parallelism.
