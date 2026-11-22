@@ -1,21 +1,40 @@
-# Moonshot 22: per-optimizer-rule checkpoints for the TPC sub-test (on top of moon-05)
+# Moonshot 22: per-optimizer-rule checkpoints for the TPC sub-test (on moon-05 / r29-tpcstage)
 
 ## Verdict (numbers first)
 
-- **It works, but the gain is small.** It cuts moon-05's re-run CPU by about 30 % and adds
-  almost no new tpcds drops: **+1 drop in 1,872 commits**, P_6phk.
-- **0 misses** on every labeled set: practice_like, private, private41, adversarial, adversarial2,
-  sample. Drops are unchanged on all of them.
-- **Ground truth:** 18 commits re-run with the three real TPC tests on patched sqlglot. All 18 pass
-  test_execute_tpcds, test_execute_tpch and test_optimized_tpch.
-  - The 18 are every R drop under rules mode from P/Q that moon-05's 35-commit truth run had not
-    covered, including the one new drop, P_6phk.
-  - Only 1 drop is new, so the "≥15 newly dropped" target cannot be met literally. Instead, these
-    18 check the new verification path on drops it decided.
-  - With usage logging on, 42 of R's 55 drops and 6 of practice_like's 9 verified at least one query
-    from a rule checkpoint (2,148 query runs on R).
-- **Re-run (verification child) CPU, rules off (= moon-05) → rules on.** EC2 container, load ~100–200,
-  store calibrated to laptop CPU (as moon-05).
+- **It works and is sound: re-run CPU drops ~25–35 %, 0 misses.** How many extra drops it buys
+  depends on the base.
+  - **On r29-tpcstage** (moon-05 plus the stage guard and build calibration; branch
+    **`moon-22-r29`**): **+11 tpcds drops**.
+    - R: +10, sim −113.8 s over the 166 r17 refusals.
+    - private41: +1 (op05, labeled, no miss).
+    - P: +6, sim −67.8 s / 600. Q: +4, sim −46.0 s / 1,000. These are the same 10 commits as R's.
+  - **On moon-05 as is** (branch `moon-22`): +1 drop in 1,872 commits (P_6phk). Moon-05's looser
+    plan already fits most optb-only commits in the budget.
+- **0 misses** on all labeled sets, on both bases: practice_like, private, private41, adversarial,
+  adversarial2, sample.
+- **Ground truth:** 18 commits re-run with the three real TPC tests on patched sqlglot. All 18 pass.
+  - They are all P/Q drops of rules mode that moon-05's truth run had not covered.
+  - They include **all 10 new P/Q drops on the r29 base** (P_6phk, a4cj, srm1, u34w, uero, z46m;
+    Q_6ise, cpww, k21r, qtcd).
+  - The 11th new drop, op05, is labeled.
+  - Fewer than 15 *new* drops exist, so all of them are checked; the other 8 check the
+    rule-checkpoint path on drops shared with moon-05.
+  - Usage logging (moon-05 base): 42 of R's 55 drops and 6 of practice_like's 9 verified at least
+    one query from a rule checkpoint (2,148 query runs on R).
+- **r29 base, rules off → on** (EC2, 6-CPU container, the r29 in-build calibration):
+
+  | set | child CPU | drops | sim |
+  |---|---|---|---|
+  | R (166) | 165.4 → 146.1 s; on the 47 common drops 122.7 → 87.3 s | 47 → **57** | 3708.9 → **3595.1** |
+  | practice_like (120) | 15.4 → 11.7 s | 9 → 9 | = |
+  | private (264) | 15.8 → 11.6 s | 6 → 6 | = |
+  | private41 (41) | 0.0 → 0.8 s | 0 → **1** (op05) | 388.9 → 377.6 |
+  | sample / adversarial / adversarial2 | 0.4→0.2 / 0.5→0.5 / 0 s | = | = |
+  | P (600) | 62.0 → 59.2 s; on the 26 common drops 48.8 → 36.7 s | 26 → **32** | 4636.0 → **4568.2** |
+  | Q (1,000) | 132.1 → 119.9 s; on the 46 common drops 102.3 → 81.8 s | 46 → **50** | 7555.7 → **7509.7** |
+
+- **moon-05 base, rules off → on** (first run; EC2, store calibrated to laptop as moon-05):
 
   | set | commits | child CPU | tpcds-commit drops | sim cost |
   |---|---|---|---|---|
@@ -28,9 +47,12 @@
 
   On commits dropped in both modes, child CPU falls 32–35 % (P: 61.5 → 40.6 s, Q: 112.5 → 83.3 s,
   R: 150.9 → 102.8 s).
-- **Per 40 practice-style commits:** −1.7 s of child CPU. At the scorer's 2x that is **≈ −3.4 s**.
-  The sim cost does not change: no new drops on practice_like.
-- **Why so few new drops.** Of the 52 refusals still left on R, about 40 are full-mode. Their
+- **Per 40 practice-style commits:** −1.2 to −1.7 s of child CPU. At the scorer's 2x that is
+  **≈ −2.5 to −3.4 s**. There are no new drops on practice_like.
+  - The refusal population (R, P/Q) shows a larger tail: a ≈ −11 s sim win per affected commit,
+    ~1 % of commits on the r29 base.
+  - On the final's ~60 unseen commits that is ≈ +0.6 drops, ≈ −7 s expected.
+- **Why not more drops.** Of the 52 refusals still left on R (moon-05 base), about 40 are full-mode. Their
   touched lines also run in the executor windows (prep / plan / post: `executor/context.py`,
   `table.py`, `trie.py`, `schema.py`, `scope.py`, `generators/python.py`, `planner.py`), so every
   query has to be re-run whole (11.4 s for 57 queries). An optimizer checkpoint cannot help them.
@@ -39,10 +61,15 @@
   - Subtest store: 6.15 → 11.28 MB.
   - Build CPU, EC2 3-CPU container at load ~100: 1m10s → 2m09s user (+59 s), 1m21s → 2m36s wall.
   - Expect ≈ +40–60 s on the idle 4-core scorer build, within the ≤3 min target.
-- **Recommendation:** merge it as part of the moon-05 / r29-tpcstage line. It is cheap and sound,
-  and saves ~3 s per 40 commits. Do not expect board movement beyond that. The next lever for the
-  remaining refusals is executor-step checkpoints (moon-05 phase 2, item 2), not finer optimizer
-  checkpoints. **P(works on the board as measured) ≈ 0.75; expected gain ≈ 2–4 s per 40 commits.**
+- **Recommendation: merge `moon-22-r29` into the r29-tpcstage line.**
+  - It is a clean merge: r29's 15 unit tests pass. Rule CPU is normalized by r29's `_calib`, once
+    per query.
+  - Build: r29 subtest build 1m19s → 2m26s wall on a 2-CPU container (+67 s), within the 3 min
+    target.
+  - Expect ≈ −3 s per 40 practice commits (CPU), plus occasional extra drops worth ~11 s each.
+  - The next lever for the remaining refusals is executor-step checkpoints (moon-05 phase 2,
+    item 2), not finer optimizer checkpoints.
+  - **P(works on the board as measured) ≈ 0.75; expected gain ≈ 3–6 s per 40 commits.**
 
 ## Mechanism (`selector/subtest.py`, `BR_SUBTEST_RULES=0` turns it off)
 
@@ -112,3 +139,5 @@ not built.
   tests).
 - Outputs: `~/work/m22/out2` (labeled + R), `out3` (P), `out4` (Q), `out5` (truth), `out6`
   (build timing), `out7` (R / practice_like with rule-usage logging).
+- r29 port: `~/work/m22/r29.sh` (build + unit tests + all sets), `pq.sh` (P / Q), outputs in
+  `o29`; build timing in `o29b`.
