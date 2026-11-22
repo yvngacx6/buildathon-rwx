@@ -172,11 +172,13 @@ def test_hunk_that_does_not_apply_selects_all(selector):
 
 # ── sqlglot/: functions ──────────────────────────────────────────────────────
 
-def test_function_body_uses_whole_function_span(selector):
-    # Line 11 never ran (short-circuit), but tests that ran the function are selected,
-    # plus the untraced test U, which joins every non-empty selection.
+def test_function_body_uses_touched_statement_span(selector):
+    # Line 11 never ran (short-circuit). Since r23 every test uses the statement rule: the
+    # touched statement is the whole `if` header (lines 10-12), which C ran. D's fake map has
+    # only line 14 (`return None`); real coverage would also credit line 10 (the `if`), so D
+    # is dropped here only because of this miniature map. U joins every non-empty selection.
     got = run(selector, edit("sqlglot/lib.py", "len(sql) > LIMIT", "len(sql) >= LIMIT"))
-    assert got == {C, D, U}
+    assert got == {C, U}
 
 
 def test_slow_test_off_the_touched_statement_is_dropped(tmp_path):
@@ -189,7 +191,7 @@ def test_slow_test_on_another_line_of_the_touched_header_is_kept(tmp_path):
     # C (slow) ran line 10 of the 3-line `if` header, not the edited line 11.
     selector = make_selector(tmp_path, slow=(C,))
     got = run(selector, edit("sqlglot/lib.py", "len(sql) > LIMIT", "len(sql) >= LIMIT"))
-    assert got == {C, D, U}
+    assert got == {C, U}  # D: see test_function_body_uses_touched_statement_span
 
 
 def test_slow_test_kept_when_statements_are_inserted(tmp_path):
