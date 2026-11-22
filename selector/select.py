@@ -902,10 +902,16 @@ class Selector:
         leaf = module.rsplit(".", 1)[-1]
         if any(m.endswith(leaf) for _, m in index.data["stars"]):
             return None
+        readers: set[int] = set()
         for site, allowed, names_only, on_module in index.data["dynamic"]:
             if on_module is not None and re.fullmatch(on_module, module, re.S) and (
                     allowed is None or any(re.fullmatch(allowed, c, re.S) for c in changed)):
-                return None  # getattr(module, name) / vars(module) can read it
+                if names_only:
+                    continue  # dir(): which names exist, not their values
+                if site.when != "run":
+                    return None  # getattr(module, name) at import
+                # getattr(module, computed name) in a def: the value is read on that line
+                readers |= self.maps.span(site.path, *site.lines)
         for name in changed:
             if index.data["imports"].get(name) or any(
                     o[0] != path or o[1] != "name" for o in index._occurrences(name)):
@@ -934,7 +940,7 @@ class Selector:
                 return None
         if not uses:
             return None
-        out: set[int] = set()
+        out: set[int] = set(readers)
         whys = []
         for f, param, slot, method in uses:
             if f.name.startswith("__") or self.maps.import_time.modules(
