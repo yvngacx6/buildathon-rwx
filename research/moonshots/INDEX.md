@@ -29,5 +29,5 @@ new moonshot angle is started in its slot.
 | 21 | Key-level state diff for class-creation hooks & import-run builders | moon-21 | running | |
 | 22 | Per-optimizer-rule TPC checkpoints (3–5x cheaper re-runs) | moon-22 | running | |
 | 23 | Final-day plan + final_check.sh | moon-23 | done | ✓ eval/final_check.sh (13 checks, EC2-only); main PASS. Build 171–188 s on rwx (≈2x on scorer → watch 600 s cap). Freeze 03:00, pick final ≈04:00. |
-| 24 | Dispatch precision: per-test (class, method) maps for *_sql generator dispatch and parser tables (function-map bucket ≈172 s on practice_like) | moon-24 | running | |
+| 24 | Dispatch precision | moon-24 | done | ✗ Dispatch pairs are coarser than statement coverage (R23 already captures it); instruction-level ≤2 s/40. Remaining waste = unrecorded functions, but moon-04 showed recording them saves ~0. |
 | 25 | Executor-touched TPC commits: PythonExecutor.generate checkpoint (record generate() in/out per query, replay patched generate) | moon-25 | running | |
