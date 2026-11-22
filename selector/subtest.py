@@ -64,6 +64,11 @@ NET_SHARE = float(os.environ.get("BR_SUBTEST_NET", "0.95"))
 NET_EST_MAX = float(os.environ.get("BR_SUBTEST_NET_MAX", "13"))  # laptop s, whole child
 NET_CPU_FACTOR = float(os.environ.get("BR_SUBTEST_NET_CPU_FACTOR", str(SCORER_SLOWDOWN)))
 NET_CAP_SHARE = float(os.environ.get("BR_SUBTEST_NET_CAP_SHARE", "1.0"))  # child CPU cap / saving
+# r40: the net gate's choice is verified only when it saves at least this much (ms): below,
+# the child's measured CPU (~2x its est on small sets: P noyh / wv8c 0.6-0.8 s for ~1 s
+# saved) charged at 2x costs more than the drop saves. Applied after the choice: it only
+# turns a verification into a keep, never picks another subset.
+NET_MIN_GAIN_MS = float(os.environ.get("BR_SUBTEST_NET_MIN_MS", "3000"))
 
 
 # ── shared: what the test does for one query ─────────────────────────────────
@@ -1562,6 +1567,9 @@ class SubTest:
                             best = (net, set(subset), todo, est)
             _, chosen, todo, est = best
             net_gate = bool(chosen)
+            if net_gate and todo and NET_SHARE < 100 and benefit_of(chosen) < NET_MIN_GAIN_MS:
+                return set(), (f"subtest: keep (net gate: saves {benefit_of(chosen) / 1000:.2f}s"
+                               f" < {NET_MIN_GAIN_MS / 1000:.1f}s, est {est:.2f})")
         if not chosen:
             return set(), f"subtest: keep (est {cpu:.1f}s CPU for {sum(map(len, per.values()))} queries{"" if getattr(self, "stage_ok", True) else "; no stage: " + str(self.stage_why)})"
         if not todo:
