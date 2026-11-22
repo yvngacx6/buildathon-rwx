@@ -243,7 +243,7 @@ def test_snapshot_of_other_source_is_not_used(repo, tmp_path, monkeypatch):
     assert state.diff(other, snapshot, {}) is None
     assert state.diff(root, snapshot, {}) == {"changed": [], "same": {}, "digests": {},
                                               "info": {},
-                                              "instances": [], "holders": {}}
+                                              "instances": [], "holders": {}, "keys": {}}
 
 
 @pytest.mark.parametrize("after, expected", [

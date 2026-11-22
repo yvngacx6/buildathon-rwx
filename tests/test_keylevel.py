@@ -32,3 +32,10 @@ def test_changed_keys_nested_paths():
     assert ("s:F", "s:X") in got  # added inside a nested dict: its key in that dict
     assert ("", "s:Z") in got and ("", "s:Y") in got  # removed / added at the top
     assert ("", "s:A") not in got and ("", "s:F") not in got
+
+
+def test_changed_keys_order_only():
+    snap = state.Snapshot("x")
+    old = state.key_table(snap, {"A": 1, "B": 2})
+    new = state.key_table(snap, {"B": 2, "A": 1})
+    assert state.changed_keys(old, new) == [("", state.ORDER)]

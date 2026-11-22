@@ -449,6 +449,11 @@ def _selfcheck() -> None:
 import pytest  # noqa: E402
 
 
+def pytest_collection_modifyitems(items):
+    if os.environ.get("KEYTRACE_REVERSE") == "1":  # order check: a second trace, reversed
+        items.reverse()
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_setup(item):
     global _CTX
@@ -535,8 +540,9 @@ def _write(out: str, nodeids: list[str]) -> None:
     # A table read whole in a context that also wrote an import-time dict may have been
     # copied into a run-time cache (generator._DISPATCH_CACHE <- dict(TRANSFORMS)): later
     # tests read the cache, not the table, so the table's recorded readers are incomplete.
-    fed = {t for t, ctxs in WHOLE.items() if t >= 0 and ctxs & WRITERS}
-    mutated = sorted({e for t in MUTATED | fed for r in ROOT_OF[t] for e, _ in PATHS[r]})
+    fed_t = {t for t, ctxs in WHOLE.items() if t >= 0 and ctxs & WRITERS}
+    fed = sorted({e for t in fed_t for r in ROOT_OF[t] for e, _ in PATHS[r]})
+    mutated = sorted({e for t in MUTATED for r in ROOT_OF[t] for e, _ in PATHS[r]})
     for t, paths in enumerate(PATHS):
         whole = expand(WHOLE.get(t, ())) | spawn
         ks = {k: sorted(expand(cs)) for k, cs in keyed.get(t, {}).items()}
@@ -544,5 +550,5 @@ def _write(out: str, nodeids: list[str]) -> None:
         for e, p in paths:
             entries.setdefault(e, {})[p] = rec
     with gzip.open(out, "wt") as f:
-        json.dump({"tests": tests, "leaky": leaky_entries, "mutated": mutated,
+        json.dump({"tests": tests, "leaky": leaky_entries, "mutated": mutated, "fed": fed,
                    "entries": entries}, f, separators=(",", ":"))

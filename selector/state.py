@@ -98,6 +98,7 @@ def kid(k: object) -> str | None:
 
 
 KEY_SEP = "\x1f"
+ORDER = "\x00order"  # changed_keys marker: the keys kept their values but not their order
 
 
 def key_table(snap: "Snapshot", v: dict, depth: int = 0, path: str = "",
@@ -131,6 +132,8 @@ def changed_keys(old: dict[str, dict[str, str]], new: dict[str, dict[str, str]]
         now = new.get(path)
         if now is None:
             continue  # its parent shows the change
+        if [k for k in was if k in now] != [k for k in now if k in was]:
+            out.append((path, ORDER))  # only iteration sees order: the dict's whole readers
         for k in was.keys() | now.keys():
             if was.get(k) != now.get(k) or (was.get(k) == "D" and _sub(path, k) not in new):
                 out.append((path, k))
@@ -481,7 +484,7 @@ def _main(argv: list[str]) -> None:
     if cmd == "snap":  # snap <root> <out>
         snap = take(root, {}, track=True)
         keys = {}
-        for k in snap.entries:
+        for k in (snap.entries if argv[3:] == ["keys"] else ()):  # one sample needs them
             try:
                 v = snap.value(k)
             except (KeyError, ValueError):
@@ -620,7 +623,7 @@ def build(root: Path, out: Path, samples: int = BUILD_SAMPLES) -> bool:
     Rare variation the samples miss is handled in `compare`."""
     runs = []
     for i in range(samples):
-        data = _snap(root, out.with_suffix(f".{i}.tmp"))
+        data = _snap(root, out.with_suffix(f".{i}.tmp"), keys=i == 0)
         if data is None:
             return False
         runs.append(data)
@@ -643,7 +646,7 @@ def build(root: Path, out: Path, samples: int = BUILD_SAMPLES) -> bool:
     keys0 = Path(str(out.with_suffix(".0.tmp")) + ".keys")
     if keys0.is_file():
         keys0.replace(Path(str(out) + ".keys"))
-    for i in range(1, samples):
+    for i in range(1, samples):  # (written empty: only sample 0 computes key tables)
         Path(str(out.with_suffix(f".{i}.tmp")) + ".keys").unlink(missing_ok=True)
     return True
 
@@ -654,8 +657,8 @@ def source_files(root: Path) -> list[tuple[str, int]]:
                   for p in (root / "sqlglot").rglob("*.py"))
 
 
-def _snap(root: Path, part: Path) -> dict | None:
-    if _run(["snap", str(root), str(part)], None) is None:
+def _snap(root: Path, part: Path, keys: bool = False) -> dict | None:
+    if _run(["snap", str(root), str(part)] + (["keys"] if keys else []), None) is None:
         return None
     data = pickle.loads(part.read_bytes())
     part.unlink()

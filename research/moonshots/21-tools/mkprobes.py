@@ -34,6 +34,8 @@ P = [
      "        TokenType.LOCALTIMESTAMP: exp.Localtime,\n    }"),
     ("k17", "sqlglot/parsers/mysql.py", 'format=Dialect["mysql"].format_time(seq_get(args, 1)),',
      'format=Dialect["mysql"].format_time(seq_get(args, 0)),'),
+    ("k19", "sqlglot/dialects/duckdb.py", '"//": TokenType.DIV,\n            "**": TokenType.DSTAR,',
+     '"**": TokenType.DSTAR,\n            "//": TokenType.DIV,'),
     ("k18", "sqlglot/dialects/sqlite.py", '"ATTACH": TokenType.ATTACH,', '"ATTACH": TokenType.COMMAND,'),
 ]
 (OUT / "commits").mkdir(parents=True, exist_ok=True)

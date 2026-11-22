@@ -93,6 +93,7 @@ from . import maps as maps_module
 from .maps import ImportTimeMap, Maps
 
 KEY_SEP = "\x1f"  # nested-path separator of the key-lookup map (state.KEY_SEP)
+KEY_ORDER = "\x00order"  # state.ORDER
 
 # Class and module bodies of these files shape nearly every test (map gives ~1550 of 1620):
 # no conservative set for them, only the name / state narrowing, else ALL.
@@ -1289,7 +1290,7 @@ class Selector:
         No answer for entries the map marks leaky (an original reference left unswapped) or
         mutated at run time, or whose dicts it does not have."""
         changes = (found.get("keys") or {}).get(entry)
-        if changes is None:
+        if not changes:  # None, or a change the key tables do not show: today's rule
             return None
         km = self._keymap()
         if km is None or entry in km["bad"]:
@@ -1306,7 +1307,8 @@ class Selector:
                 if rec is None:
                     return None
                 got |= self._key_tests(km, rec.get("W", ()))
-            got |= self._key_tests(km, (rec or {}).get("K", {}).get(k, ()))
+            if k != KEY_ORDER:  # an order change is seen only by the whole readers
+                got |= self._key_tests(km, (rec or {}).get("K", {}).get(k, ()))
         self._keyed_entries.add(entry)
         return got
 
@@ -1323,7 +1325,8 @@ class Selector:
 
     def _keymap(self) -> dict | None:
         if self._keymap_data is None:
-            path = Path(os.environ.get("BR_KEYMAP", self.maps.directory / "keys.json.gz"))
+            where = getattr(self.maps, "directory", None)
+            path = Path(os.environ.get("BR_KEYMAP") or (where or Path("/nonexistent")) / "keys.json.gz")
             if os.environ.get("BR_KEYLEVEL", "1") == "0" or not path.is_file():
                 self._keymap_data = False
             else:
