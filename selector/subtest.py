@@ -236,15 +236,46 @@ def rule_steps(expr, schema_, cov_factory=None, keep=False, timer=False):
         if k:
             digs[k] = strict_digest(opt)
             if keep:
-                cks[k] = pickle.dumps(opt)
+                cks[k] = ck_dumps(opt)
         params = inspect.getfullargspec(rule).args
         rkw = {p: kw[p] for p in params if p in kw}
         opt = step(k, lambda: rule(opt, **rkw))
     digs[NSTEPS - 1] = strict_digest(opt)
     if keep:
-        cks[NSTEPS - 1] = pickle.dumps(opt)
+        cks[NSTEPS - 1] = ck_dumps(opt)
     step(NSTEPS - 1, lambda: opt.sql(pretty=True))
     return covs, cks, digs, strict_digest(opt), cpu
+
+
+def _ck_new(cls):
+    return object.__new__(cls)
+
+
+_SLOTS: dict = {}
+
+
+def ck_dumps(tree) -> bytes:
+    """Lossless pickle of an expression tree: every slot / __dict__ attribute of every node as
+    is (args with None values, parent links, _type, _meta, _hash, sharing), bypassing Expr's
+    serde-based __reduce__ (which drops None-valued args). Loading runs no sqlglot code."""
+    from sqlglot.expressions import Expr
+
+    class P(pickle.Pickler):
+        def reducer_override(self, obj):
+            if not isinstance(obj, Expr):
+                return NotImplemented
+            cls = type(obj)
+            slots = _SLOTS.get(cls)
+            if slots is None:
+                slots = _SLOTS[cls] = tuple(dict.fromkeys(
+                    n for c in cls.__mro__ for n in c.__dict__.get("__slots__", ())
+                    if n not in ("__dict__", "__weakref__")))
+            st = {n: getattr(obj, n) for n in slots if hasattr(obj, n)}
+            return _ck_new, (cls,), (getattr(obj, "__dict__", None) or None, st)
+
+    buf = io.BytesIO()
+    P(buf, protocol=pickle.HIGHEST_PROTOCOL).dump(tree)
+    return buf.getvalue()
 
 
 def from_checkpoint(ck: bytes, schema_dict: dict, k: int):
