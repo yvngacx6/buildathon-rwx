@@ -322,6 +322,22 @@ def _safe_path(ancestors: list[ast.AST], node: ast.AST) -> bool:
 # ── 2. who can read a name ───────────────────────────────────────────────────────────────
 
 
+# r36: a run-time read of a name / attribute is observed exactly by the tests that ran one of
+# the node's own lines. The lines map (mapbuild/trace_one.py) records sys.monitoring LINE
+# events, one interpreter per test; CPython (3.12+) marks as a line start every instruction
+# whose line differs from the previous instruction's in bytecode order, every jump target and
+# every exception handler, so an instruction on line L only runs after a LINE event for L in
+# its frame (it either starts the line or falls through from an instruction on L). The
+# LOAD_NAME / LOAD_GLOBAL / LOAD_FAST / LOAD_DEREF / LOAD_ATTR (and AugAssign / del)
+# instructions of an `ast.Name` / `ast.Attribute` carry a line within node.lineno ..
+# node.end_lineno (a multi-line attribute's LOAD_ATTR is moved to the attribute's own line,
+# still inside the node). So the node's span is enough; the enclosing statement's other lines
+# (a branch not taken: `x.A if c else x.B`, the call's first line) add tests that never
+# performed the read. Before r36 the span was widened to the statement's lines, a rule from
+# the coverage.py prototype maps (which credit only a statement's first line).
+_OWN_LINE_LOADS = (ast.Name, ast.Attribute)
+
+
 @dataclass(frozen=True)
 class Site:
     path: str
@@ -697,7 +713,9 @@ class Index:
             f = ctx.func
             return Site(path, (f.lineno, f.end_lineno), "run", (f.lineno, f.end_lineno), what=what)
         if ctx.kind == "def" and not ctx.deftime:
-            if stmt is not None:
+            if stmt is not None and not isinstance(node, _OWN_LINE_LOADS):
+                # (a constant may be folded into an enclosing literal whose load carries the
+                # outer node's line: keep the statement's lines for string mentions)
                 body = getattr(stmt, "body", None)
                 head_end = body[0].lineno - 1 if isinstance(body, list) and body else stmt.end_lineno
                 first, last = min(first, stmt.lineno), max(last, max(stmt.lineno, head_end))
@@ -794,7 +812,7 @@ class Index:
             up = parents.get(id(n))
             while up is not None and not isinstance(up, ast.stmt):
                 up = parents.get(id(up))
-            if up is not None:  # the map may credit the statement's first line(s)
+            if up is not None and not isinstance(n, _OWN_LINE_LOADS):
                 body = getattr(up, "body", None)
                 head_end = body[0].lineno - 1 if isinstance(body, list) and body else up.end_lineno
                 first, last = min(first, up.lineno), max(last, up.lineno, head_end or up.lineno)
