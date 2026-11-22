@@ -1515,6 +1515,91 @@ class SubTest:
         return chosen, (f"subtest: {sorted(chosen)} dropped ({len(todo)} queries re-run,"
                         f" {self.last_child:.2f}s, est {est:.2f}, cap {cap:.2f}) [rule checkpoints {nr}]")
 
+    # ── r37: class / module-body edits, verified on the patched import ──────────────────
+
+    def unrecorded(self, spans: dict, cands: set[int]) -> bool:
+        """True when a candidate TPC test ran a span line (lines map: the whole test) that no
+        recorded query phase nor the global set-up ran: it ran while the store was warmed up
+        (before the per-query forks), where its effect can outlive one query."""
+        meta = self.meta()
+        if "_all_lines" not in self.__dict__:
+            per = {}
+            for suite, qs in meta["suites"].items():
+                acc: dict = {}
+                for q in qs:
+                    ph = q["phases"]
+                    parts = [v for k, v in ph.items() if k != "win"]
+                    parts += list((ph.get("win") or {}).values())
+                    for part in parts:
+                        for f, ls in (part or {}).items():
+                            acc.setdefault(f, set()).update(ls)
+                for f, ls in meta["global"].items():
+                    acc.setdefault(f, set()).update(ls)
+                per[suite] = {f: sorted(ls) for f, ls in acc.items()}
+            self._all_lines = per
+        maps = self.sel.maps
+        for path, ss in spans.items():
+            for first, last in ss:
+                ran = maps.span(path, first, last) & cands
+                for suite in {TESTS[self.numbers[n]][0] for n in ran}:
+                    if not _hit(self._all_lines[suite], {path: [(first, last)]}):
+                        return True
+        return False
+
+    def prune_patched(self, root: str, patched: dict[str, str], spans: dict,
+                      candidates: set[int], benefit_of, stage_ok: bool) -> tuple[set[int], str]:
+        """r37. The TPC tests of a commit whose .py edits are not all clean function-body
+        edits (class / module bodies, definition-time code: no diffexec job): `spans` are the
+        OLD-file lines whose run can behave differently (touched function statements, and the
+        lines reading every value the import-state diff shows changed). The queries that run
+        one are re-run in a fresh interpreter importing the PATCHED package and must give the
+        pinned outputs; the others run identical code on identical state."""
+        cands = candidates & set(self.numbers)
+        if not cands:
+            return set(), ""
+        self.stage_ok, self.stage_why = stage_ok, (None if stage_ok else "guard")
+        try:
+            got = self.plan(spans, cands)
+        except Exception as e:  # noqa: BLE001
+            return set(), f"tpc-patched: keep ({type(e).__name__})"
+        if got is None:
+            return set(), "tpc-patched: keep (set-up touched / unknown / unstable)"
+        per, cpu = got
+        import itertools
+        best = (0.0, set(), [], 0.0)
+        nums = sorted(per)
+        for r in range(1, len(nums) + 1):
+            for subset in itertools.combinations(nums, r):
+                todo = []
+                for n in subset:
+                    todo.extend(x for x in per[n] if x not in todo)
+                est = sum(self._cpu(x) for x in todo) + (PATCHED_START_S if todo else 0.0)
+                spend = SCORER_SLOWDOWN * est
+                gain = benefit_of(set(subset))
+                if gain > 0 and spend <= min(PATCHED_BUDGET_S, SHARE * gain / 1000):
+                    net = gain / 1000 - spend
+                    if net > best[0]:
+                        best = (net, set(subset), todo, est)
+        _, chosen, todo, est = best
+        if not chosen:
+            return set(), (f"tpc-patched: keep (est {cpu:.1f}s CPU for "
+                           f"{sum(map(len, per.values()))} queries)")
+        if not todo:
+            return chosen, f"tpc-patched: {sorted(chosen)} dropped (no query runs a changed line)"
+        cap = min(PATCHED_BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0)
+        meta = self.meta()
+        sub = {"schemas": meta["schemas"], "suites": {}}
+        for x in todo:
+            sub["suites"].setdefault(x[0], {})[x[1]] = meta["suites"][x[0]][x[1]]
+        ok, cpu_used = run_patched(root, patched, todo, sub, str(self.store), cap)
+        self.last_child = round(cpu_used, 2)
+        self.spent += cpu_used
+        if not ok:
+            return set(), (f"tpc-patched: keep (verification of {len(todo)} queries failed,"
+                           f" {cpu_used:.2f}s, est {est:.2f}, cap {cap:.2f})")
+        return chosen, (f"tpc-patched: {sorted(chosen)} dropped ({len(todo)} queries re-run"
+                        f" on the patched import, {cpu_used:.2f}s, est {est:.2f}, cap {cap:.2f})")
+
     def _cpu(self, x):
         suite, i, opt, mode, parse_hit, optb_hit, duck_hit, k, gen_hit = x
         q = self.meta()["suites"][suite][i]
@@ -1630,7 +1715,75 @@ def _warm(root: str) -> None:
     from diffexec import replay, serial  # noqa: F401
 
 
-def _child(root, jobs, todo, meta, store, budget, defaults=None) -> bool:
+# ── r37: the patched-import child ────────────────────────────────────────────────
+
+PATCHED_START_S = float(os.environ.get("BR_TPCPATCH_START", "0.6"))  # spawn + patched import
+PATCHED_BUDGET_S = float(os.environ.get("BR_TPCPATCH_S", "8"))  # scorer s (≈ 4 s here)
+
+_RUN_PATCHED = (f"import sys; sys.path.insert(0, {str(REPO)!r}); "
+                "from selector.subtest import _patched_main; _patched_main(sys.argv[1:]); "
+                "sys.stdout.flush(); import os; os._exit(0)")
+
+
+def _patched_main(argv: list[str]) -> None:
+    """Child: import the patched package (selector/state.py `_PatchedFinder`) as the test
+    worker does (unittest loaded first, every patched module imported), then run `todo`
+    exactly as the forked function-body child does, minus the code swap."""
+    import signal
+    root = argv[0]
+    signal.signal(signal.SIGPROF, signal.SIG_DFL)
+    req = pickle.loads(sys.stdin.buffer.read())
+    signal.setitimer(signal.ITIMER_PROF, req["budget"])
+    try:
+        import importlib
+        import warnings
+        sys.path.insert(0, root)
+        from selector.state import _PatchedFinder
+        sys.meta_path.insert(0, _PatchedFinder({os.path.join(root, p): s
+                                                for p, s in req["patched"].items()}))
+        warnings.simplefilter("ignore")
+        import unittest  # noqa: F401  (sqlglot checks it at import, as under the test runner)
+        _warm(root)
+        for p in sorted(req["patched"]):
+            importlib.import_module(p[:-3].replace("/", ".").removesuffix(".__init__"))
+        ok = _child(root, [], req["todo"], req["meta"], req["store"], req["budget"],
+                    patched=True)
+    except BaseException:  # noqa: BLE001
+        if os.environ.get("SUBTEST_DEBUG"):
+            import traceback
+            traceback.print_exc()
+        ok = False
+    signal.setitimer(signal.ITIMER_PROF, 0)
+    sys.stdout.write("OK" if ok else "NO")
+
+
+def run_patched(root: str, patched: dict[str, str], todo: list, meta: dict, store: str,
+                budget: float) -> tuple[bool, float]:
+    """(every query gave the pinned outputs?, child CPU s). Any failure → False."""
+    import subprocess
+    from .diffexec import wall_guard
+    env = {"PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1",
+           "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    if os.environ.get("SUBTEST_DEBUG"):
+        env["SUBTEST_DEBUG"] = "1"
+    req = pickle.dumps({"patched": patched, "todo": todo, "meta": meta, "store": store,
+                        "budget": budget}, pickle.HIGHEST_PROTOCOL)
+    t0 = os.times()
+    try:
+        proc = subprocess.run([sys.executable, "-P", "-s", "-S", "-c", _RUN_PATCHED, root],
+                              input=req, capture_output=True, env=env,
+                              timeout=wall_guard(budget), cwd="/")
+    except (OSError, subprocess.SubprocessError):
+        return False, 0.0
+    finally:
+        t1 = os.times()
+    cpu = (t1.children_user - t0.children_user) + (t1.children_system - t0.children_system)
+    if os.environ.get("SUBTEST_DEBUG") and proc.stderr:
+        sys.stderr.write(proc.stderr.decode(errors="replace")[-3000:])
+    return proc.returncode == 0 and proc.stdout == b"OK", cpu
+
+
+def _child(root, jobs, todo, meta, store, budget, defaults=None, patched=False) -> bool:
     import signal
     sys.setrecursionlimit(1000)  # the pool worker's default (this stack is deeper: stricter)
     # CPU cap: SIGPROF's default action ends the child (→ keep the tests)
@@ -1638,7 +1791,7 @@ def _child(root, jobs, todo, meta, store, budget, defaults=None) -> bool:
     signal.setitimer(signal.ITIMER_PROF, budget)
     _warm(root)
     from sqlglot.executor.table import Table
-    why = _swap(root, jobs, defaults)
+    why = None if patched else _swap(root, jobs, defaults)
     if why:
         if os.environ.get("SUBTEST_DEBUG"):
             print("subtest bail:", why, file=sys.stderr)
