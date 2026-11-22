@@ -126,6 +126,8 @@ SLOW_SECONDS = 5.0  # tests at least this slow get the statement-level rule in f
 # costs at least this much more than the cheapest selection it could give. r5-tune: 1.2 adds
 # diffs that save ~1.8 s each; ≤1.0 adds diffs that save ~0.5 s (< their CPU).
 STATE_MIN_GAIN = 1.2
+# r37: the TPC patched-import check (state diff ~0.8 s + child ≥ 0.6 s): only for a bigger win
+TPCPATCH_MIN_GAIN_MS = int(os.environ.get("BR_TPCPATCH_MIN_MS", "3000"))
 EXPR_ROOT = "sqlglot.expressions.core:Expr"
 # Site.use values: a read that only uses part of the value. The floor (`_state_floor`) leaves
 # such reads out, since the diff may show that part unchanged.
@@ -287,6 +289,10 @@ class Selector:
             for pruner in (self.subtest, self.slowverify):
                 if pruner is not None and (not self._defaults or pruner is self.subtest):
                     per_file = self._subtest(per_file, reasons, pruner)
+        elif self.subtest is not None and os.environ.get("BR_TPCPATCH", "1") != "0":
+            # r37: no function-body job (class / module bodies, definition-time code): verify
+            # the TPC tests on the patched import
+            per_file = self._tpc_patched(per_file, reasons)
         if self.genmem is not None:
             per_file = self._genmem(per_file, reasons)
         for _, got in per_file:
@@ -321,6 +327,188 @@ class Selector:
         if note:
             reasons.append(note)
         return [(p, got - dropped) for p, got in per_file]
+
+    def _tpc_patched(self, per_file, reasons):
+        """r37: drop the TPC executor tests of a commit no function-body pruner can take
+        (class / module-body edits, definition-time code, state-diff commits) when the
+        queries that run a line the commit can change give the pinned outputs on the PATCHED
+        import (subtest.SubTest.prune_patched). The lines: the touched statements of every
+        changed def, and every site reading a value the import-state diff shows changed
+        (the sites `_by_state` takes its readers from). Anything unusual → keep."""
+        from . import pack
+        st = self.subtest
+        everything = set().union(*(got for _, got in per_file)) if per_file else set()
+        cands = set(st.numbers) & everything
+        if not cands:
+            return per_file
+        ms_of = {n: pack.duration_ms(s) for n, s in self._secs.items()}
+        base = pack.cost_ms(pack.pack(everything, ms_of), ms_of)
+
+        def benefit(only):
+            rest = everything - only
+            return base - (pack.cost_ms(pack.pack(rest, ms_of), ms_of) if rest else 0)
+
+        if benefit(cands) < TPCPATCH_MIN_GAIN_MS:
+            return per_file
+
+        def keep(why: str):
+            reasons.append(f"tpc-patched: keep ({why})")
+            return per_file
+
+        patched: dict[str, str] = {}
+        for fp in self._files:
+            p = fp.path
+            if p.endswith(".py") or (fp.old_path or "").endswith(".py"):
+                if not (p.startswith("sqlglot/") and fp.old_path and fp.old_path == fp.new_path):
+                    return keep(f"{p}: not a modified sqlglot module")
+                try:
+                    patched[p] = diff.apply(self._old_text(p), fp)
+                except diff.PatchError:
+                    return keep(f"{p}: patch")
+        for p, got in per_file:
+            if got & cands and not (p.startswith("sqlglot/") and p.endswith(".py")):
+                return keep(f"selected by {p}")
+        if not patched:
+            return per_file
+        try:
+            found = self._state_diff()
+        except Exception as e:  # noqa: BLE001  (StateDiffOff …)
+            return keep(type(e).__name__)
+        if found is None:
+            return keep("import-state diff unavailable")
+        self._tpc_guard_skip: set[tuple[str, str]] = set()
+        try:
+            spans = self._tpc_spans(patched, found, cands)
+            if isinstance(spans, str):
+                return keep(spans)
+            if st.unrecorded(spans, cands):
+                return keep("a changed line ran outside the recorded queries")
+            from .subtest import stage_guard
+            why = stage_guard(str(self.sqlglot), [(p, t, None) for p, t in patched.items()],
+                              skip=self._tpc_guard_skip)
+        except names.Fallback as e:
+            return keep(str(e)[:120])
+        except Exception as e:  # noqa: BLE001
+            return keep(type(e).__name__)
+        if why:
+            return keep(f"may write shared state: {why}"[:160])
+        try:
+            dropped, note = st.prune_patched(str(self.sqlglot), patched, spans, cands, benefit,
+                                             True)
+        except Exception as e:  # noqa: BLE001
+            return keep(type(e).__name__)
+        if note:
+            reasons.append(note)
+        return [(p, got - dropped) for p, got in per_file]
+
+    def _tpc_spans(self, patched: dict[str, str], found: dict, cands: set[int]):
+        """{path: [(first, last)]} OLD-file lines whose run can differ under the patch, or a
+        reason (str) not to verify. Raises names.Fallback like `_state_readers`."""
+        spans: dict[str, list[tuple[int, int]]] = {}
+        covered: set[tuple[str, ...]] = set()  # (module, *def chain) whose edit is in spans
+        by_path = {fp.path: fp for fp in self._files}
+        for p, new_text in patched.items():
+            old_bytes = (self.sqlglot / p).read_bytes()
+            old_text = old_bytes.decode("utf-8")
+            same = classify.SameAst(old_text, new_text)
+            old_tree = self._old_tree(p, old_bytes)
+            new_tree = classify.strip_docstrings(ast.parse(new_text.encode("utf-8")))
+            if same(old_tree, new_tree):
+                continue
+            removed, added = diff.changed_lines(by_path[p])
+            scopes = self._old_scopes(p)
+            module = _module_of(p)
+            for r in classify.regions(old_tree, new_tree, removed, added, same, scopes):
+                if r.kind == "function":
+                    spans.setdefault(p, []).extend(
+                        r.statements if r.statements is not None else [r.span])
+                    covered.add((module, *r.chain))
+                elif r.via_def:  # metaclass / __init_subclass__ …: also runs at run time
+                    s = scopes.by_chain.get(r.via_def)
+                    if s is None:
+                        return f"{'.'.join(r.via_def)}: no pinned def"
+                    spans.setdefault(p, []).append((s.start, s.end))
+                    covered.add((module, *r.via_def))
+                    if not self.maps.span(p, s.start, s.end) & cands:
+                        # no TPC test runs it (class creation at import only): its writes to
+                        # the new class are what the import-state diff compares
+                        self._tpc_guard_skip.add((p, ".".join(r.via_def)))
+                # plain class / module bodies run at import: what they build differently is
+                # in the import-state diff, read at the sites below
+        changed = [k.split(" ", 2) for k in found["changed"]]
+        digests = found.get("digests") or {}
+        new_classes = {k.split(" ")[1] for k in found["changed"]
+                       if k.endswith(" __mro__") and (digests.get(k) or (1,))[0] is None}
+        index = self._index()
+        info, with_instances = found["info"], set(found["instances"])
+        maps = self.maps
+        real_span = maps.span
+        rec: list[tuple[str, int, int]] = []
+
+        def span(path, first, last):
+            rec.append((path, first, last))
+            return real_span(path, first, last)
+
+        maps.span = span  # record every line range the readers are taken from
+        try:
+            for kind, owner, attr in changed:
+                if kind == "C" and owner in new_classes and attr.startswith("__"):
+                    continue  # a new class: reached only through the entries that name it
+                if kind == "C" and attr.startswith("__") and (
+                        owner.split(":", 1)[0], *owner.split(":", 1)[-1].split("."), attr) in covered:
+                    # a changed special method of a patched class (`super()` cell: digested
+                    # with its code): Python calls it implicitly, which runs its body, whose
+                    # touched lines are in the spans already
+                    continue
+                if kind == "C" and attr in TYPEDDICT_KEYS:
+                    return f"{attr}: TypedDict key set"
+                if attr.startswith("__") and attr.endswith("__"):
+                    return f"{owner.rsplit(':', 1)[-1]}.{attr}: special name"
+                if kind == "M":
+                    owner_path = self._module_path(owner)
+                    if owner_path is None:
+                        return f"module {owner} not found"
+                    chain: tuple[str, ...] = ()
+                elif kind == "C":
+                    owner_path, chain, _ = self._class_owner(owner, info, with_instances, index,
+                                                             found.get("holders"))
+                else:
+                    return f"entry kind {kind}"
+                entry = f"{kind} {owner} {attr}"
+                same_parts = frozenset(found.get("same", {}).get(entry, ()))
+                start = len(rec)
+                ran: set[int] = set()  # tests that ran any site line (import-time ones too)
+                for site in index.sites(attr, owner_path, chain, True):
+                    at = len(rec)
+                    for bucket, got in self._site_reads(index, site, attr, same=same_parts):
+                        if bucket == "tests" and got & cands:
+                            return f"test code reads {attr}"
+                    if site.when != "run":
+                        # runs at import (memoized code raised Fallback above): what it builds
+                        # is itself in the diff, read at its own sites. A module first
+                        # imported during a query runs it there too, but on the patched
+                        # import it builds exactly that diff entry.
+                        for path, a, b in rec[at:]:
+                            ran |= real_span(path, a, b)
+                        del rec[at:]
+                for path, a, b in rec[start:]:
+                    ran |= real_span(path, a, b)
+                if cands - ran:
+                    # a TPC test reading the value where no site line shows (key-level map,
+                    # attrs map): no line to verify by
+                    # (`_state_readers` takes the key-level map alone when no site ran)
+                    by_key = self._key_readers(entry, found)
+                    if by_key is not None and (by_key & cands) - ran:
+                        return f"{attr}: key-level reader with no site line"
+                    looked = self._attr_readers(owner, attr, info) if kind == "C" else None
+                    if looked is not None and (looked & cands) - ran:
+                        return f"{attr}: looked up where no site line shows"
+        finally:
+            del maps.span
+        for path, a, b in rec:
+            if path.startswith("sqlglot/"):
+                spans.setdefault(path, []).append((a, b))
+        return spans
 
     def _genmem(self, per_file, reasons):
         """Drop test_generator_memory when its body passes on the patched package
