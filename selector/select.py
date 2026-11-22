@@ -2663,8 +2663,21 @@ def _same_code_shape(old_tree: ast.Module, new_tree: ast.Module,
     what its touched statements do."""
     if not chain:
         return False
-    old = _code_shape(old_tree, chain)
+    old = _old_memo(("shape", chain), old_tree, lambda: _code_shape(old_tree, chain))
     return old is not None and old == _code_shape(new_tree, chain)
+
+
+_OLD_MEMO: dict[tuple, tuple] = {}
+
+
+def _old_memo(key: tuple, old_tree: ast.Module, make):
+    """r41: a value computed from a pinned tree (`Selector._old_tree`: parsed once per run,
+    never changed after), once per tree and key. Holds the tree, so its id stays its own."""
+    k = (id(old_tree),) + key
+    hit = _OLD_MEMO.get(k)
+    if hit is None or hit[0] is not old_tree:
+        hit = _OLD_MEMO[k] = (old_tree, make())
+    return hit[1]
 
 
 def _same_lead(old_tree: ast.Module, new_tree: ast.Module, lead: int,
@@ -2836,7 +2849,7 @@ def _default_changes(old_tree: ast.Module, new_tree: ast.Module) -> list | None:
                 node.args.defaults, node.args.kw_defaults = od, okw
         return dump, [(node, list(od), list(okw)) for node, od, okw in found]
 
-    old_dump, old_defs = blank(old_tree)
+    old_dump, old_defs = _old_memo(("blank",), old_tree, lambda: blank(old_tree))
     new_dump, new_defs = blank(new_tree)
     if old_dump != new_dump or len(old_defs) != len(new_defs):
         return None

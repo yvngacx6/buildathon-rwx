@@ -104,9 +104,12 @@ class FixtureRule:
         if self._bodies is None:
             self._bodies = {}
             src = (self.sqlglot / "tests" / "test_optimizer.py").read_text(encoding="utf-8")
+            lines = None
             for node in ast.walk(ast.parse(src)):
                 if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
-                    self._bodies[node.name] = ast.get_source_segment(src, node) or ""
+                    if lines is None:
+                        lines = _split_lines(src)
+                    self._bodies[node.name] = _segment(src, lines, node) or ""
         return self._bodies
 
     def consumer(self, path: str, test: str) -> tuple[str, str] | None:
@@ -197,3 +200,30 @@ class FixtureRule:
             kept.add(test)
         note = f"consumer views: {len(readers) - len(kept)}/{len(readers)} readers unchanged"
         return kept, note + (f", {parsed} by parse check" if parsed else "")
+
+
+def _split_lines(src: str):
+    """r41: the file's lines as `ast.get_source_segment` splits them, once (it re-splits the
+    whole file per call: ~0.7 s for test_optimizer.py's ~170 tests)."""
+    try:
+        return ast._splitlines_no_ff(src)  # noqa: SLF001  (the pinned image's Python)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _segment(src: str, lines, node) -> str | None:
+    """`ast.get_source_segment(src, node)` over pre-split lines (same steps)."""
+    if lines is None:
+        return ast.get_source_segment(src, node)
+    try:
+        if node.end_lineno is None or node.end_col_offset is None:
+            return None
+        lineno, end_lineno = node.lineno - 1, node.end_lineno - 1
+        col_offset, end_col_offset = node.col_offset, node.end_col_offset
+    except AttributeError:
+        return None
+    if end_lineno == lineno:
+        return lines[lineno].encode()[col_offset:end_col_offset].decode()
+    first = lines[lineno].encode()[col_offset:].decode()
+    last = lines[end_lineno].encode()[:end_col_offset].decode()
+    return "".join([first] + lines[lineno + 1:end_lineno] + [last])
