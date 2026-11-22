@@ -438,8 +438,7 @@ def _build_rules(outs, optb_cov, pexpr, schema_dict, prefix, seed_runs) -> None:
             t0 = time.process_time()
             oe = from_checkpoint(cks[k], schema_dict, k)
             t1 = time.process_time()
-            c1 = _calib()  # after: it must not warm caches for the run (as stage_timed)
-            return strict_digest(oe), _norm(t1 - t0, c1, c1)
+            return strict_digest(oe), t1 - t0
 
         try:
             d, c = _in_fork(check)
@@ -448,6 +447,10 @@ def _build_rules(outs, optb_cov, pexpr, schema_dict, prefix, seed_runs) -> None:
         if d == dfin:
             ok.append(k)
             cpu_from[k] = c
+    if cpu_from:
+        # one calibration per query (in its own fork, after the timed runs), as stage_timed
+        c1 = _in_fork(_calib)
+        cpu_from = {k: _norm(c, c1, c1) for k, c in cpu_from.items()}
     outs["ck_ok"] = ok
     outs["cpu_from"] = cpu_from
     outs["cpu_steps"] = cpu
