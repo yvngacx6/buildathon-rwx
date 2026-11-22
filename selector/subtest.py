@@ -397,7 +397,6 @@ def build(root: Path, out: Path) -> None:
                         return covs, d_opt, dres
 
                     def stage_timed():
-                        c0 = _calib()
                         t0 = time.process_time()
                         e4 = pickle.loads(pexpr)
                         import sqlglot.executor as E
@@ -406,7 +405,8 @@ def build(root: Path, out: Path) -> None:
                         oe.sql(pretty=True)
                         d2 = strict_digest(oe)
                         cpu_stage = time.process_time() - t0
-                        return d2, _norm(cpu_stage, c0, _calib())
+                        c1 = _calib()  # after: it must not warm caches for the run
+                        return d2, _norm(cpu_stage, c1, c1)
                     covs, d_opt, dres = _in_fork(windows)
                     d2, cpu_stage = _in_fork(stage_timed)
                     phases["win"] = covs
@@ -428,14 +428,13 @@ def build(root: Path, out: Path) -> None:
                 return cov.stop(), duck, opt
 
             def timed(q=q):
-                c0 = _calib()
                 t0 = time.process_time()
                 a = run_query(q, schemas[suite], tables[suite], False)
                 t1 = time.process_time()
                 b = run_query(q, schemas[suite], tables[suite], True) if suite == "tpch" else None
                 t2 = time.process_time()
-                c1 = _calib()
-                return a, b, _norm(t1 - t0, c0, c1), _norm(t2 - t1, c0, c1), (c0 + c1) / 2
+                c1 = _calib()  # after: it must not warm caches for the runs
+                return a, b, _norm(t1 - t0, c1, c1), _norm(t2 - t1, c1, c1), c1
 
             try:
                 phases, outs = _in_fork(traced)
