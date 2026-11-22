@@ -17,3 +17,4 @@
 | S13 | 11-21 10:16 | 0bcd015 | + r19 import-fn narrowing, r20 genmem verify | 115.1 | 2427.1 / 0 (264) | 194.0 (189.1 sim + 4.9 CPU) | 0/40 | Same sim as S12: r19/r20 do not touch practice commits. |
 | S14 | 11-21 15:02 | 17d41ba (branch diag-slow2) | DIAGNOSTIC: drop test_max_nodes only | – | – | 195.1 (189.106 sim) | 0/40 | max_nodes is ~never selected on practice (−0.001 s). Remaining slow cost = tpcds/tpch/genmem. | Not a final candidate. (Laptop restart lost 11:00–15:00.) |
 | S15 | 11-21 16:06 | 9a5d41e | + r25 safety, r25b, moon-13 CPU, r23 statement rule for all tests | 115.0 | 2331.1 / 0 (264); practice_like 923.3 / 0 | pending | pending | Limit now 2/hour. |
+| S16 | 11-21 16:30 | cd01065 | + moon-18 miss fixes, r29 TPC stage checkpoints, r26 subset prune, final_check tool | 115.0 | practice_like 824.2 / 0; private 2240.3 / 0; final_check PASS | pending | pending | |
