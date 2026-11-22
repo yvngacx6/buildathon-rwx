@@ -5,11 +5,11 @@
 - **It works and is sound: re-run CPU drops ~25–35 %, 0 misses.** How many extra drops it buys
   depends on the base.
   - **On r29-tpcstage** (moon-05 plus the stage guard and build calibration; branch
-    **`moon-22-r29`**): **+11 tpcds drops**.
+    **`moon-22`** = `moon-22-r29`): **+11 tpcds drops**.
     - R: +10, sim −113.8 s over the 166 r17 refusals.
     - private41: +1 (op05, labeled, no miss).
     - P: +6, sim −67.8 s / 600. Q: +4, sim −46.0 s / 1,000. These are the same 10 commits as R's.
-  - **On moon-05 as is** (branch `moon-22`): +1 drop in 1,872 commits (P_6phk). Moon-05's looser
+  - **On moon-05 as is** (moon-05-based code, `moon-22` up to 1a7b6f2): +1 drop in 1,872 commits (P_6phk). Moon-05's looser
     plan already fits most optb-only commits in the budget.
 - **0 misses** on all labeled sets, on both bases: practice_like, private, private41, adversarial,
   adversarial2, sample.
@@ -50,8 +50,8 @@
 - **Per 40 practice-style commits:** −1.2 to −1.7 s of child CPU. At the scorer's 2x that is
   **≈ −2.5 to −3.4 s**. There are no new drops on practice_like.
   - The refusal population (R, P/Q) shows a larger tail: a ≈ −11 s sim win per affected commit,
-    ~1 % of commits on the r29 base.
-  - On the final's ~60 unseen commits that is ≈ +0.6 drops, ≈ −7 s expected.
+    on 10 of 1,600 P+Q commits (≈ 0.6 %) on the r29 base.
+  - On the final's ~60 unseen commits that is ≈ +0.4 drops, ≈ −4 s expected.
 - **Why not more drops.** Of the 52 refusals still left on R (moon-05 base), about 40 are full-mode. Their
   touched lines also run in the executor windows (prep / plan / post: `executor/context.py`,
   `table.py`, `trie.py`, `schema.py`, `scope.py`, `generators/python.py`, `planner.py`), so every
