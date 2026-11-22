@@ -3,7 +3,8 @@
 usage (cwd = sqlglot checkout, SKIP_INTEGRATION=0):
     python attrs_map.py --tests tests.json --work <scratch> --out <maps dir> [-j N]
 
-attrs.json.gz = {"tests": [ids], "map": {"module:Qual NAME": [test idx]},
+attrs.json.gz = {"tests": [ids], "classes": {"module:Qual": {NAME: list id}}, "lists": [delta-encoded
+                 sorted test idx: tests that looked NAME up through that class or a subclass],
                  "tracked": {"module:Qual": [names]}, "untracked": {"module:Qual": [names]},
                  "replaced": [test idx], "failed": [test idx]}
 A test is in "replaced" (some tracked entry was rebound during it) or "failed" (outcome
@@ -71,7 +72,14 @@ def main():
     for cls in tracked:
         both = tracked[cls] & untracked.get(cls, set())
         tracked[cls] -= both
-    out = {"tests": ids, "map": {k: sorted(v) for k, v in sorted(keymap.items())},
+    # compact: keys grouped by class, identical test lists stored once, delta-encoded
+    uniq: dict[tuple, int] = {}
+    classes: dict[str, dict[str, int]] = {}
+    for k, v in sorted(keymap.items()):
+        cls, _, name = k.partition(" ")
+        classes.setdefault(cls, {})[name] = uniq.setdefault(tuple(sorted(v)), len(uniq))
+    lists = [[b - a for a, b in zip((0,) + t, t)] for t in sorted(uniq, key=uniq.get)]
+    out = {"tests": ids, "classes": classes, "lists": lists,
            "tracked": {k: sorted(v) for k, v in sorted(tracked.items())},
            "untracked": {k: sorted(v) for k, v in sorted(untracked.items())},
            "replaced": sorted(replaced), "failed": sorted(failed)}
