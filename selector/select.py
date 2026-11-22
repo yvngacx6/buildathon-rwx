@@ -87,6 +87,7 @@ dropped only if that passes with margin (selector/genmem.py).
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 from pathlib import Path, PurePosixPath
@@ -94,6 +95,9 @@ from pathlib import Path, PurePosixPath
 from . import classify, diff, nameindex, names, pack
 from . import maps as maps_module
 from .maps import ImportTimeMap, Maps
+
+KEY_SEP = "\x1f"  # nested-path separator of the key-lookup map (state.KEY_SEP)
+KEY_ORDER = "\x00order"  # state.ORDER
 
 # Class and module bodies of these files shape nearly every test (map gives ~1550 of 1620):
 # no conservative set for them, only the name / state narrowing, else ALL.
@@ -207,6 +211,8 @@ class Selector:
         self._attr_meta: tuple | None = None  # `_attr_readers`: (tracked, untracked, always)
         self._families: dict[tuple, list] = {}  # `_related`: owner class → its family
         self._ancestor_memo: dict[tuple, set | None] = {}
+        self._keymap_data: dict | bool | None = None  # maps/keys.json.gz (False: none)
+        self._keyed_entries: set[str] = set()
         self._test_imports = None  # testimport.Checker, on first use
         self._all_test_modules: set[str] | None = None
         self.state_diff_off = False  # `degrade`
@@ -254,6 +260,7 @@ class Selector:
         if not files:
             return self.all_numbers(), "ALL (no files parsed)"
         self._files, self._state, self._state_error = files, False, None
+        self._keyed_entries: set[str] = set()
         chosen: set[int] = set()
         reasons = []
         self._jobs = []  # diffexec: (path, new text, prunable tests) per file
@@ -1479,9 +1486,13 @@ class Selector:
         typed: set[int] = set()  # tests that name a TypedDict whose key sets changed
         untyped = False  # some changed value is not a TypedDict key set (nor attrs-vouched)
         vouched: set[str] = set()  # changed keys whose every lookup the attrs map recorded
+        weak: set[str] = set()  # changed keys with no attrs-map answer (moon-21 may give one)
         held: set[int] = set()  # class-attribute readers among tests that can hold the class
         in_tests: set[int] = set()
         n_sites = 0
+        keyed: set[int] = set()  # key-level readers (moonshot 21)
+        keyed_parts: list[tuple[set[int], set[int], set[int]]] = []
+        n_keyed = 0
         owners: dict[str, tuple] = {}
         per_key: list[tuple[str, set[int], set[int]]] = []  # (key, reads, reads ∩ touch)
         for kind, owner, attr in changed:
@@ -1512,6 +1523,7 @@ class Selector:
             looked = self._attr_readers(owner, attr, info) if kind == "C" else None
             if looked is None:
                 untyped = True
+                weak.add(f"{kind} {owner} {attr}")
             else:
                 vouched.add(f"{kind} {owner} {attr}")
             if kind == "M":
@@ -1527,49 +1539,150 @@ class Selector:
                 owner_path, chain, users = owners[owner]
                 touch |= self.maps.whole_file(owner_path) | self._class_users(
                     _module_of(owner_path), [chain])
-            same = frozenset(found.get("same", {}).get(f"{kind} {owner} {attr}", ()))
+            entry = f"{kind} {owner} {attr}"
+            same = frozenset(found.get("same", {}).get(entry, ()))
             key_free: set[int] = set()
             key_touched: set[int] = set()
-            per_key.append((f"{kind} {owner} {attr}", key_free, key_touched))
+            e_tests: set[int] = set()
+            e_free: set[int] = set()
+            e_loose: set[int] = set()
+            e_held: set[int] = set()
             for site in index.sites(attr, owner_path, chain, True):
                 if (kind == "C" and site.recv is not None
                         and not self._related(index, (site.path, site.recv), owner_path, chain)):
                     continue  # `self.attr` in a method of a class unrelated to the owner
+                # (run for every entry, key-level or not: its Fallbacks -- reads in code
+                # cached across tests, special names -- guard the key-level answer too)
                 for bucket, got in self._site_reads(index, site, attr, same=same):
                     n_sites += 1
                     if bucket == "tests":
-                        in_tests |= got
+                        e_tests |= got
                         key_free |= got
                     elif kind == "M":
-                        free |= got
+                        e_free |= got
                         key_free |= got
                     elif bucket == "held" and looked is not None:
                         # a static / getattr read goes through the attribute lookup the
                         # attrs map recorded: only tests that made that lookup can see it
                         hit = got & looked if users is None else got & users & looked
-                        held |= hit
+                        e_held |= hit
                         key_touched |= hit
                     elif users is None or bucket == "loose":
-                        loose |= got
+                        e_loose |= got
                         key_touched |= got
                     else:
-                        held |= got & users
+                        e_held |= got & users
                         key_touched |= got & users
+            by_key = self._key_readers(entry, found)
+            if by_key is not None:
+                # moonshot 21: the tests that looked up a changed key of this dict (or read
+                # it whole) in the pinned run -- every run-time read of the object. Both it
+                # and the site readers bound the entry's readers, so take both bounds (the
+                # site bound after the final `touch`, below); with no site reader seen, the
+                # map alone (it records every read of the object, not just named ones).
+                keyed_parts.append((by_key, e_free | e_tests, e_loose | e_held,
+                                    looked is not None))
+                n_keyed += 1
+                per_key.append((entry, by_key, set()))
+                continue
+            per_key.append((entry, key_free, key_touched))
+            in_tests |= e_tests
+            free |= e_free
+            loose |= e_loose
+            held |= e_held
         # Class-attribute reads stay within the users of the owner classes and their files
         # (the bound `_by_names` relies on); `held` narrows that further.
+        for by_key, unrestricted, restricted, by_attrs in keyed_parts:
+            # both narrowings bound the entry's readers: the static sites (already cut by the
+            # attrs map where it vouches) and the key-level map. Take both. No site reader:
+            # the key-level map alone -- unless the attrs map vouched for that (no lookup at
+            # all), which is itself a sound empty answer.
+            sites = unrestricted | (restricted & touch)
+            keyed |= (by_key & sites) if (sites or by_attrs) else by_key
         got = free | ((loose | held) & touch) | in_tests
-        got |= typed
+        got |= typed | keyed
         # changed values no test is seen reading (a reader the index is blind to, or none):
         # callers of `_state_readers(…, allow_empty)` let the lines' run-time callers stand in
-        self._state_unread = [k for k, f, t in per_key
-                              if not f and not t & touch and k not in vouched]
-        if not got and not allow_empty and untyped:
+        self._state_unread = [k for k, f, t in per_key if not f and not t & touch
+                              and k not in vouched and k not in self._keyed_entries]
+        # Fallback only if some changed value has neither an attrs-map nor a key-level answer
+        if not got and not allow_empty and any(
+                e not in vouched and e not in self._keyed_entries for e in weak):
             raise names.Fallback("no test ran a line reading a changed value")
         shown = sorted({f"{o.rsplit(':', 1)[-1]}.{a}" for _, o, a in changed})
         more = f" +{len(shown) - 6}" if len(shown) > 6 else ""
         return got, (f"state: {', '.join(shown[:6])}{more} → {n_sites} reader sites "
                      f"(globals {len(free)}, unrestricted {len(loose & touch)}, "
-                     f"held {len(held)}, tests {len(in_tests)})")
+                     f"held {len(held)}, tests {len(in_tests)}"
+                     + (f", key-level {n_keyed} entries / {len(keyed)} tests" if n_keyed else "")
+                     + ")")
+
+    def _key_readers(self, entry: str, found: dict) -> set[int] | None:
+        """Key-level readers of a changed dict entry (moonshot 21), or None (no answer).
+
+        The import-state diff lists, for an entry that is an exact dict before and after,
+        the (nested path, key) pairs whose lookup can differ (`state._key_changes`). The
+        key-lookup map (maps/keys.json.gz, mapbuild/keytrace.py: the pinned suite run with
+        every import-time dict replaced by a recording copy) gives, per dict, the tests that
+        looked each key up -- hits and misses -- and the tests that read it whole (iteration,
+        len, keys / items, copy, ==, pickling ...). A test that did neither, at the changed
+        dict or any dict above it on the path, got the same result from every read of it.
+        No answer for entries the map marks leaky (an original reference left unswapped) or
+        mutated at run time, or whose dicts it does not have."""
+        changes = (found.get("keys") or {}).get(entry)
+        if not changes:  # None, or a change the key tables do not show: today's rule
+            return None
+        km = self._keymap()
+        if km is None or entry in km["bad"]:
+            return None
+        paths = km["entries"].get(entry)
+        if paths is None:
+            return None
+        got: set[int] = set()
+        for path, k in changes:
+            parts = path.split(KEY_SEP) if path else []
+            rec = None
+            for i in range(len(parts) + 1):
+                rec = paths.get(KEY_SEP.join(parts[:i]))
+                if rec is None:
+                    return None
+                got |= self._key_tests(km, rec.get("W", ()))
+            if k != KEY_ORDER:  # an order change is seen only by the whole readers
+                got |= self._key_tests(km, (rec or {}).get("K", {}).get(k, ()))
+        self._keyed_entries.add(entry)
+        return got
+
+    def _key_tests(self, km: dict, idx) -> set[int]:
+        out: set[int] = set()
+        numbers = km["numbers"]
+        for i in idx:
+            if i < 0:
+                return set(self.all_numbers())
+            n = numbers[i]
+            if n is not None:
+                out.add(n)
+        return out
+
+    def _keymap(self) -> dict | None:
+        if self._keymap_data is None:
+            where = getattr(self.maps, "directory", None)
+            path = Path(os.environ.get("BR_KEYMAP") or (where or Path("/nonexistent")) / "keys.json.gz")
+            if os.environ.get("BR_KEYLEVEL", "1") == "0" or not path.is_file():
+                self._keymap_data = False
+            else:
+                import gzip
+
+                try:
+                    with gzip.open(path, "rt") as f:
+                        raw = json.load(f)
+                    number_of = self.maps._number_of
+                    self._keymap_data = {
+                        "numbers": [number_of.get(t) for t in raw["tests"]],
+                        "bad": set(raw.get("leaky", ())) | set(raw.get("mutated", ())),
+                        "entries": raw["entries"]}
+                except (OSError, ValueError, KeyError):
+                    self._keymap_data = False
+        return self._keymap_data or None
 
     def _attr_readers(self, owner: str, attr: str, info: dict) -> set[int] | None:
         """moon-19. Tests that looked `attr` up (x.attr, cls.attr, getattr, hasattr, super())

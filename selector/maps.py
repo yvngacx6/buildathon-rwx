@@ -254,6 +254,7 @@ class Maps:
         # moon-19 attrs: class-attribute lookups per test (mapbuild/trace_attrs.py); optional
         self.attrs = (AttrsMap(directory / "attrs.json.gz", number_of)
                       if (directory / "attrs.json.gz").is_file() else None)
+        self.directory = directory  # moon-21: maps/keys.json.gz is loaded by select.py
         self._unvouched: frozenset[int] | None = None
         self._file_cache: dict[str, frozenset[int]] = {}
 
