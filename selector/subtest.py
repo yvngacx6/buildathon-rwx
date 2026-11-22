@@ -195,7 +195,9 @@ def exec_windows(expr, schema, used, cov_factory=None, swap_until=None):
 # seconds: cpu * CALIB_REF / calib. CALIB_REF is the workload's CPU on the machine the budget
 # constants were tuned on (laptop, idle); BR_SUBTEST_NOCALIB=1 stores raw seconds.
 
-CALIB_REF = 0.0  # set below from the reference measurement
+# rwx idle: cpu_exec(tpcds) / calib = 1004; rwx-big at load ~150: 966 (raw CPU 1.72x apart).
+# 11.6 ms maps that ratio onto the laptop-idle 11.4 s the budget constants were tuned with.
+CALIB_REF = 0.0116
 
 
 _CALIB_SQL = ("SELECT a.x, SUM(b.y) AS s FROM a JOIN b ON a.k = b.k AND b.z > 3 "
