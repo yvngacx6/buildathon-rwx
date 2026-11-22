@@ -7,9 +7,9 @@
 # out <sha>, and does everything from that clone.
 #
 #   usage:  bash eval/final_check.sh <sha> [--quick]
-#   remote: ssh rwx 'bash -s -- <sha>' < eval/final_check.sh          (from any machine)
-#      or:  ssh rwx 'cd /tmp && rm -rf fc && git clone -q https://github.com/yvngacx6/buildathon-rwx.git fc \
-#                    && nohup bash fc/eval/final_check.sh <sha> > ~/fc-<sha>.log 2>&1 &'
+#   remote: ssh rwx 'rm -rf ~/fc23 && git clone -q -b moon-23 https://github.com/yvngacx6/buildathon-rwx.git ~/fc23 \
+#                    && nohup bash ~/fc23/eval/final_check.sh <sha> > ~/fc-<sha>.log 2>&1 < /dev/null &'
+#           (drop "-b moon-23" once moon-23 is merged into main)
 #
 # Checks (FAIL → exit 1; WARN → look, but not blocking):
 #   C1 public clone has the commit; which remote branches contain it
@@ -107,7 +107,8 @@ for u in $URLS; do
   case "$u" in
     https://github.com/tobymao/sqlglot/archive/${PINNED_SQLGLOT}*|"https://github.com/tobymao/sqlglot/archive/{sha"*) ;;
     https://pypi.org/*|https://files.pythonhosted.org/*) ;;
-    https://github.com/tobymao/sqlglot*|https://docs.*|https://www.python.org/*|http://www.apache.org/*) ;;  # docs / comments
+    *github.com/tobymao/sqlglot/archive/*|*github.com/tobymao/sqlglot/tarball/*|*codeload*) C3=FAIL; MSG+="unpinned sqlglot download $u; " ;;
+    https://github.com/tobymao/sqlglot*|https://docs.*|https://www.python.org/*) ;;  # docs links in comments
     *) C3=FAIL; MSG+="URL $u; " ;;
   esac
 done

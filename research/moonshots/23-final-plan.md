@@ -30,13 +30,13 @@ Not covered:
 ## How to run (identical whether or not the laptop is alive)
 ```sh
 # from anywhere with ssh access (phone/EC2 console works too):
-ssh rwx 'rm -rf ~/fc23 && git clone -q https://github.com/yvngacx6/buildathon-rwx.git ~/fc23 &&
+ssh rwx 'rm -rf ~/fc23 && git clone -q -b moon-23 https://github.com/yvngacx6/buildathon-rwx.git ~/fc23 &&
   nohup bash ~/fc23/eval/final_check.sh <SHA> > ~/fc-<SHA>.log 2>&1 < /dev/null &'
 ssh rwx 'tail -30 ~/fc-<SHA>.log'          # done when "VERDICT:" appears (~6 min on idle rwx)
 # quicker (no labeled sets, P batch only):  ... final_check.sh <SHA> --quick
 # subset: SETS="private41 adversarial2" bash ~/fc23/eval/final_check.sh <SHA>
 ```
-The tool lives on branch `moon-23` until merged. After the merge, clone main. `-b moon-23` works in the meantime.
+The tool lives on branch `moon-23` until it is merged. After the merge, drop `-b moon-23` and clone main, which lacks the script until then.
 
 ## Freeze timeline (PST; cutoff Sun 22 Nov 08:00)
 | When | What |
