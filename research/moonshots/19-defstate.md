@@ -4,7 +4,7 @@ Branch `moon-19` (base a8fbd6b). All runs on rwx-big in the pinned image (`drun.
 without subtest/slowverify indexes (same for base and new, so deltas compare).
 
 ## Verdict (numbers first)
-Two sound narrowings, both ready to port (pending the determinism rebuild below) (selector/select.py, selector/maps.py, maps/attrs.json.gz,
+Two sound narrowings, both ready to port (selector/select.py, selector/maps.py, maps/attrs.json.gz,
 mapbuild/trace_attrs.py + attrs_map.py). **0 misses on all 6 labeled sets (566 commits) and on
 24 + 18 newly labeled probes** (full suite, br-label, SKIP_INTEGRATION=0).
 
@@ -87,6 +87,9 @@ reads are in the dialect metaclass / `__init_subclass__` (import time, covered b
 `Dialect.classes` loads every dialect first (no dependence on what a worker happened to load).
 Rule-A spans (25 distinct: labeled, P, Q, probes) are zero in `lines`, `lines_phase` and
 `lines_full` of all four coverage builds on rwx-big (mapsA, mapsC, agent-r3, main-r3).
+
+Determinism: a from-scratch rebuild (6 CPUs, 380 s) is identical to the committed map (15881 keys,
+same test lists, same tracked/untracked tables).
 
 ## Porting notes
 - `maps/attrs.json.gz` must be rebuilt whenever maps are (same image, SKIP_INTEGRATION=0); add
