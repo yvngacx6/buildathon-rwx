@@ -783,11 +783,16 @@ class Selector:
                          if not self._mixed_py and self.diffexec is not None else set())
                 # its own state entry (a def with a closure, e.g. `super()`'s `__class__`
                 # cell, is digested with its code): the edit itself, seen by its callers
-                # (a plain def only: a decorated one's entry is what the decorator returned)
+                # (a plain def only: a decorated one's entry is what the decorator returned).
+                # r34: also a literal-default edit (R-DEF: every change in the file is a
+                # literal default, nothing reads `__defaults__` & co.): the entry differs only
+                # in its defaults, which only a call leaving the parameter out observes, and
+                # such a call runs the body (lines map / default-observing calls above).
                 plain = bool(defs) and all(
                     isinstance(d, ast.Name) and d.id in ("staticmethod", "classmethod")
                     for f in defs for d in f.decorator_list)
-                own = (None if r.signature or r.is_lambda or not r.chain or not plain
+                own = (None if (r.signature and path not in self._defaults) or r.is_lambda
+                       or not r.chain or not plain
                        else f"M {module} {r.chain[0]}" if len(r.chain) == 1
                        else f"C {module}:{'.'.join(r.chain[:-1])} {r.chain[-1]}")
                 at_import, same_state = (
