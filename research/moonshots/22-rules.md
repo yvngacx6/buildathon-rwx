@@ -22,7 +22,13 @@
     rule-checkpoint path on drops shared with moon-05.
   - Usage logging (moon-05 base): 42 of R's 55 drops and 6 of practice_like's 9 verified at least
     one query from a rule checkpoint (2,148 query runs on R).
-- **r29 base, rules off → on** (EC2, 6-CPU container, the r29 in-build calibration):
+- **r29 base, rules off → on** (EC2, 6-CPU container, the r29 in-build calibration).
+  - The table below was measured at 9092ceb, which calibrates per boundary.
+  - The head code (b540ada, one calibration per query) was re-checked with its own store on R and
+    on all labeled sets. Results are identical:
+    - drops: R 47 → 57, the same 10; op05; 0 misses;
+    - child CPU: R 165.4 → 135.4 s, practice_like 15.4 → 10.9 s, private 15.8 → 11.1 s.
+  - P/Q were not re-run at b540ada. Their 10 new drops are R's 10.
 
   | set | child CPU | drops | sim |
   |---|---|---|---|
