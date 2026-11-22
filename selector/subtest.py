@@ -1199,6 +1199,7 @@ def _defs(tree):
                 visit(child, prefix, outer)
 
     visit(tree, "", None)
+    visit = None  # noqa: F841  r41c: break visit's self-reference (gc is off: it held `out`)
     return out
 
 
@@ -1297,29 +1298,66 @@ def _writes_shared(fn, self_shared: bool) -> str | None:
             return f"writes {r.id}" if is_shared(r.id) else None
         return "writes through an expression" if not isinstance(r, ast.Call) else None
 
-    for n in nodes:
-        targets = []
-        if isinstance(n, ast.Assign):
-            targets = n.targets
-        elif isinstance(n, (ast.AugAssign, ast.AnnAssign)) and (n.value is not None or isinstance(n, ast.AugAssign)):
-            targets = [n.target]
-        elif isinstance(n, ast.Delete):
-            targets = n.targets
-        elif isinstance(n, (ast.For, ast.AsyncFor)):
-            targets = [n.target]
-        elif isinstance(n, ast.Call):
-            f = n.func
-            if isinstance(f, ast.Name) and f.id in _BAD_CALLS:
-                return f"calls {f.id}"
-            if isinstance(f, ast.Attribute) and f.attr in _MUTATORS:
-                r = _root(f.value)
-                if isinstance(r, ast.Name) and is_shared(r.id):
-                    return f"{f.attr}() on {r.id}"
-        for t in targets:
-            why = target_shared(t)
-            if why:
-                return why
-    return None
+    # r41c: is_shared / target_shared call themselves (closure cells): with the cycle
+    # collector off (__main__) that cycle would keep `binds` (nodes of `fn`) alive for the
+    # run; cleared on the way out.
+    try:
+        for n in nodes:
+            targets = []
+            if isinstance(n, ast.Assign):
+                targets = n.targets
+            elif isinstance(n, (ast.AugAssign, ast.AnnAssign)) and (n.value is not None or isinstance(n, ast.AugAssign)):
+                targets = [n.target]
+            elif isinstance(n, ast.Delete):
+                targets = n.targets
+            elif isinstance(n, (ast.For, ast.AsyncFor)):
+                targets = [n.target]
+            elif isinstance(n, ast.Call):
+                f = n.func
+                if isinstance(f, ast.Name) and f.id in _BAD_CALLS:
+                    return f"calls {f.id}"
+                if isinstance(f, ast.Attribute) and f.attr in _MUTATORS:
+                    r = _root(f.value)
+                    if isinstance(r, ast.Name) and is_shared(r.id):
+                        return f"{f.attr}() on {r.id}"
+            for t in targets:
+                why = target_shared(t)
+                if why:
+                    return why
+        return None
+    finally:
+        is_shared = target_shared = None  # noqa: F841
+
+
+_OLD_DEFS: dict[tuple[str, str], tuple[dict, list[bytes]]] = {}
+
+
+def _pinned_defs(root: str, path: str) -> tuple[dict, list[bytes]]:
+    """r41: `_defs` of the pinned (old) file and its lines as bytes, once per file and run
+    (the source does not change; read-only use: no caller mutates the trees)."""
+    key = (root, path)
+    hit = _OLD_DEFS.get(key)
+    if hit is None:
+        with open(os.path.join(root, path), encoding="utf-8") as fh:
+            old_text = fh.read()
+        hit = _OLD_DEFS[key] = (_defs(ast.parse(old_text)), old_text.encode("utf-8").splitlines(True))
+    return hit
+
+
+def _def_source(lines: list[bytes], node) -> bytes | None:
+    """The exact source of a def / lambda node (first decorator to its end; col offsets
+    are UTF-8 byte offsets), or None. Equal sources ⇒ equal `ast.dump`."""
+    try:
+        first = node
+        for d in getattr(node, "decorator_list", ()):
+            if (d.lineno, d.col_offset) < (first.lineno, first.col_offset):
+                first = d
+        a, ca, b, cb = first.lineno, first.col_offset, node.end_lineno, node.end_col_offset
+        if a == b:
+            return lines[a - 1][ca:cb]
+        return lines[a - 1][ca:] + b"".join(lines[a:b - 1]) + lines[b - 1][:cb]
+    except (AttributeError, IndexError, TypeError):
+        return None
 
 
 def stage_guard(root: str, jobs, defaults: dict | None = None,
@@ -1333,9 +1371,9 @@ def stage_guard(root: str, jobs, defaults: dict | None = None,
     __init_subclass__) the caller showed no TPC test runs: they run at class creation, whose
     products the import-state diff holds."""
     for path, new_text, _ in jobs:
-        with open(os.path.join(root, path), encoding="utf-8") as fh:
-            old_text = fh.read()
-        old_defs, new_defs = _defs(ast.parse(old_text)), _defs(ast.parse(new_text))
+        old_defs, old_lines = _pinned_defs(root, path)
+        new_defs = _defs(ast.parse(new_text))
+        new_lines = new_text.encode("utf-8").splitlines(True)
         for name, line, _params in (defaults or {}).get(path, ()):
             hits = [d for k, d in old_defs.items() if k[0].split(".")[-1] == name
                     and min([d[0].lineno] + [x.lineno for x in d[0].decorator_list]) == line]
@@ -1346,8 +1384,10 @@ def stage_guard(root: str, jobs, defaults: dict | None = None,
                 return f"{name}: {why}"
         for k in set(old_defs) | set(new_defs):
             o, n = old_defs.get(k), new_defs.get(k)
-            if o is not None and n is not None and ast.dump(o[0]) == ast.dump(n[0]):
-                continue
+            if o is not None and n is not None:
+                so = _def_source(old_lines, o[0])
+                if (so is not None and so == _def_source(new_lines, n[0])) or ast.dump(o[0]) == ast.dump(n[0]):
+                    continue
             if skip and any((path, q) in skip for q in _outer_names(k[0])):
                 continue
             for d in (o, n):

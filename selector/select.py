@@ -316,7 +316,7 @@ class Selector:
         cands &= set().union(*(got for _, got in per_file))
         if not cands:
             return per_file
-        ms_of = {n: pack.duration_ms(s) for n, s in self._secs.items()}
+        ms_of = self._ms_of()
         everything = set().union(*(got for _, got in per_file))
         base = pack.cost_ms(pack.pack(everything, ms_of), ms_of)
 
@@ -333,6 +333,14 @@ class Selector:
             reasons.append(note)
         return [(p, got - dropped) for p, got in per_file]
 
+    def _ms_of(self) -> dict[int, int]:
+        """r41: {number: duration ms} of tests.json, built once (read-only for every user)."""
+        got = self.__dict__.get("_ms_of_memo")
+        if got is None:
+            from . import pack
+            got = self._ms_of_memo = {n: pack.duration_ms(s) for n, s in self._secs.items()}
+        return got
+
     def _ends_all_every(self, everything: set[int], cands: set[int], base: int) -> bool:
         """r40: `_ends_all` for every non-empty subset of `cands` (≤ 3 TPC tests): no drop
         the verifier could choose changes the output (checked before its parent-side work)."""
@@ -347,7 +355,7 @@ class Selector:
         from . import pack
         if base is not None:
             if "_all_cost" not in self.__dict__:
-                ms_of = {n: pack.duration_ms(s) for n, s in self._secs.items()}
+                ms_of = self._ms_of()
                 self._all_cost = pack.cost_ms(pack.pack(set(self._all), ms_of), ms_of)
             if base < 0.9 * ALL_FRACTION * self._all_cost:
                 return False  # far from ALL (cheap pre-filter; False = verify as before)
@@ -365,7 +373,7 @@ class Selector:
             return float("inf")
         from . import pack
         try:
-            ms_of = {n: pack.duration_ms(s) for n, s in self._secs.items()}
+            ms_of = self._ms_of()
             if "_all_cost" not in self.__dict__:
                 self._all_cost = pack.cost_ms(pack.pack(set(self._all), ms_of), ms_of)
             all_cost = self._all_cost
@@ -419,7 +427,7 @@ class Selector:
         cands = set(st.numbers) & everything
         if not cands:
             return per_file
-        ms_of = {n: pack.duration_ms(s) for n, s in self._secs.items()}
+        ms_of = self._ms_of()
         base = pack.cost_ms(pack.pack(everything, ms_of), ms_of)
 
         def benefit(only):
@@ -609,7 +617,7 @@ class Selector:
         everything = set().union(*(got for _, got in per_file))
         if n not in everything:
             return per_file
-        ms_of = {k: pack.duration_ms(s) for k, s in self._secs.items()}
+        ms_of = self._ms_of()
         base = pack.cost_ms(pack.pack(everything, ms_of), ms_of)
 
         def benefit(only):
@@ -2655,8 +2663,21 @@ def _same_code_shape(old_tree: ast.Module, new_tree: ast.Module,
     what its touched statements do."""
     if not chain:
         return False
-    old = _code_shape(old_tree, chain)
+    old = _old_memo(("shape", chain), old_tree, lambda: _code_shape(old_tree, chain))
     return old is not None and old == _code_shape(new_tree, chain)
+
+
+_OLD_MEMO: dict[tuple, tuple] = {}
+
+
+def _old_memo(key: tuple, old_tree: ast.Module, make):
+    """r41: a value computed from a pinned tree (`Selector._old_tree`: parsed once per run,
+    never changed after), once per tree and key. Holds the tree, so its id stays its own."""
+    k = (id(old_tree),) + key
+    hit = _OLD_MEMO.get(k)
+    if hit is None or hit[0] is not old_tree:
+        hit = _OLD_MEMO[k] = (old_tree, make())
+    return hit[1]
 
 
 def _same_lead(old_tree: ast.Module, new_tree: ast.Module, lead: int,
@@ -2828,7 +2849,7 @@ def _default_changes(old_tree: ast.Module, new_tree: ast.Module) -> list | None:
                 node.args.defaults, node.args.kw_defaults = od, okw
         return dump, [(node, list(od), list(okw)) for node, od, okw in found]
 
-    old_dump, old_defs = blank(old_tree)
+    old_dump, old_defs = _old_memo(("blank",), old_tree, lambda: blank(old_tree))
     new_dump, new_defs = blank(new_tree)
     if old_dump != new_dump or len(old_defs) != len(new_defs):
         return None
