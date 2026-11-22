@@ -4,7 +4,7 @@ Branch `moon-19` (base a8fbd6b). All runs on rwx-big in the pinned image (`drun.
 without subtest/slowverify indexes (same for base and new, so deltas compare).
 
 ## Verdict (numbers first)
-Two sound narrowings, both ready to port (selector/select.py, selector/maps.py, maps/attrs.json.gz,
+Two sound narrowings, both ready to port (pending the determinism rebuild below) (selector/select.py, selector/maps.py, maps/attrs.json.gz,
 mapbuild/trace_attrs.py + attrs_map.py). **0 misses on all 6 labeled sets (566 commits) and on
 24 + 18 newly labeled probes** (full suite, br-label, SKIP_INTEGRATION=0).
 
@@ -16,6 +16,10 @@ mapbuild/trace_attrs.py + attrs_map.py). **0 misses on all 6 labeled sets (566 c
 | P (600, unlabeled) | 5096.3 | 5042.1 | 4931.2 | −4.0 / −4.7 |
 | Q (1000, unlabeled) | 8367.2 | 8285.3 | 8051.3 | −3.6 / −7.0 |
 
+Production config (compiled index/maps + subtest.zip + slowverify.pkl, as job1.sh; both trees):
+practice_like 989.6 → 937.8 (−51.8; −56.3 excl. 00i9 diffexec noise), private 2417.2 → 2400.0,
+private41 388.9 → 383.3, adversarial 1063.2 → 1046.9, adversarial2 937.4 → 907.9, sample 115.0 → 114.4;
+0 misses everywhere; `selector.maps build` ignores attrs.json.gz (loaded directly, lazily).
 (P/Q per-rule numbers count only commits whose reason shows the rule and no diffexec drop;
 diffexec run-to-run noise was ±20 s on single commits, see moon-17.)
 **Expected: −9 … −19 s per 40 practice commits (best guess −12 s), 0 misses.** CPU: rule A none;
