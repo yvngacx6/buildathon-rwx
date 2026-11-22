@@ -62,7 +62,7 @@
   - Each narrowed site removes a 0.7–1.3 s floor from every name / state-diff commit whose
     attribute name it used to match.
   - Tokenizer-specific wins: 48vt −2.1, w7sj −1.8, p3ow −0.7, probe t04 −2.1.
-  - 4d63 stays at 6.1 s. Before and after, its 11 selected tests all come from `:1240`: they ran `numeric_escapes.get(peek)` under Snowflake (next section).
+  - 4d63 stays at 6.1 s. R20a cut its selection from 15 to 11 tests at no cost change. All 11 come from `:1240`: they ran `numeric_escapes.get(peek)` under Snowflake (next section).
 
 
 ## Probes (full suite, SKIP_INTEGRATION=0, --continue-on-collection-errors)
