@@ -51,6 +51,9 @@ TESTS = {
 SUITES = {"tpch": "optimizer/tpc-h/", "tpcds": "optimizer/tpc-ds/"}
 SCORER_SLOWDOWN = 2.0
 BUDGET_S = float(os.environ.get("BR_SUBTEST_S", "12"))
+STAGE = os.environ.get("BR_SUBTEST_STAGE", "1") != "0"  # moon-05 checkpoint verification
+FALLBACK = os.environ.get("BR_SUBTEST_FALLBACK", "0") != "0"  # checkpoint differs → whole query
+FALLBACK_CAP = float(os.environ.get("BR_SUBTEST_FALLBACK_CAP", "1.5"))  # laptop s
 SHARE = 0.6  # spend at most this share of what dropping saves
 
 
@@ -86,6 +89,141 @@ def run_query(q: dict, schema: dict, tables: dict, opt: bool):
         out_duck = transpile(q["sql"], write="duckdb")[0]
         out_opt = transpile(q["optimized"], write="duckdb")[0]
     return out_exec, out_duck, out_opt
+
+
+# ── moon-05: stage split of one executed query (checkpoints) ──────────────────
+#
+# The pool worker of test_execute_tpcds receives pickle(parse_one(sql)) and runs
+# sqlglot.executor.execute on it. execute's body is mirrored here window by window, calling the
+# very objects execute() calls (looked up in sqlglot.executor's namespace):
+#   prep:  ensure_tables, ensure_schema, the supported_table_args check
+#   optb:  optimize(...) and the eager logger.debug argument expression.sql(pretty=True)
+#   plan:  Plan(expression)
+#   post:  PythonExecutor(tables).execute(plan) + the result's pickle round trip
+# Checkpoints: the post-parse pickle (what the worker receives) and a type-strict digest of the
+# optimized expression after the debug .sql() (what Plan receives). A change whose touched
+# statements run only in parse / optb can be verified by re-running those windows and comparing
+# the checkpoint digests; plan / post are then identical (same code, same input).
+
+def strict_digest(root) -> str:
+    """Digest of an expression tree: classes, every arg key (None-valued too) in order, value
+    types, DType values, .type, comments, _meta, parent / arg_key / index links and sharing."""
+    from sqlglot.expressions import Expr
+    h = hashlib.blake2b(digest_size=16)
+    seen: dict[int, int] = {}
+    stack = [(root, None, None, None)]
+    while stack:
+        node, parent, key, index = stack.pop()
+        if not isinstance(node, Expr):
+            h.update(b"V")
+            h.update(repr((type(node).__name__, node)).encode())
+            continue
+        nid = id(node)
+        if nid in seen:
+            h.update(b"R%d" % seen[nid])
+            continue
+        seen[nid] = len(seen)
+        cls = type(node)
+        h.update(f"N{cls.__module__}.{cls.__qualname__}".encode())
+        if parent is not None:
+            h.update(repr((node.parent is parent, node.arg_key == key, node.index == index)).encode())
+        t = getattr(node, "_type", None)
+        if t is not None and t is not node:
+            h.update(b"T" + strict_digest(t).encode())
+        if getattr(node, "comments", None):
+            h.update(repr(("C", node.comments)).encode())
+        m = getattr(node, "_meta", None)
+        if m is not None:
+            h.update(repr(("M", sorted((k, type(v).__name__, repr(v)) for k, v in m.items()))).encode())
+        args = node.args
+        h.update(repr(("K", tuple(args))).encode())
+        items = list(args.items())
+        for k, v in reversed(items):
+            if type(v) is list:
+                stack.append(("]", None, None, None))
+                for i in range(len(v) - 1, -1, -1):
+                    stack.append((v[i], node, k, i))
+                stack.append(("[", None, None, None))
+            else:
+                stack.append((v, node, k, None))
+    return h.hexdigest()
+
+
+def exec_windows(expr, schema, used, cov_factory=None, swap_until=None):
+    """execute(expr, schema=schema, tables=used) window by window.
+    → ({window: coverage}, result digest)."""
+    import sqlglot.executor as E
+    covs = {}
+
+    def window(name, fn):
+        cov = cov_factory() if cov_factory else None
+        if cov:
+            cov.start()
+        try:
+            return fn()
+        finally:
+            if cov:
+                covs[name] = cov.stop()
+
+    def prep():
+        tables_ = E.ensure_tables(used, dialect=None)
+        schema_ = E.ensure_schema(schema, dialect=None)
+        if tables_.supported_table_args and tables_.supported_table_args != schema_.supported_table_args:
+            raise E.ExecuteError("Tables must support the same table args as schema")
+        return tables_, schema_
+
+    tables_, schema_ = window("prep", prep)
+
+    def optb():
+        e = E.optimize(expr, schema_, leave_tables_isolated=True, dialect=None)
+        e.sql(pretty=True)
+        return e
+
+    oe = window("optb", optb)
+    d_opt = strict_digest(oe)
+    plan = window("plan", lambda: E.Plan(oe))
+    res = window("post", lambda: pickle.loads(pickle.dumps(E.PythonExecutor(tables=tables_).execute(plan))))
+    return covs, d_opt, digest_table(res)
+
+
+# ── build-machine calibration ────────────────────────────────────────────────────
+#
+# The image build may run on a busy box: CPU seconds measured there are inflated (shared cores,
+# hyper-threads, caches), which made the budget refuse verifications it can afford (a store
+# built at load ~20 had every query 2.4x too expensive). Each timed run is bracketed by a fixed
+# pure-Python workload measured the same way, and the stored CPU is expressed in reference
+# seconds: cpu * CALIB_REF / calib. CALIB_REF is the workload's CPU on the machine the budget
+# constants were tuned on (laptop, idle); BR_SUBTEST_NOCALIB=1 stores raw seconds.
+
+CALIB_REF = 0.0  # set below from the reference measurement
+
+
+def _calib_work() -> int:
+    acc = 0
+    d: dict = {}
+    for i in range(20000):
+        k = ("k", i % 97)
+        d[k] = d.get(k, 0) + i
+        s = f"col{i % 31}".upper()
+        acc += len(s) + (i & 7)
+        lst = [i, s, k]
+        acc += len(lst[1:])
+    return acc + len(d)
+
+
+def _calib() -> float:
+    best = float("inf")
+    for _ in range(5):
+        t = time.process_time()
+        _calib_work()
+        best = min(best, time.process_time() - t)
+    return best
+
+
+def _norm(cpu: float, c0: float, c1: float) -> float:
+    if os.environ.get("BR_SUBTEST_NOCALIB") == "1" or not CALIB_REF:
+        return cpu
+    return cpu * CALIB_REF / max(1e-6, (c0 + c1) / 2)
 
 
 # ── build ─────────────────────────────────────────────────────────────────────
@@ -221,6 +359,9 @@ def build(root: Path, out: Path) -> None:
                 phases["parse"] = cov.stop()
                 outs = {}
                 if q["execute"]:
+                    pexpr = pickle.dumps(expr)
+                    outs["pexpr"] = pexpr
+                    outs["d_parse"] = strict_digest(pickle.loads(pexpr))
                     cov = _Cov(prefix)
                     cov.start()
                     used = {t.name: tables[suite][t.name] for t in find_tables(e2)}
@@ -228,6 +369,34 @@ def build(root: Path, out: Path) -> None:
                     res = pickle.loads(pickle.dumps(res))
                     phases["exec"] = cov.stop()
                     outs["exec"] = digest_table(res)
+                    # moon-05: the same execute, window by window, in a fresh fork
+                    def windows():
+                        e3 = pickle.loads(pexpr)
+                        cov = _Cov(prefix)
+                        cov.start()
+                        u = {t.name: tables[suite][t.name] for t in find_tables(e3)}
+                        ft = cov.stop()
+                        covs, d_opt, dres = exec_windows(e3, schemas[suite], u, lambda: _Cov(prefix))
+                        covs["prep"] = {k: sorted(set(v) | set(ft.get(k, ()))) for k, v in
+                                        list(covs["prep"].items()) + list(ft.items())}
+                        return covs, d_opt, dres
+
+                    def stage_timed():
+                        c0 = _calib()
+                        t0 = time.process_time()
+                        e4 = pickle.loads(pexpr)
+                        import sqlglot.executor as E
+                        sch = E.ensure_schema(schemas[suite], dialect=None)
+                        oe = E.optimize(e4, sch, leave_tables_isolated=True, dialect=None)
+                        oe.sql(pretty=True)
+                        d2 = strict_digest(oe)
+                        cpu_stage = time.process_time() - t0
+                        return d2, _norm(cpu_stage, c0, _calib())
+                    covs, d_opt, dres = _in_fork(windows)
+                    d2, cpu_stage = _in_fork(stage_timed)
+                    phases["win"] = covs
+                    outs["d_opt"] = d_opt if (dres == outs["exec"] and d2 == d_opt) else None
+                    outs["cpu_stage"] = cpu_stage
                 cov = _Cov(prefix)
                 cov.start()
                 outs["duck"] = transpile(q["sql"], write="duckdb")[0]
@@ -244,12 +413,14 @@ def build(root: Path, out: Path) -> None:
                 return cov.stop(), duck, opt
 
             def timed(q=q):
+                c0 = _calib()
                 t0 = time.process_time()
                 a = run_query(q, schemas[suite], tables[suite], False)
                 t1 = time.process_time()
                 b = run_query(q, schemas[suite], tables[suite], True) if suite == "tpch" else None
                 t2 = time.process_time()
-                return a, b, t1 - t0, t2 - t1
+                c1 = _calib()
+                return a, b, _norm(t1 - t0, c0, c1), _norm(t2 - t1, c0, c1), (c0 + c1) / 2
 
             try:
                 phases, outs = _in_fork(traced)
@@ -257,18 +428,19 @@ def build(root: Path, out: Path) -> None:
                     phases["opt"], duck, outs["opt"] = _in_fork(traced_opt)
                     if duck != outs["duck"]:
                         raise RuntimeError("duckdb sql differs between runs")
-                a, b, cpu_exec, cpu_opt = _in_fork(timed)
+                a, b, cpu_exec, cpu_opt, calib = _in_fork(timed)
                 # the untraced run must give the same outputs (else: not deterministic → never used)
                 stable = (a[0] == outs.get("exec")) and (
                     a[1] == (outs["duck"] if q["execute"] else None))
                 if b is not None:
                     stable = stable and b[1] == outs["duck"] and b[2] == outs["opt"]
             except RuntimeError:  # e.g. RecursionError at the worker's limit: never used
-                phases, outs, cpu_exec, cpu_opt, stable = {}, {}, 0.0, 0.0, False
-            q.update(phases=phases, outs=outs, cpu_exec=cpu_exec, cpu_opt=cpu_opt, stable=stable)
+                phases, outs, cpu_exec, cpu_opt, stable, calib = {}, {}, 0.0, 0.0, False, 0.0
+            q.update(phases=phases, outs=outs, cpu_exec=cpu_exec, cpu_opt=cpu_opt, stable=stable,
+                     calib=calib)
             queries.append(q)
             print(f"{suite} {len(queries)} exec={q['execute']} cpu={cpu_exec:.2f}/{cpu_opt:.2f}"
-                  f" stable={stable}", file=sys.stderr)
+                  f" stable={stable} calib={calib * 1000:.1f}ms", file=sys.stderr)
         meta["suites"][suite] = queries
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".tmp")
@@ -308,6 +480,195 @@ def _hit(lines_by_file: dict, spans: dict) -> bool:
                 if ln >= first:
                     return True
     return False
+
+
+# ── stage guard: no checkpoint shortcut for code that may write shared state ─────────────
+#
+# The checkpoint compares the optimized tree, not global state. If a changed function (old or
+# new version; for a nested def, its outermost enclosing def, so closures resolve) can write
+# state that outlives its call, the query goes the whole way (full re-run, as r17):
+#   * `global` / `nonlocal`, setattr / delattr / exec / eval / globals() / vars() / __import__
+#   * a store, del, augmented assignment or mutating method call (append, update, set, ...)
+#     whose base is a non-local object: a module-level name, builtin or import, `cls`, `self`
+#     of a Dialect (instances are cached and shared; parser / generator / tokenizer / scope /
+#     schema objects are made per call), or a local name bound to one of those by alias
+#     (x = MOD.TABLE, from m import X, for x in GLOBAL..., with GLOBAL as x, x = M.get(...));
+#     exp.* builders and .copy() make new objects
+# Parameters and names bound from them / from calls of plain functions count as query-local:
+# the objects the optimizer works on are the query's tree and scopes, compared by the digest.
+# Not covered (documented gap, as r17's cross-query reuse): an unchanged callee that writes
+# global state on the changed function's behalf.
+
+_MUTATORS = {"append", "extend", "insert", "pop", "popitem", "remove", "clear", "update",
+             "setdefault", "add", "discard", "sort", "reverse", "__setitem__", "__delitem__",
+             "__setattr__", "__delattr__", "difference_update", "intersection_update",
+             "symmetric_difference_update", "appendleft", "extendleft", "popleft", "rotate",
+             "move_to_end", "cache_clear", "set", "replace", "append_comments", "add_comments",
+             "pop_comments", "set_meta"}
+_BAD_CALLS = {"setattr", "delattr", "exec", "eval", "globals", "vars", "__import__", "locals"}
+
+
+def _defs(tree):
+    """{(qualname, occurrence): (def node, outermost enclosing def node)}."""
+    out, seen = {}, {}
+
+    def visit(node, prefix, outer):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                name = prefix + (child.name if not isinstance(child, ast.Lambda) else "<lambda>")
+                k = seen.get(name, 0)
+                seen[name] = k + 1
+                out[(name, k)] = (child, outer or child)
+                visit(child, name + ".<locals>.", outer or child)
+            elif isinstance(child, ast.ClassDef):
+                visit(child, prefix + child.name + ".", outer)
+            else:
+                visit(child, prefix, outer)
+
+    visit(tree, "", None)
+    return out
+
+
+def _root(node):
+    """Base name of a.b[c].d(...).e chains (through method calls, not plain-function calls)."""
+    while True:
+        if isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
+            node = node.value
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            f = node.func
+            # sqlglot.expressions builders (exp.column(...), exp.Alias(...)) and .copy() make
+            # new objects
+            if f.attr in ("copy", "deepcopy") or (isinstance(f.value, ast.Name) and f.value.id == "exp"):
+                return node
+            node = f.value
+        else:
+            return node
+
+
+def _writes_shared(fn, self_shared: bool) -> str | None:
+    """Why `fn` (whole subtree) may write state that outlives its call, or None."""
+    nodes = list(ast.walk(fn))
+    params: set[str] = set()
+    for n in nodes:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            a = n.args
+            params.update(p.arg for p in a.posonlyargs + a.args + a.kwonlyargs)
+            params.update(p.arg for p in (a.vararg, a.kwarg) if p is not None)
+    shared_self = "self" if self_shared else None
+
+    # local bindings: name → [value expressions] (None: an import, i.e. a shared module object)
+    binds: dict[str, list] = {}
+
+    def bind(target, value):
+        for x in ast.walk(target):
+            if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
+                binds.setdefault(x.id, []).append(value if isinstance(target, ast.Name) else value)
+
+    for n in nodes:
+        if isinstance(n, (ast.Global, ast.Nonlocal)):
+            return "global / nonlocal"
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            for a in n.names:
+                binds.setdefault((a.asname or a.name).split(".")[0], []).append(None)
+        elif isinstance(n, ast.Assign):
+            for t in n.targets:
+                bind(t, n.value)
+        elif isinstance(n, (ast.AnnAssign, ast.NamedExpr)) and n.value is not None:
+            bind(n.target, n.value)
+        elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+            bind(n.target, n.iter)
+        elif isinstance(n, (ast.With, ast.AsyncWith)):
+            for it in n.items:
+                if it.optional_vars is not None:
+                    bind(it.optional_vars, it.context_expr)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            binds.setdefault(n.name, []).append(ast.Constant(None))
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n is not fn:
+            binds.setdefault(n.name, []).append(ast.Constant(None))
+
+    shared: dict[str, bool] = {}
+
+    def is_shared(name: str, depth: int = 0) -> bool:
+        if name in ("cls",) or name == shared_self:
+            return True
+        if name in params and name not in binds:
+            return False
+        if name not in binds:
+            return True  # module-level name, builtin or closure of the module
+        if name in shared:
+            return shared[name]
+        shared[name] = False  # cycles: assume local until shown otherwise
+        res = False
+        for v in binds[name]:
+            if v is None:
+                res = True  # import
+                break
+            r = _root(v)
+            if isinstance(r, ast.Name) and depth < 20 and r.id != name and is_shared(r.id, depth + 1):
+                res = True
+                break
+        shared[name] = res
+        return res
+
+    def target_shared(t) -> str | None:
+        if isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                why = target_shared(e)
+                if why:
+                    return why
+            return None
+        if isinstance(t, ast.Name):
+            return None
+        r = _root(t)
+        if isinstance(r, ast.Name):
+            return f"writes {r.id}" if is_shared(r.id) else None
+        return "writes through an expression" if not isinstance(r, ast.Call) else None
+
+    for n in nodes:
+        targets = []
+        if isinstance(n, ast.Assign):
+            targets = n.targets
+        elif isinstance(n, (ast.AugAssign, ast.AnnAssign)) and (n.value is not None or isinstance(n, ast.AugAssign)):
+            targets = [n.target]
+        elif isinstance(n, ast.Delete):
+            targets = n.targets
+        elif isinstance(n, (ast.For, ast.AsyncFor)):
+            targets = [n.target]
+        elif isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Name) and f.id in _BAD_CALLS:
+                return f"calls {f.id}"
+            if isinstance(f, ast.Attribute) and f.attr in _MUTATORS:
+                r = _root(f.value)
+                if isinstance(r, ast.Name) and is_shared(r.id):
+                    return f"{f.attr}() on {r.id}"
+        for t in targets:
+            why = target_shared(t)
+            if why:
+                return why
+    return None
+
+
+def stage_guard(root: str, jobs) -> str | None:
+    """None when every changed function (old and new version) of the jobs passes
+    _writes_shared, else the reason (→ no checkpoint shortcut for this commit)."""
+    for path, new_text, _ in jobs:
+        with open(os.path.join(root, path), encoding="utf-8") as fh:
+            old_text = fh.read()
+        old_defs, new_defs = _defs(ast.parse(old_text)), _defs(ast.parse(new_text))
+        for k in set(old_defs) | set(new_defs):
+            o, n = old_defs.get(k), new_defs.get(k)
+            if o is not None and n is not None and ast.dump(o[0]) == ast.dump(n[0]):
+                continue
+            for d in (o, n):
+                if d is None:
+                    continue
+                # Dialect instances are cached and shared; parser / generator / tokenizer /
+                # scope / schema objects are made per call
+                why = _writes_shared(d[1], path.startswith("sqlglot/dialects/") or "Dialect" in k[0])
+                if why:
+                    return f"{k[0]}: {why}"
+    return None
 
 
 class SubTest:
@@ -359,8 +720,21 @@ class SubTest:
                 if hit:
                     if not q["stable"]:
                         return None
-                    todo.append((suite, i, kind == "optimized"))
-                    cpu += q["cpu_opt"] if kind == "optimized" else q["cpu_exec"]
+                    x = (suite, i, kind == "optimized", "full", False, False, False)
+                    win = ph.get("win")
+                    if (STAGE and getattr(self, "stage_ok", False) and kind == "execute"
+                            and q["execute"] and win and q["outs"].get("d_opt")):
+                        wl = {}
+                        for w in win.values():
+                            for f, ls in w.items():
+                                wl.setdefault(f, set()).update(ls)
+                        glue = {f: sorted(set(ls) - wl.get(f, set())) for f, ls in ph["exec"].items()}
+                        later = any(_hit(win[w], spans) for w in ("prep", "plan", "post"))
+                        if not later and not _hit(glue, spans):
+                            x = (suite, i, False, "stage", _hit(ph["parse"], spans),
+                                 _hit(win["optb"], spans), _hit(ph["duck"], spans))
+                    todo.append(x)
+                    cpu += self._cpu(x)
             out[n] = todo
         return out, cpu
 
@@ -389,7 +763,9 @@ class SubTest:
                 os._exit(code)
         os.close(wfd)
         import select as _select
-        deadline = time.monotonic() + budget * 2 + 2
+        # the CPU itimers bound the child; the wall deadline only guards a stuck child. r26:
+        # budget * 2 + 2 cut verifications short on a loaded machine (wall >> CPU) → keep
+        deadline = time.monotonic() + budget * 6 + 10
         chunks = []
         with os.fdopen(rfd, "rb") as fh:
             while True:
@@ -419,6 +795,14 @@ class SubTest:
         cands = candidates & set(self.numbers)
         if not cands or not spans:
             return set(), ""
+        self.stage_ok, self.stage_why = False, "off"
+        if STAGE:
+            try:
+                why = stage_guard(str(self.sel.sqlglot), jobs)
+            except Exception as e:  # noqa: BLE001
+                why = type(e).__name__
+            self.stage_ok = why is None
+            self.stage_why = why
         try:
             got = self.plan(spans, cands)
         except Exception as e:  # noqa: BLE001
@@ -426,23 +810,32 @@ class SubTest:
         if got is None:
             return set(), "subtest: keep (set-up touched / unknown / unstable)"
         per, cpu = got
-        # cheapest first: drop the tests whose verification pays off
-        chosen, todo, est = set(), [], 0.0
-        for n in sorted(per, key=lambda n: sum(self._cpu(x) for x in per[n])):
-            qs = [x for x in per[n] if x not in todo]
-            c = sum(self._cpu(x) for x in qs) + (0.3 if qs and not todo else 0.0)  # fork, swap, tables
-            trial = chosen | {n}
-            spend = SCORER_SLOWDOWN * (est + c)
-            gain = benefit_of(trial)
-            if gain > 0 and spend <= min(BUDGET_S, SHARE * gain / 1000):
-                chosen, est = trial, est + c
-                todo.extend(qs)
+        # r26: every subset of the (at most 3) candidates, best net saving. Greedy cheapest-
+        # first never dropped test_execute_tpch / test_optimized_tpch next to tpcds: alone
+        # they save nothing (tpcds is the long pole), and they were not reconsidered once
+        # tpcds was chosen.
+        import itertools
+        best = (0.0, set(), [], 0.0)
+        nums = sorted(per)
+        for r in range(1, len(nums) + 1):
+            for subset in itertools.combinations(nums, r):
+                todo = []
+                for n in subset:
+                    todo.extend(x for x in per[n] if x not in todo)
+                est = sum(self._cpu(x) for x in todo) + (0.3 if todo else 0.0)  # fork, swap, tables
+                spend = SCORER_SLOWDOWN * est
+                gain = benefit_of(set(subset))
+                if gain > 0 and spend <= min(BUDGET_S, SHARE * gain / 1000):
+                    net = gain / 1000 - spend
+                    if net > best[0]:
+                        best = (net, set(subset), todo, est)
+        _, chosen, todo, est = best
         if not chosen:
-            return set(), f"subtest: keep (est {cpu:.1f}s CPU for {sum(map(len, per.values()))} queries)"
+            return set(), f"subtest: keep (est {cpu:.1f}s CPU for {sum(map(len, per.values()))} queries{"" if getattr(self, "stage_ok", True) else "; no stage: " + str(self.stage_why)})"
         if not todo:
             return chosen, f"subtest: {sorted(chosen)} dropped (no query runs a touched statement)"
         try:
-            ok = self.verify(jobs, todo, min(BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0))
+            ok = self.verify(jobs, todo, min(BUDGET_S / SCORER_SLOWDOWN, 2.5 * est + 1.0 + FALLBACK_CAP))
         except Exception as e:  # noqa: BLE001
             return set(), f"subtest: keep ({type(e).__name__})"
         if not ok:
@@ -451,8 +844,11 @@ class SubTest:
                         f" {self.last_child:.2f}s)")
 
     def _cpu(self, x):
-        suite, i, opt = x
+        suite, i, opt, mode, parse_hit, optb_hit, duck_hit = x
         q = self.meta()["suites"][suite][i]
+        if mode == "stage":
+            # parse / duck transpile: a few ms; optb from the checkpoint: its pinned CPU
+            return 0.02 + (q["outs"]["cpu_stage"] if optb_hit else 0.0)
         return q["cpu_opt"] if opt else q["cpu_exec"]
 
 
@@ -545,8 +941,45 @@ def _child(root, jobs, todo, meta, store, budget) -> bool:
         return False
     import contextlib
     tables: dict = {}
+    import sqlglot.executor as E
+    from sqlglot import parse_one as _parse_one, transpile as _transpile
+    full = []
+    fb_cpu = 0.0  # pinned CPU of the queries re-run whole after a checkpoint diverged
+    # checkpoint-verified queries first (cheap; a divergence ends the child early)
+    for suite, i, opt, mode, parse_hit, optb_hit, duck_hit in todo:
+        if mode != "stage":
+            full.append((suite, i, opt))
+            continue
+        q = meta["suites"][suite][i]
+        signal.setitimer(signal.ITIMER_PROF, 3 * q["outs"]["cpu_stage"] + 0.8)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                if duck_hit and _transpile(q["sql"], write="duckdb")[0] != q["outs"]["duck"]:
+                    return False
+                if parse_hit:
+                    e = pickle.loads(pickle.dumps(_parse_one(q["sql"])))
+                    if strict_digest(e) != q["outs"]["d_parse"]:
+                        fb_cpu += q["cpu_exec"]
+                        if not FALLBACK and fb_cpu > FALLBACK_CAP: return False
+                        full.append((suite, i, opt))  # parse differs: run the whole query
+                        continue
+                if optb_hit:
+                    e = pickle.loads(q["outs"]["pexpr"])
+                    sch = E.ensure_schema(meta["schemas"][suite], dialect=None)
+                    oe = E.optimize(e, sch, leave_tables_isolated=True, dialect=None)
+                    oe.sql(pretty=True)
+                    if strict_digest(oe) != q["outs"]["d_opt"]:
+                        if os.environ.get("SUBTEST_DEBUG"):
+                            print("subtest stage diff:", suite, i, file=sys.stderr)
+                        fb_cpu += q["cpu_exec"]
+                        if not FALLBACK and fb_cpu > FALLBACK_CAP: return False
+                        full.append((suite, i, opt))  # optimized tree differs: run it all
+                        continue
+            except Exception:  # noqa: BLE001
+                return False
+    tables: dict = {}
     with zipfile.ZipFile(store) as zf:
-        for suite, i, opt in todo:
+        for suite, i, opt in full:
             q = meta["suites"][suite][i]
             # each query (with its table loading): at most 3x its pinned CPU + 0.8 s, else the
             # child ends (→ keep)
