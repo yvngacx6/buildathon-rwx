@@ -376,6 +376,7 @@ class Selector:
             return keep(type(e).__name__)
         if found is None:
             return keep("import-state diff unavailable")
+        self._tpc_guard_skip: set[tuple[str, str]] = set()
         try:
             spans = self._tpc_spans(patched, found, cands)
             if isinstance(spans, str):
@@ -383,7 +384,8 @@ class Selector:
             if st.unrecorded(spans, cands):
                 return keep("a changed line ran outside the recorded queries")
             from .subtest import stage_guard
-            why = stage_guard(str(self.sqlglot), [(p, t, None) for p, t in patched.items()])
+            why = stage_guard(str(self.sqlglot), [(p, t, None) for p, t in patched.items()],
+                              skip=self._tpc_guard_skip)
         except names.Fallback as e:
             return keep(str(e)[:120])
         except Exception as e:  # noqa: BLE001
@@ -427,6 +429,10 @@ class Selector:
                         return f"{'.'.join(r.via_def)}: no pinned def"
                     spans.setdefault(p, []).append((s.start, s.end))
                     covered.add((module, *r.via_def))
+                    if not self.maps.span(p, s.start, s.end) & cands:
+                        # no TPC test runs it (class creation at import only): its writes to
+                        # the new class are what the import-state diff compares
+                        self._tpc_guard_skip.add((p, ".".join(r.via_def)))
                 # plain class / module bodies run at import: what they build differently is
                 # in the import-state diff, read at the sites below
         changed = [k.split(" ", 2) for k in found["changed"]]

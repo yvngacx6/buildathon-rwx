@@ -1154,6 +1154,12 @@ _MUTATORS = {"append", "extend", "insert", "pop", "popitem", "remove", "clear", 
 _BAD_CALLS = {"setattr", "delattr", "exec", "eval", "globals", "vars", "__import__", "locals"}
 
 
+def _outer_names(qual: str) -> list[str]:
+    """"A.f.<locals>.g" → ["A.f.<locals>.g", "A.f"]: the def and every def enclosing it."""
+    parts = qual.split(".<locals>.")
+    return [".<locals>.".join(parts[:i]) for i in range(len(parts), 0, -1)]
+
+
 def _defs(tree):
     """{(qualname, occurrence): (def node, outermost enclosing def node)}."""
     out, seen = {}, {}
@@ -1295,12 +1301,16 @@ def _writes_shared(fn, self_shared: bool) -> str | None:
     return None
 
 
-def stage_guard(root: str, jobs, defaults: dict | None = None) -> str | None:
+def stage_guard(root: str, jobs, defaults: dict | None = None,
+                skip: set | None = None) -> str | None:
     """None when every changed function (old and new version) of the jobs passes
     _writes_shared, else the reason (→ no checkpoint shortcut for this commit).
     r35: a def whose literal defaults change (`defaults`, select._default_changes: the job
     text is then the old source) keeps its body but may take other branches: it is checked
-    as a changed function too."""
+    as a changed function too.
+    r37 `skip`: {(path, qualname)} of definition-time defs (metaclass methods,
+    __init_subclass__) the caller showed no TPC test runs: they run at class creation, whose
+    products the import-state diff holds."""
     for path, new_text, _ in jobs:
         with open(os.path.join(root, path), encoding="utf-8") as fh:
             old_text = fh.read()
@@ -1316,6 +1326,8 @@ def stage_guard(root: str, jobs, defaults: dict | None = None) -> str | None:
         for k in set(old_defs) | set(new_defs):
             o, n = old_defs.get(k), new_defs.get(k)
             if o is not None and n is not None and ast.dump(o[0]) == ast.dump(n[0]):
+                continue
+            if skip and any((path, q) in skip for q in _outer_names(k[0])):
                 continue
             for d in (o, n):
                 if d is None:
