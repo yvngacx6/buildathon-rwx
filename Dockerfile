@@ -42,4 +42,6 @@ RUN python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig
       wait $p1 && wait $p2 && wait $p3 && wait $p4; } \
  && chmod -R a+rX /app /opt/sqlglot
 # -S: no site module (the selector needs only the standard library).
+# r39 variant: net gate charges the child at 1.0x (board experiment)
+ENV BR_SUBTEST_NET_CPU_FACTOR=1.0
 CMD ["python", "-S", "-m", "selector"]
