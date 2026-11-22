@@ -6,7 +6,14 @@
   almost no new tpcds drops: **+1 drop in 1,872 commits**, P_6phk.
 - **0 misses** on every labeled set: practice_like, private, private41, adversarial, adversarial2,
   sample. Drops are unchanged on all of them.
-- **Ground truth:** __TRUTH__
+- **Ground truth:** 18 commits re-run with the three real TPC tests on patched sqlglot. All 18 pass
+  test_execute_tpcds, test_execute_tpch and test_optimized_tpch.
+  - The 18 are every R drop under rules mode from P/Q that moon-05's 35-commit truth run had not
+    covered, including the one new drop, P_6phk.
+  - Only 1 drop is new, so the "≥15 newly dropped" target cannot be met literally. Instead, these
+    18 check the new verification path on drops it decided.
+  - With usage logging on, 42 of R's 55 drops and 6 of practice_like's 9 verified at least one query
+    from a rule checkpoint (2,148 query runs on R).
 - **Re-run (verification child) CPU, rules off (= moon-05) → rules on.** EC2 container, load ~100–200,
   store calibrated to laptop CPU (as moon-05).
 
@@ -28,7 +35,10 @@
   `table.py`, `trie.py`, `schema.py`, `scope.py`, `generators/python.py`, `planner.py`), so every
   query has to be re-run whole (11.4 s for 57 queries). An optimizer checkpoint cannot help them.
   The few that are optb-only were already within budget under moon-05.
-- **Store and build:** __BUILD__
+- **Store and build:** nothing is added to the repo; everything is built in the Docker build.
+  - Subtest store: 6.15 → 11.28 MB.
+  - Build CPU, EC2 3-CPU container at load ~100: 1m10s → 2m09s user (+59 s), 1m21s → 2m36s wall.
+  - Expect ≈ +40–60 s on the idle 4-core scorer build, within the ≤3 min target.
 - **Recommendation:** merge it as part of the moon-05 / r29-tpcstage line. It is cheap and sound,
   and saves ~3 s per 40 commits. Do not expect board movement beyond that. The next lever for the
   remaining refusals is executor-step checkpoints (moon-05 phase 2, item 2), not finer optimizer
