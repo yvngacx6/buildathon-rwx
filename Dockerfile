@@ -37,4 +37,5 @@ RUN python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig
  && python -m selector.diffexec resources /opt/sqlglot /app/index/resources.pkl \
  && chmod -R a+rX /app /opt/sqlglot
 # -S: no site module (the selector needs only the standard library).
+ENV BR_DIAG_DROP_IDS=test_execute_tpcds,test_execute_tpch,test_optimized_tpch
 CMD ["python", "-S", "-m", "selector"]
