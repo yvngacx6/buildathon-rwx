@@ -1170,6 +1170,7 @@ class Selector:
         in_tests: set[int] = set()
         n_sites = 0
         keyed: set[int] = set()  # key-level readers (moonshot 21)
+        keyed_parts: list[tuple[set[int], set[int], set[int]]] = []
         n_keyed = 0
         owners: dict[str, tuple] = {}
         per_key: list[tuple[str, set[int], set[int]]] = []  # (key, reads, reads ∩ touch)
@@ -1241,8 +1242,11 @@ class Selector:
             by_key = self._key_readers(entry, found)
             if by_key is not None:
                 # moonshot 21: the tests that looked up a changed key of this dict (or read
-                # it whole) in the pinned run -- every run-time read of the object
-                keyed |= by_key
+                # it whole) in the pinned run -- every run-time read of the object. Both it
+                # and the site readers bound the entry's readers, so take both bounds (the
+                # site bound after the final `touch`, below); with no site reader seen, the
+                # map alone (it records every read of the object, not just named ones).
+                keyed_parts.append((by_key, e_free | e_tests, e_loose | e_held))
                 n_keyed += 1
                 per_key.append((entry, by_key, set()))
                 continue
@@ -1253,6 +1257,9 @@ class Selector:
             held |= e_held
         # Class-attribute reads stay within the users of the owner classes and their files
         # (the bound `_by_names` relies on); `held` narrows that further.
+        for by_key, unrestricted, restricted in keyed_parts:
+            sites = unrestricted | (restricted & touch)
+            keyed |= (by_key & sites) if sites else by_key
         got = free | ((loose | held) & touch) | in_tests
         got |= typed | keyed
         # changed values no test is seen reading (a reader the index is blind to, or none):

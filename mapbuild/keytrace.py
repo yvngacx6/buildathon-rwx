@@ -47,6 +47,7 @@ _CTX_INDEX: dict[tuple[str, str], int] = {}
 LOOK: dict[tuple[int, int], set] = {}  # (table, ctx) -> raw keys looked up
 WHOLE: dict[int, set[int]] = {}  # table -> contexts that read it whole
 MUTATED: set[int] = set()
+WRITERS: set[int] = set()  # contexts that wrote some import-time dict (filled a cache?)
 ALLTABLES: set[int] = set()  # contexts that spawned a process: read everything
 
 
@@ -175,6 +176,7 @@ class RecDict(dict):
     # writes
     def _mut(self):
         MUTATED.add(self._t)
+        WRITERS.add(_CTX)
         _whole(self._t)
 
     def __setitem__(self, k, v):
@@ -380,7 +382,40 @@ def pytest_configure(config):
     _CTX = -1
     install(os.environ.get("BR_SQLGLOT", os.getcwd()))
     _selfcheck()
+    _inline_pools()
     sys.addaudithook(_audit)
+
+
+def _inline_pools() -> None:
+    """Run process-pool work inline, in the submitting test's context (pickle round trip
+    as a worker would see it). A pool's workers outlive the test that started them
+    (test_optimizer's class-wide spawn pool), so marking only the spawning test would miss
+    every later test's lookups in the children."""
+    import concurrent.futures as cf
+    import pickle
+
+    init = cf.ProcessPoolExecutor.__init__
+
+    def __init__(self, *a, **kw):
+        init(self, *a, **kw)
+        self._kt_init = (kw.get("initializer", a[2] if len(a) > 2 else None),
+                         kw.get("initargs", a[3] if len(a) > 3 else ()))
+
+    def submit(self, fn, /, *args, **kwargs):
+        fut = cf.Future()
+        initializer, initargs = getattr(self, "_kt_init", (None, ()))
+        if initializer is not None:  # once per executor, as each worker would
+            self._kt_init = (None, ())
+            initializer(*pickle.loads(pickle.dumps(initargs)))
+        try:
+            fn2, args2, kwargs2 = pickle.loads(pickle.dumps((fn, args, kwargs)))
+            fut.set_result(pickle.loads(pickle.dumps(fn2(*args2, **kwargs2))))
+        except BaseException as exc:  # noqa: BLE001 - delivered through the future
+            fut.set_exception(exc)
+        return fut
+
+    cf.ProcessPoolExecutor.__init__ = __init__
+    cf.ProcessPoolExecutor.submit = submit
 
 
 def _selfcheck() -> None:
@@ -455,6 +490,13 @@ def pytest_sessionfinish(session):
                      if snap.entries.get(k) != _BEFORE.get(k))
     with open(_OUT + ".runstate.txt", "w") as f:
         f.write("\n".join(changed) + "\n")
+    # an entry whose value the run itself changed (patched, cached, filled lazily) is never
+    # narrowed: add them to the map's "mutated" list
+    with gzip.open(_OUT, "rt") as f:
+        data = json.load(f)
+    data["mutated"] = sorted(set(data["mutated"]) | set(changed))
+    with gzip.open(_OUT, "wt") as f:
+        json.dump(data, f, separators=(",", ":"))
 
 
 def _write(out: str, nodeids: list[str]) -> None:
@@ -490,7 +532,11 @@ def _write(out: str, nodeids: list[str]) -> None:
             slot.setdefault(kk, set()).add(c)
     leaky_entries = sorted({e for t in LEAKY for r in ROOT_OF[t] for e, _ in PATHS[r]}
                            | {e for t in LEAKY for e, _ in PATHS[t]})
-    mutated = sorted({e for t in MUTATED for r in ROOT_OF[t] for e, _ in PATHS[r]})
+    # A table read whole in a context that also wrote an import-time dict may have been
+    # copied into a run-time cache (generator._DISPATCH_CACHE <- dict(TRANSFORMS)): later
+    # tests read the cache, not the table, so the table's recorded readers are incomplete.
+    fed = {t for t, ctxs in WHOLE.items() if t >= 0 and ctxs & WRITERS}
+    mutated = sorted({e for t in MUTATED | fed for r in ROOT_OF[t] for e, _ in PATHS[r]})
     for t, paths in enumerate(PATHS):
         whole = expand(WHOLE.get(t, ())) | spawn
         ks = {k: sorted(expand(cs)) for k, cs in keyed.get(t, {}).items()}
