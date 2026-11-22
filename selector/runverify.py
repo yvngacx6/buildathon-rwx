@@ -739,18 +739,18 @@ class RunVerify:
             return numbers, f"runverify: keep ({type(e).__name__})"
         self.spent += SCORER_SLOWDOWN * cpu
         if res is None:
-            return numbers, f"runverify: keep (child died / CPU cap, dx {dx}; est {est:.2f}s, child {cpu:.2f}s)"
+            return numbers, f"runverify: keep (child died / CPU cap, dx {dx}, rss {rss // 1024}MB; est {est:.2f}s, child {cpu:.2f}s)"
         if res.get("anomaly"):
             why = res["anomaly"][:80].replace(";", ",")
-            return numbers, f"runverify: keep (anomaly: {why}, dx {dx}; est {est:.2f}s, child {cpu:.2f}s)"
+            return numbers, f"runverify: keep (anomaly: {why}, dx {dx}, rss {rss // 1024}MB; est {est:.2f}s, child {cpu:.2f}s)"
         num_of = self.sel._number_of
         passed = {num_of[t] for t in res["passed"] if t in num_of}
         failed = res["failed"]
         if not failed and passed != numbers:
-            return numbers, f"runverify: keep (incomplete, dx {dx}; est {est:.2f}s, child {cpu:.2f}s)"
+            return numbers, f"runverify: keep (incomplete, dx {dx}, rss {rss // 1024}MB; est {est:.2f}s, child {cpu:.2f}s)"
         rest = numbers - passed
         return rest, (f"runverify: {len(passed)} passed, {len(failed)} failed {failed[:3]}, {len(rest)} kept "
-                      f"(dx {dx}; est {est:.2f}s, child {cpu:.2f}s)")
+                      f"(dx {dx}, rss {rss // 1024}MB; est {est:.2f}s, child {cpu:.2f}s)")
 
 
 if __name__ == "__main__":
