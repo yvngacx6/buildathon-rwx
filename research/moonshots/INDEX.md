@@ -25,9 +25,9 @@ new moonshot angle is started in its slot.
 | 17 | Determinism audit | moon-17 | done | ✓ Only wall-clock guards flip (tggb +18 s, op07, ktz3 under load). CPU caps decide + timing re-check → R30 (r30-determinism). 66ks flip was a mis-comparison. |
 | 18 | Red-team of run-time pruners | moon-18 | done | ✓ Found 2 real holes (one-line lambdas run at import → 3/5 probes missed on main; diffexec exception attrs) and fixed both; 0 cost on labeled sets. Merged into cand-a. |
 | 19 | 'Conservative def-time' + 'state diff' buckets on practice_like (~87 s): sound narrowing | moon-19 | running | |
-| 20 | Tokenizer settings → TokenizerCore(...) read sites ∩ dialect users | moon-20 | running | |
+| 20 | Tokenizer settings read sites | moon-20 | done | ✓ Constructor hop already existed; added constant-name getattr narrowing + bool() truth flow: −1…−1.5 s/40, 0 misses → merged in cand-e. |
 | 21 | Key-level state diff for class-creation hooks & import-run builders | moon-21 | running | |
 | 22 | Per-optimizer-rule TPC checkpoints (3–5x cheaper re-runs) | moon-22 | running | |
 | 23 | Final-day plan + final_check.sh | moon-23 | done | ✓ eval/final_check.sh (13 checks, EC2-only); main PASS. Build 171–188 s on rwx (≈2x on scorer → watch 600 s cap). Freeze 03:00, pick final ≈04:00. |
 | 24 | Dispatch precision | moon-24 | done | ✗ Dispatch pairs are coarser than statement coverage (R23 already captures it); instruction-level ≤2 s/40. Remaining waste = unrecorded functions, but moon-04 showed recording them saves ~0. |
-| 25 | Executor-touched TPC commits: PythonExecutor.generate checkpoint (record generate() in/out per query, replay patched generate) | moon-25 | running | |
+| 25 | Executor generate() checkpoint | moon-25 | done | ~ Sound (16/16 drops pass, 7/7 keeps fail) but ≈ −1 s/40 and +10–14 s build. Parked. |
