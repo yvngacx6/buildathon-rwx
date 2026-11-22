@@ -74,7 +74,9 @@ NET_MIN_GAIN_MS = float(os.environ.get("BR_SUBTEST_NET_MIN_MS", "1500"))
 # r40: the queries to re-run go cheapest (estimated CPU) first, whole re-runs inline with the
 # checkpoint-verified ones: a divergence ends the child before the dearer queries run (pl
 # h917: 98 stage queries passed in 2.9 s before a ~0 s full query failed). Order only: a
-# drop still needs every query to give the pinned outputs.
+# drop still needs every query to give the pinned outputs. Patched-import child only: on the
+# forked function-body child it cost more than it saved (P/Q failed verifications +1.7 s
+# each: there a cheap checkpoint query is the usual first divergence).
 ORDERED = os.environ.get("BR_SUBTEST_ORDER", "1") != "0"
 
 
@@ -1593,8 +1595,6 @@ class SubTest:
                 # (raw CPU where it runs: on the scorer that is what is charged)
                 cap = min(2.5 * est + 1.0 + FALLBACK_CAP,
                           NET_CAP_SHARE * benefit_of(chosen) / 1000 if NET_SHARE < 100 else 99)
-            if ORDERED:
-                todo = sorted(todo, key=self._cpu)
             ok = self.verify(jobs, todo, cap)
         except Exception as e:  # noqa: BLE001
             return set(), f"subtest: keep ({type(e).__name__})"
@@ -1999,7 +1999,7 @@ def _child(root, jobs, todo, meta, store, budget, defaults=None, patched=False) 
         if mode != "stage":
             # r40: in the given order (the parent sorts the queries cheapest first, so a
             # divergence among them ends the child before the dearer ones)
-            if ORDERED:
+            if ORDERED and patched:
                 if not run_one(suite, i, opt, mode == "tail", zck):
                     return False
             else:
